@@ -16,10 +16,10 @@
 //!
 //!   StepForge --headless tracks
 //!   StepForge --headless settings
-//!   StepForge --headless generate --track fm2_lucky_lucky --difficulties easy,hard
-//!   StepForge --headless generate --track fm2_lucky_lucky --difficulties easy,hard \
-//!       --engine neural --style-preset itg_stamina --style-json '{"jump_share":0.12}'
-//!   StepForge --headless install  --base fm2_lucky_lucky --pack "My Mix"
+//!   StepForge --headless generate --track my_song --difficulties easy,hard
+//!   StepForge --headless generate --track my_song --difficulties easy,hard \
+//!       --style-preset itg_stamina --style-json '{"jump_share":0.12}'
+//!   StepForge --headless install  --base my_song --pack "My Mix"
 //!   StepForge --headless batch    --manifest mix.json [--force]
 
 use std::collections::HashMap;
@@ -113,8 +113,8 @@ fn generate(app: &AppHandle, kv: &HashMap<String, String>, flags: &[String]) -> 
     let args = if target == "stepforge" {
         // The GUI's own builder, so `--engine`, `--style-preset` and
         // `--style-json` mean here exactly what the Generate screen sends. With
-        // no `--engine` the run is what it was before the neural engine
-        // existed: `--deterministic` picks the DSP path, otherwise the LLM.
+        // no `--engine` it charts with the onboard model (`--deterministic`
+        // still picks the DSP path).
         crate::commands::stepforge_args(&crate::commands::StepforgeRun {
             track_id: &track,
             difficulties: &diffs,
