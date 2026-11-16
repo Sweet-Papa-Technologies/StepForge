@@ -88,15 +88,82 @@ def fetch_python(triple: str, cache: Path, dest: Path) -> None:
     shutil.rmtree(tmp, ignore_errors=True)
 
 
-def install_packages(py: Path) -> None:
+def macos_minimum() -> str:
+    """The oldest macOS the app declares (tauri.conf.json), e.g. "12.0"."""
+    conf = json.loads((DESKTOP / "src-tauri" / "tauri.conf.json").read_text())
+    return str(conf["bundle"]["macOS"]["minimumSystemVersion"])
+
+
+def wheel_platform(triple: str) -> str | None:
+    """On macOS, the wheel tag for the app's declared minimum, else None.
+
+    pip on its own picks wheels for the BUILD machine's macOS: on a macOS 15
+    runner that meant numpy, scipy and onnxruntime builds that need macOS 14,
+    inside an app that says it runs on older systems. Pinning the platform tag
+    to the declared minimum makes pip choose wheels every supported Mac can load
+    (and fail the build if a dependency has none)."""
+    if not triple.endswith("-apple-darwin"):
+        return None
+    # Wheel tags for macOS 11+ name the major version only (macosx_12_0 covers
+    # every 12.x); check_macos_minimum() catches a binary built for a later minor.
+    major = macos_minimum().split(".")[0]
+    arch = "arm64" if triple.startswith("aarch64") else "x86_64"
+    return f"macosx_{major}_0_{arch}"
+
+
+def _version(v: str) -> tuple[int, ...]:
+    return tuple(int(x) for x in v.split("."))
+
+
+def check_macos_minimum(py_root: Path) -> None:
+    """Fail if any bundled binary needs a newer macOS than the app declares.
+
+    A wheel's tag is a promise, not a guarantee: scipy's macosx_12_0 arm64
+    wheel contains extensions built for 12.3. Read the real load-command minimum
+    (LC_BUILD_VERSION / LC_VERSION_MIN_MACOSX) of every binary instead."""
+    floor = macos_minimum()
+    worst: dict[str, str] = {}
+    for f in py_root.rglob("*"):
+        if not f.is_file() or f.is_symlink() or not (f.suffix in (".so", ".dylib") or f.parent.name == "bin"):
+            continue
+        # -arch all: universal2 files carry one minimum per slice.
+        out = subprocess.run(["otool", "-arch", "all", "-l", str(f)],
+                             capture_output=True, text=True).stdout
+        legacy = False                       # inside an LC_VERSION_MIN_MACOSX command
+        for line in out.splitlines():
+            s = line.split()
+            if s[:2] == ["cmd", "LC_VERSION_MIN_MACOSX"]:
+                legacy = True
+            elif s[:1] == ["minos"] or (legacy and s[:1] == ["version"]):
+                legacy = False
+                if _version(s[1]) > _version(floor):
+                    worst[str(f.relative_to(py_root))] = s[1]
+    if worst:
+        listing = "\n  ".join(f"{v}  {k}" for k, v in sorted(worst.items())[:20])
+        raise SystemExit(f"{len(worst)} bundled binaries need a newer macOS than the declared "
+                         f"minimum {floor} (tauri.conf.json bundle.macOS.minimumSystemVersion):\n  {listing}")
+    log(f"every bundled binary loads on macOS {floor}")
+
+
+def install_packages(py: Path, triple: str) -> None:
     reqs = [l.split("#", 1)[0].strip() for l in (REPO / "requirements.txt").read_text().splitlines()]
     reqs = [r for r in reqs if r]
     log(f"installing {len(reqs)} packages: {' '.join(reqs)}")
     env = dict(os.environ, PIP_DISABLE_PIP_VERSION_CHECK="1", PYTHONNOUSERSITE="1")
+    cmd = [str(py), "-m", "pip", "install", "--no-cache-dir", "--no-compile",
+           "--only-binary", ":all:"]
+    plat = wheel_platform(triple)
+    if plat:
+        # A platform tag requires --target: install straight into the
+        # interpreter's own site-packages.
+        site = subprocess.run([str(py), "-c", "import sysconfig; print(sysconfig.get_paths()['purelib'])"],
+                              check=True, capture_output=True, text=True).stdout.strip()
+        log(f"wheels for {plat} (the app's minimum macOS)")
+        cmd += ["--platform", plat, "--implementation", "cp",
+                "--python-version", ".".join(PY_VERSION.split(".")[:2]), "--target", site]
     # setuptools < 81: `fs` (pulled in by simfile) still imports pkg_resources,
     # which setuptools 81 removed — without the pin simfile cannot be imported.
-    subprocess.run([str(py), "-m", "pip", "install", "--no-cache-dir", "--no-compile",
-                    "--only-binary", ":all:", *reqs, "setuptools<81"], check=True, env=env)
+    subprocess.run([*cmd, *reqs, "setuptools<81"], check=True, env=env)
 
 
 def prune(py_root: Path) -> None:
@@ -108,7 +175,8 @@ def prune(py_root: Path) -> None:
         for name in STDLIB_PRUNE:
             shutil.rmtree(lib / name, ignore_errors=True)
         site = lib / "site-packages"
-        for d in list(site.glob("pip")) + list(site.glob("pip-*.dist-info")):
+        # `bin` holds console scripts that `pip install --target` drops there.
+        for d in list(site.glob("pip")) + list(site.glob("pip-*.dist-info")) + [site / "bin"]:
             shutil.rmtree(d, ignore_errors=True)
     for d in list(py_root.rglob("__pycache__")):
         shutil.rmtree(d, ignore_errors=True)
@@ -159,6 +227,29 @@ def sign_macos(root: Path, identity: str) -> None:
     log("signatures applied")
 
 
+INFER_CHECK = """
+import sys
+import numpy as np
+import onnxruntime
+from beatforge.adapters.stepmania.neural import conditioning as cond
+from beatforge.adapters.stepmania.neural import grid_features as GF
+from beatforge.adapters.stepmania.neural import infer
+rng = np.random.default_rng(3)
+y = np.zeros(int(30 * GF.SR), np.float32)
+for b in range(140):                               # a click every 0.2 s (150 BPM)
+    k = int((0.2 + b * 0.2) * GF.SR)
+    y[k:k + 60] += rng.standard_normal(60).astype(np.float32)
+g = GF.extract_grid_features(y, GF.TimingMap.constant(150.0, 0.2))
+eng = infer.StepManiaNeuralEngine(sys.argv[1])
+counts = {}
+for d in ("easy", "hard"):
+    ch = eng.generate(g.X, g.tick_times_sec, d, cond.resolve_style(d), 30.0, seed=1)
+    counts[d] = len(infer.to_placements(ch))
+assert all(counts.values()), counts
+print(f"{onnxruntime.__version__} (charted easy {counts['easy']} / hard {counts['hard']} notes)")
+"""
+
+
 def smoke_test(py: Path, engine: Path) -> None:
     env = dict(os.environ, PYTHONPATH=str(engine / "tools"), PYTHONNOUSERSITE="1",
                PYTHONDONTWRITEBYTECODE="1")
@@ -167,7 +258,15 @@ def smoke_test(py: Path, engine: Path) -> None:
     status = json.loads(out.stdout.strip().splitlines()[-1])
     if not status.get("installed"):
         raise SystemExit(f"the staged engine does not see its model: {status.get('error')}")
-    log(f"smoke test ok: {status.get('display_name')} via onnxruntime, "
+    # Loading is not running: chart a synthetic click track with the real
+    # model, so an onnxruntime build that loads the model but cannot execute
+    # it (each platform resolves its own onnxruntime version) fails here.
+    run = subprocess.run([str(py), "-c", INFER_CHECK, str(engine / "models" / "stepforge_flow")],
+                         cwd=engine, env=env, capture_output=True, text=True)
+    if run.returncode != 0:
+        raise SystemExit(f"the staged engine could not chart:\n{run.stderr[-3000:]}")
+    log(f"smoke test ok: {status.get('display_name')} via onnxruntime "
+        f"{run.stdout.strip().splitlines()[-1]}, "
         f"style index {'yes' if status.get('style_rag_available') else 'no'}")
 
 
@@ -194,8 +293,10 @@ def main() -> int:
         shutil.rmtree(out, ignore_errors=True)
         out.mkdir(parents=True)
         fetch_python(a.triple, Path(a.cache), py_root)
-        install_packages(python_exe(py_root))
+        install_packages(python_exe(py_root), a.triple)
         prune(py_root)
+        if a.triple.endswith("-apple-darwin"):
+            check_macos_minimum(py_root)
     shutil.rmtree(engine, ignore_errors=True)
     copy_engine(engine, a.version)
     smoke_test(python_exe(py_root), engine)
