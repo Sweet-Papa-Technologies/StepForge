@@ -12,3 +12,9 @@ exactly what the app writes; nothing was edited by hand.
 
 Screenshots: [library](screenshot-library.png), [generate](screenshot-generate.png),
 [results](screenshot-results.png). Banner: [banner.png](banner.png).
+
+Blog post images: [stepforge-pipeline.png](stepforge-pipeline.png) (how a chart
+is written: listen, RhythmNet places the steps, ChoreoNet picks the feet, an exact
+check produces the final chart) and [llm-hater.jpg](llm-hater.jpg), a meme made
+with imgflip on Robotatertot Comics' "The Scroll of Truth". The meme's artwork
+belongs to its creator and is not covered by this repository's licenses.
