@@ -5,6 +5,7 @@
 <p align="center">
   <a href="https://github.com/Sweet-Papa-Technologies/StepForge/releases"><img alt="Latest release" src="https://img.shields.io/github/v/release/Sweet-Papa-Technologies/StepForge?include_prereleases&label=download"></a>
   <a href="https://github.com/Sweet-Papa-Technologies/StepForge/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/Sweet-Papa-Technologies/StepForge/actions/workflows/ci.yml/badge.svg"></a>
+  <a href="https://step.fofo.dev"><img alt="Website" src="https://img.shields.io/badge/web-step.fofo.dev-bc13fe"></a>
   <a href="https://discord.gg/kFHgCKr5E3"><img alt="Discord" src="https://img.shields.io/badge/chat-Discord-5865F2?logo=discord&logoColor=white"></a>
   <a href="LICENSE"><img alt="Code: MIT" src="https://img.shields.io/badge/code-MIT-blue"></a>
 </p>
@@ -30,7 +31,8 @@ your CPU: no account, no API key, no upload, no per-song cost.
 
 ## Download
 
-Get the latest build from the **[Releases page](https://github.com/Sweet-Papa-Technologies/StepForge/releases)**.
+Get the latest build from **[step.fofo.dev/download](https://step.fofo.dev/download)** or the
+**[Releases page](https://github.com/Sweet-Papa-Technologies/StepForge/releases)**.
 
 | Platform | File | Notes |
 |---|---|---|
@@ -138,6 +140,7 @@ then `npx tauri build --config src-tauri/tauri.release.conf.json`. See
 
 ## Community and contact
 
+- **Website and news:** https://step.fofo.dev
 - **Discord:** https://discord.gg/kFHgCKr5E3
 - **Reddit:** [u/sweetpapatech](https://www.reddit.com/user/sweetpapatech)
 - **Bluesky:** [@sweetpapa.bsky.social](https://bsky.app/profile/sweetpapa.bsky.social)
