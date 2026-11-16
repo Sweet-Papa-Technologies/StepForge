@@ -20,7 +20,7 @@ merge. Nobody pushes to `main` directly.
 3. Run the checks locally:
 
    ```bash
-   python3 -m pip install -r requirements.txt pytest "setuptools<81"
+   python3 -m pip install -r requirements.txt -r requirements-optional.txt pytest "setuptools<81"
    (cd tools && python3 -m pytest beatforge/tests -q)
    cd desktop && npm ci && npm run build && (cd src-tauri && cargo test)
    ```

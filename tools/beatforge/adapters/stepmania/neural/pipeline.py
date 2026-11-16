@@ -127,27 +127,7 @@ def render_previews(placements, analysis, audio_path, out_stem) -> dict:
     times = np.array([offset + p.beat / bpm * 60 for p in notes])
     png = Path(str(out_stem) + ".notefield.png")
     try:
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-        from ..grammar import PANELS
-        fig, ax = plt.subplots(figsize=(16, 3))
-        taps = [(t, c) for p, t in zip(notes, times) for c in p.panels if not p.hold_beats]
-        if taps:
-            ax.scatter(*zip(*taps), color="#2de2e6", s=16)
-        for p, t in zip(notes, times):
-            if p.hold_beats:
-                for c in p.panels:
-                    ax.plot([t, t + p.hold_beats / bpm * 60], [c, c], color="#ff2d95", lw=4)
-        for sec in analysis.get("sections", []):
-            ax.axvline(offset + sec["start_bar"] * 4 / bpm * 60, color="#b14cff",
-                       ls="--", lw=0.6)
-        ax.set_yticks(range(4))
-        ax.set_yticklabels(list(PANELS))
-        ax.set_xlabel("s")
-        fig.tight_layout()
-        fig.savefig(png, dpi=110)
-        plt.close(fig)
+        _notefield_png(png, notes, times, bpm, offset, analysis.get("sections", []))
         out["png"] = str(png)
     except Exception:
         pass
@@ -173,6 +153,40 @@ def render_previews(placements, analysis, audio_path, out_stem) -> dict:
     except Exception:
         pass
     return out
+
+
+def _notefield_png(path, notes, times, bpm, offset, sections) -> None:
+    """A timeline of the chart: one row per panel, a dot per tap, a bar per
+    hold, dashed lines at section starts. Drawn with Pillow (already a
+    dependency) rather than matplotlib, which the app no longer bundles."""
+    from PIL import Image, ImageDraw, ImageFont
+    from ..grammar import PANELS
+    W, H, L, R, T, B = 1760, 330, 56, 24, 18, 46
+    end = max([float(t) + (p.hold_beats or 0) / bpm * 60 for p, t in zip(notes, times)] or [1.0]) + 1.0
+    x = lambda s: L + (W - L - R) * max(0.0, s) / end
+    row = lambda c: H - B - (H - T - B) * (c + 0.5) / 4
+    im = Image.new("RGB", (W, H), "white")
+    d = ImageDraw.Draw(im)
+    font = ImageFont.load_default()
+    d.rectangle((L, T, W - R, H - B), outline="#444444")
+    for sec in sections:
+        sx = x(offset + sec["start_bar"] * 4 / bpm * 60)
+        for y0 in range(T, H - B, 10):
+            d.line((sx, y0, sx, min(y0 + 5, H - B)), fill="#b14cff", width=1)
+    for p, t in zip(notes, times):
+        for c in p.panels:
+            if p.hold_beats:
+                d.line((x(t), row(c), x(t + p.hold_beats / bpm * 60), row(c)), fill="#ff2d95", width=4)
+            else:
+                d.ellipse((x(t) - 3, row(c) - 3, x(t) + 3, row(c) + 3), fill="#2de2e6")
+    for c, name in enumerate(PANELS):
+        d.text((L - 10, row(c)), str(name), fill="#222222", font=font, anchor="rm")
+    step = 10 if end <= 200 else 30
+    for s in range(0, int(end) + 1, step):
+        d.line((x(s), H - B, x(s), H - B + 5), fill="#444444")
+        d.text((x(s), H - B + 8), str(s), fill="#222222", font=font, anchor="mt")
+    d.text(((L + W - R) / 2, H - 14), "s", fill="#222222", font=font, anchor="mm")
+    im.save(path)
 
 
 def flow_veto(difficulty: str, bpm: float | None = None):

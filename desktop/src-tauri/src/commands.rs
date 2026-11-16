@@ -450,7 +450,7 @@ fn transcode_to_ogg(
     let out = pub_dir.join(format!("{base}.ogg"));
 
     let ffmpeg = engine::ffmpeg_bin(app);
-    match std::process::Command::new(&ffmpeg)
+    match engine::command(&ffmpeg)
         .args(["-y", "-loglevel", "error", "-i"])
         .arg(src)
         .args(["-vn", "-map", "0:a:0", "-c:a", "libvorbis", "-q:a", "6"])
@@ -1657,7 +1657,7 @@ fn probe_engine_status(app: AppHandle) -> Value {
         }
     }
     let ffmpeg = engine::ffmpeg_bin(&app);
-    let ffmpeg_ok = std::process::Command::new(&ffmpeg)
+    let ffmpeg_ok = engine::command(&ffmpeg)
         .arg("-version")
         .output()
         .map(|o| o.status.success())

@@ -33,7 +33,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends libsndfile1 ffmpeg
-          python -m pip install -r requirements.txt pytest "setuptools<81"
+          python -m pip install -r requirements.txt -r requirements-optional.txt pytest "setuptools<81"
           npm ci   # bsmap, for the Beat Saber serializer tests
       - name: Tests
         working-directory: tools

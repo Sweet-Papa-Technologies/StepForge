@@ -1,0 +1,6 @@
+# Optional engine extras. NOT bundled in the release builds, which chart with
+# the StepForge Flow model only; install these when running from source and
+# you want the other engines:
+#   python3 -m pip install -r requirements-optional.txt
+matplotlib             # timeline previews for the Deterministic / AI Designer engines
+google-auth[requests]  # the AI Designer engine on Google Gemini / Vertex

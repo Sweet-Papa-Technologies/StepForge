@@ -8,6 +8,9 @@ export const useLibrary = defineStore("library", {
     /** Selected track's `base` (the filename stem — unique per file). */
     selectedBase: null as string | null,
     loading: false,
+    /** The engine probe is running (it starts Python, so the first one after
+     *  launch can take a few seconds, longer on Windows). */
+    statusLoading: false,
     error: null as string | null,
     status: null as EngineStatus | null,
   }),
@@ -38,10 +41,13 @@ export const useLibrary = defineStore("library", {
       }
     },
     async loadStatus(force = false) {
+      this.statusLoading = true;
       try {
         this.status = await api.engineStatus(force);
       } catch {
         this.status = null;
+      } finally {
+        this.statusLoading = false;
       }
     },
     select(base: string) {

@@ -371,7 +371,7 @@ pub fn repo_root(app: &AppHandle) -> Result<PathBuf, String> {
 /// and from picking up the user's own site-packages.
 pub fn python_command(app: &AppHandle) -> Command {
     let py = python_bin(app);
-    let mut cmd = Command::new(&py);
+    let mut cmd = command(&py);
     for (k, v) in UTF8_ENV {
         cmd.env(k, v);
     }
@@ -388,6 +388,27 @@ pub fn python_command(app: &AppHandle) -> Command {
     }
     cmd
 }
+
+/// A `Command` that never opens a console window. On Windows a console program
+/// (python.exe, ffmpeg.exe) started from a windowed app gets a console window
+/// of its own unless asked not to: every engine call flashed one. With
+/// CREATE_NO_WINDOW the child gets a console without a window, which its own
+/// children (ffmpeg started by the engine) inherit, so they stay hidden too.
+pub fn command(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    let mut cmd = Command::new(program);
+    hide_console(&mut cmd);
+    cmd
+}
+
+#[cfg(windows)]
+fn hide_console(cmd: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    cmd.creation_flags(CREATE_NO_WINDOW);
+}
+
+#[cfg(not(windows))]
+fn hide_console(_cmd: &mut Command) {}
 
 /// Every engine process talks UTF-8, whatever the platform. The app decodes
 /// the engine's output as UTF-8; on Windows, Python otherwise writes piped
@@ -1298,7 +1319,7 @@ pub fn spawn_assetforge(
     let py = python_bin(app);
     let sub = if media == "video" { "video" } else { "image" };
 
-    let mut cmd = Command::new(py);
+    let mut cmd = command(py);
     cmd.arg(&script).arg(sub).arg(&prompt);
     cmd.arg("-o").arg(&out_path);
     if sub == "image" {
