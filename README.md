@@ -42,7 +42,7 @@ Get the latest build from **[step.fofo.dev/download](https://step.fofo.dev/downl
 | Linux (x64) | `StepForge-…-linux-x86_64.AppImage` or `…-amd64.deb` | |
 
 Everything the app needs, including Python and the model, is inside the
-download (about 190 MB on Windows, 235–250 MB on macOS, 350 MB on Linux).
+download (about 175 MB on Windows, 210–220 MB on macOS, 320–330 MB on Linux).
 You also want [ITGmania](https://www.itgmania.com/) (or StepMania 5) to play
 the charts.
 
