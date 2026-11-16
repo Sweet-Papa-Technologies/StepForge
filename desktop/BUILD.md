@@ -40,8 +40,14 @@ npx tauri build --config src-tauri/tauri.release.conf.json
 `stage_runtime.py` downloads a self-contained CPython
 ([python-build-standalone](https://github.com/astral-sh/python-build-standalone)),
 installs `requirements.txt` into it, copies the engine and the model next to it,
-stamps `ENGINE_VERSION`, and smoke-tests it by charting a synthetic click track
-with the real model. `tauri.release.conf.json` bundles that folder as an app
+stamps `ENGINE_VERSION`, and smoke-tests it: the model charts a synthetic click
+track, then a synthetic song goes through the real command line end to end
+(to-ogg, analysis, charting, .ssc/.sm, the preview PNG) in a scratch workspace.
+
+The runtime is pruned to what the engine loads: no Tcl/Tk, no C headers or type
+stubs, no onnxruntime conversion tooling, and only `requirements.txt` (matplotlib
+and google-auth live in `requirements-optional.txt` and are not bundled). Fewer
+files is what makes the Windows installer fast: Defender scans every one. `tauri.release.conf.json` bundles that folder as an app
 resource.
 
 On macOS the stager installs wheels for the app's declared minimum

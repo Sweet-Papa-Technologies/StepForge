@@ -1,5 +1,5 @@
-# StepForge engine — runtime dependencies. The release builds bundle these
-# (desktop/scripts/stage_runtime.py); to run from source:
+# StepForge engine — runtime dependencies. The release builds bundle exactly
+# these (desktop/scripts/stage_runtime.py); to run from source:
 #   python3 -m pip install -r requirements.txt
 numpy
 scipy
@@ -7,9 +7,9 @@ soundfile          # audio I/O (libsndfile); also imports WAV/MP3/FLAC/OGG witho
 simfile            # garcia/simfile — StepMania .sm/.ssc read+write
 onnxruntime        # StepForge Flow neural chart engine; no torch at runtime
 Pillow             # chart preview PNGs
-matplotlib         # chart timeline plots (imported lazily)
-google-auth[requests]  # only for the optional AI Designer engine on Google Gemini / Vertex
 
+# --- Optional, not bundled: requirements-optional.txt (matplotlib previews for
+#     the non-neural engines, Google auth for the AI Designer engine) ---
 # --- Training (not needed to run the app): requirements-train.txt ---
 # --- Dev / tests ---
 # pytest

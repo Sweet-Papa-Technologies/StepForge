@@ -29,10 +29,12 @@ import hashlib
 import json
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
 import tarfile
+import tempfile
 import urllib.request
 from pathlib import Path
 
@@ -48,7 +50,23 @@ PBS_URL = ("https://github.com/astral-sh/python-build-standalone/releases/downlo
            "{tag}/cpython-{py}+{tag}-{triple}-install_only.tar.gz")
 
 #: Directories of the standard library nobody running the engine needs.
-STDLIB_PRUNE = ("test", "idlelib", "turtledemo", "ensurepip", "lib2to3", "pydoc_data")
+STDLIB_PRUNE = ("test", "idlelib", "turtledemo", "ensurepip", "lib2to3", "pydoc_data", "tkinter")
+
+#: Tcl/Tk, bundled by python-build-standalone for tkinter; the engine has no
+#: GUI. Folders directly under python/lib (tcl9.0, tk9.0, itcl4.x, thread3.x)
+#: and the shared libraries / extension module that load them.
+TK_DIR_RE = re.compile(r"^(tcl|tk|itcl|thread|tdbc\w*)\d", re.I)
+TK_FILE_RE = re.compile(r"^((lib)?(tcl|tk)\d[\w.]*\.(dll|dylib|so)|_tkinter\..*)$", re.I)
+
+#: Parts of installed packages the engine never imports. Each file is one more
+#: thing an installer writes and a virus scanner opens, so they cost install
+#: time on Windows well beyond their size.
+SITE_PRUNE = (
+    "onnxruntime/transformers", "onnxruntime/tools", "onnxruntime/quantization",
+    "onnxruntime/datasets", "numpy/f2py", "numpy/_core/include",
+)
+#: Type stubs, C headers and Cython sources: build-time only.
+SITE_PRUNE_SUFFIXES = (".pyi", ".h", ".pxd", ".pxi", ".pyx")
 
 
 def log(msg: str) -> None:
@@ -167,17 +185,37 @@ def install_packages(py: Path, triple: str) -> None:
 
 
 def prune(py_root: Path) -> None:
-    """Drop what the engine never loads: pip itself, stdlib tests, bytecode
-    caches (the app redirects bytecode outside the bundle anyway)."""
+    """Drop what the engine never loads: pip itself, stdlib tests, Tcl/Tk,
+    C headers, type stubs, package tooling, bytecode caches (the app redirects
+    bytecode outside the bundle anyway). smoke_test() then charts a song end to
+    end with what is left, so an over-eager rule fails the build, not a user."""
+    before = sum(1 for f in py_root.rglob("*") if f.is_file())
     lib = next((p for p in [py_root / "Lib", *sorted((py_root / "lib").glob("python3.*"))]
                 if p.is_dir()), None)
     if lib:
         for name in STDLIB_PRUNE:
             shutil.rmtree(lib / name, ignore_errors=True)
+        (lib / "turtle.py").unlink(missing_ok=True)
         site = lib / "site-packages"
         # `bin` holds console scripts that `pip install --target` drops there.
         for d in list(site.glob("pip")) + list(site.glob("pip-*.dist-info")) + [site / "bin"]:
             shutil.rmtree(d, ignore_errors=True)
+        for rel in SITE_PRUNE:
+            shutil.rmtree(site / rel, ignore_errors=True)
+        for f in list(site.rglob("*")):
+            if f.is_file() and (f.suffix in SITE_PRUNE_SUFFIXES or f.name == "py.typed"):
+                f.unlink()
+    # Tcl/Tk: python/tcl on Windows, python/lib/{tcl9.0,tk9.0,...} elsewhere.
+    shutil.rmtree(py_root / "tcl", ignore_errors=True)
+    for d in list((py_root / "lib").glob("*")) if (py_root / "lib").is_dir() else []:
+        if d.is_dir() and TK_DIR_RE.match(d.name):
+            shutil.rmtree(d, ignore_errors=True)
+    for f in list(py_root.rglob("*")):
+        if f.is_file() and TK_FILE_RE.match(f.name):
+            f.unlink()
+    # Headers, import libraries and man pages for building against Python.
+    for d in ("include", "libs", "share"):
+        shutil.rmtree(py_root / d, ignore_errors=True)
     for d in list(py_root.rglob("__pycache__")):
         shutil.rmtree(d, ignore_errors=True)
     # Package test suites (numpy/scipy/matplotlib ship theirs). Only `tests`:
@@ -185,6 +223,8 @@ def prune(py_root: Path) -> None:
     for d in list(py_root.rglob("tests")):
         if d.is_dir() and "site-packages" in d.parts:
             shutil.rmtree(d, ignore_errors=True)
+    after = sum(1 for f in py_root.rglob("*") if f.is_file())
+    log(f"pruned the runtime: {before} -> {after} files")
 
 
 def copy_engine(dest: Path, version: str) -> None:
@@ -250,6 +290,53 @@ print(f"{onnxruntime.__version__} (charted easy {counts['easy']} / hard {counts[
 """
 
 
+E2E_AUDIO = """
+import sys
+import numpy as np
+import soundfile as sf
+sr = 44100
+y = np.zeros(int(24 * sr), np.float32)
+rng = np.random.default_rng(7)
+for b in range(int(23 / 0.5)):                     # a beat every 0.5 s (120 BPM)
+    k = int((0.5 + b * 0.5) * sr)
+    y[k:k + 400] += 0.6 * rng.standard_normal(400).astype(np.float32) * np.hanning(800)[400:]
+sf.write(sys.argv[1], np.stack([y, y], axis=1), sr)
+"""
+
+
+def end_to_end(py: Path, engine: Path) -> str:
+    """Chart a synthetic song through the real command line, in a scratch
+    workspace: to-ogg (libsndfile), analysis (scipy), the model (onnxruntime),
+    the foot model, .ssc/.sm writing (simfile) and the preview PNG (Pillow)."""
+    with tempfile.TemporaryDirectory(prefix="stepforge-smoke-") as tmp:
+        ws = Path(tmp)
+        shutil.copytree(engine / "tools", ws / "tools")
+        for d in ("assets/tracks", "public/assets/tracks", "public/maps", "build"):
+            (ws / d).mkdir(parents=True, exist_ok=True)
+        env = dict(os.environ, PYTHONPATH=str(ws / "tools"), PYTHONNOUSERSITE="1",
+                   PYTHONDONTWRITEBYTECODE="1", PYTHONUTF8="1", PYTHONIOENCODING="utf-8",
+                   BEATFORGE_NEURAL_MODEL_DIR=str(engine / "models" / "stepforge_flow"))
+
+        def run(*args: str, timeout: int = 600) -> None:
+            r = subprocess.run([str(py), *args], cwd=ws, env=env, capture_output=True,
+                               text=True, timeout=timeout)
+            if r.returncode != 0:
+                raise SystemExit(f"smoke test failed at {' '.join(args[:3])}:\n{r.stdout[-1500:]}\n{r.stderr[-3000:]}")
+
+        wav = ws / "assets/tracks/smoke.wav"
+        run("-c", E2E_AUDIO, str(wav))
+        run("-m", "beatforge", "to-ogg", "--in", str(wav), "--out", str(ws / "public/assets/tracks/smoke.ogg"))
+        wav.unlink()
+        run("-m", "beatforge", "stepforge", "--track", "smoke", "--difficulties", "easy,hard",
+            "--engine", "neural", "--backend", "local")
+        song = ws / "build" / "stepmania" / "smoke"
+        missing = [n for n in ("smoke.ssc", "smoke.sm", "hard.notefield.png") if not (song / n).is_file()]
+        if missing:
+            raise SystemExit(f"smoke test: the chart run did not write {missing} (got {sorted(p.name for p in song.glob('*'))})")
+        charts = (song / "smoke.ssc").read_text(encoding="utf-8").count("#NOTEDATA:")
+        return f"charted a song end to end ({charts} charts)"
+
+
 def smoke_test(py: Path, engine: Path) -> None:
     env = dict(os.environ, PYTHONPATH=str(engine / "tools"), PYTHONNOUSERSITE="1",
                PYTHONDONTWRITEBYTECODE="1")
@@ -268,6 +355,7 @@ def smoke_test(py: Path, engine: Path) -> None:
     log(f"smoke test ok: {status.get('display_name')} via onnxruntime "
         f"{run.stdout.strip().splitlines()[-1]}, "
         f"style index {'yes' if status.get('style_rag_available') else 'no'}")
+    log(f"smoke test ok: {end_to_end(py, engine)}")
 
 
 def tree_size(p: Path) -> int:
