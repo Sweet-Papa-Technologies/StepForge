@@ -74,6 +74,9 @@ const nav = [
 /** The app's own version, from the bundle (falls back while it loads). */
 const appVersion = ref("0.1");
 getVersion().then((v) => (appVersion.value = v)).catch(() => {});
+/** "0.1.0-beta.1" already says beta; a plain "0.1.0" gets the word added. */
+const versionLabel = computed(() =>
+  /-/.test(appVersion.value) ? `v${appVersion.value}` : `v${appVersion.value} Beta`);
 </script>
 
 <template>
@@ -86,7 +89,7 @@ getVersion().then((v) => (appVersion.value = v)).catch(() => {});
         StepForge
       </h1>
       <p class="font-label-mono text-label-mono text-on-surface-variant mt-1 uppercase tracking-widest">
-        v{{ appVersion }} Beta
+        {{ versionLabel }}
       </p>
     </div>
 
