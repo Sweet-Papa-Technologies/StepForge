@@ -1,0 +1,13 @@
+# StepForge Flow — OFFLINE TRAINING ONLY (tools/beatforge/adapters/stepmania/neural/train).
+# The desktop app and `--engine neural` never need any of this: inference runs on
+# numpy + scipy + simfile + onnxruntime (requirements.txt). REQ-SFN-01.
+#
+#   python3 -m pip install -r requirements.txt -r requirements-train.txt
+torch>=2.3
+torchaudio
+safetensors
+onnx
+onnxscript
+tqdm
+# Optional, only for `corpus compile --with-demucs` (4-stem shards):
+# demucs

@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+*.egg-info/
+
+# Node
+node_modules/
+
+# OS
+.DS_Store
+
+# Generated chart output (analysis cache, emitted charts)
+/build/
+!/build/.gitkeep
+
+# Local credentials
+*.sa-key.json
+sa-key.json
+.env
+
+# Desktop app build artifacts
+/desktop/dist/
+/desktop/target/
+/desktop/src-tauri/target/
+
+# Runtime bundled into release builds (desktop/scripts/stage_runtime.py)
+/desktop/src-tauri/runtime/
+/.cache/
+
+# Your audio and charts
+/assets/tracks/*
+!/assets/tracks/.gitkeep
+/public/assets/tracks/*
+/public/maps/*
+!/public/maps/.gitkeep

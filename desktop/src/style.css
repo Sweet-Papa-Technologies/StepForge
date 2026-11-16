@@ -1,0 +1,125 @@
+/* Bundled fonts (offline, no CDN) */
+@import "@fontsource/inter/400.css";
+@import "@fontsource/inter/500.css";
+@import "@fontsource/inter/600.css";
+@import "@fontsource-variable/jetbrains-mono";
+
+/* Material Symbols, subset to the icons this app uses: 3.4 MB -> ~84 KB.
+   Regenerate after adding icons:  python3 scripts/subset-icons.py            */
+@font-face {
+  font-family: "Material Symbols Outlined";
+  font-style: normal;
+  font-weight: 100 700;
+  font-display: block;
+  src: url("./assets/material-symbols-subset.woff2") format("woff2");
+}
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    color-scheme: dark;
+  }
+  html,
+  body,
+  #app {
+    height: 100%;
+    margin: 0;
+  }
+  body {
+    @apply bg-surface text-on-surface;
+    font-family: Inter, system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    overflow: hidden;
+  }
+  ::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+  ::-webkit-scrollbar-track {
+    background: #131316;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: #353438;
+    border-radius: 4px;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: #504254;
+  }
+}
+
+@layer components {
+  .material-symbols-outlined {
+    font-family: "Material Symbols Outlined";
+    font-weight: normal;
+    font-style: normal;
+    font-size: 24px;
+    line-height: 1;
+    letter-spacing: normal;
+    text-transform: none;
+    display: inline-block;
+    white-space: nowrap;
+    word-wrap: normal;
+    direction: ltr;
+    font-feature-settings: "liga";
+    -webkit-font-smoothing: antialiased;
+    font-variation-settings:
+      "FILL" 0,
+      "wght" 400,
+      "GRAD" 0,
+      "opsz" 24;
+    user-select: none;
+  }
+  .icon-fill {
+    font-variation-settings: "FILL" 1;
+  }
+  .scrollbar-hide::-webkit-scrollbar {
+    display: none;
+  }
+  .waveform-text {
+    background: linear-gradient(90deg, #bc13fe 0%, #00eefc 100%);
+    -webkit-background-clip: text;
+    background-clip: text;
+    -webkit-text-fill-color: transparent;
+  }
+  .waveform-bg {
+    background: linear-gradient(90deg, rgba(188, 19, 254, 0.2) 0%, rgba(0, 238, 252, 0.2) 100%);
+  }
+  .waveform-bar {
+    background: linear-gradient(to top, #bc13fe 0%, #00eefc 100%);
+    border-radius: 1px;
+  }
+  .grid-bg {
+    background-image:
+      linear-gradient(to right, #333338 1px, transparent 1px),
+      linear-gradient(to bottom, #333338 1px, transparent 1px);
+    background-size: 32px 32px;
+  }
+}
+
+@keyframes bf-spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+.spinner {
+  animation: bf-spin 1s linear infinite;
+}
+@keyframes bf-blink {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0;
+  }
+}
+.cursor-blink {
+  animation: bf-blink 1s step-end infinite;
+}

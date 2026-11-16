@@ -1,0 +1,86 @@
+{
+  "name": "stepforge_flow",
+  "codec_version": "1.0",
+  "created": "2026-11-14T05:18:44Z",
+  "opset": 17,
+  "files": {
+    "stage_a": "stage_a_rhythm.onnx",
+    "stage_b": "stage_b_choreo.onnx"
+  },
+  "quantization": "fp32",
+  "trained_with_stems": false,
+  "features": {
+    "sr": 22050,
+    "n_fft": 512,
+    "hop": 220,
+    "n_mel": 20,
+    "fmin": 30.0,
+    "fmax": 11000.0,
+    "d_in": 64,
+    "flux_lead_s": 0.003,
+    "ticks_per_measure": 48,
+    "ctx_k": 17,
+    "n_scalars": 31,
+    "cond_dim": 19,
+    "hold_dur_buckets": [
+      3,
+      6,
+      9,
+      12,
+      18,
+      24,
+      36,
+      48,
+      72,
+      96
+    ]
+  },
+  "stage_a": {
+    "config": {
+      "d_in": 64,
+      "cond_dim": 19,
+      "d_model": 16,
+      "n_layers": 1,
+      "n_heads": 2,
+      "ffn_mult": 4,
+      "conv_kernel": 7,
+      "dropout": 0.0
+    },
+    "params": 8899,
+    "outputs": [
+      "onset_logit",
+      "jump_logit",
+      "hold_type_logits",
+      "hold_dur_logits",
+      "mine_logit",
+      "hidden_state"
+    ],
+    "parity_max_abs_diff": 1.52587890625e-05
+  },
+  "stage_b": {
+    "config": {
+      "d_in": 64,
+      "ctx_k": 17,
+      "n_scalars": 31,
+      "cond_dim": 19,
+      "d_model": 16,
+      "n_layers": 1,
+      "n_heads": 2,
+      "ffn_mult": 4,
+      "d_audio": 8,
+      "dropout": 0.0
+    },
+    "params": 10092,
+    "inputs": [
+      "ctx",
+      "scalars",
+      "tokens",
+      "cond"
+    ],
+    "parity_max_abs_diff": 4.76837158203125e-07
+  },
+  "metrics": {
+    "note": "random init test fixture"
+  },
+  "fixture": true
+}

@@ -1,0 +1,120 @@
+{
+  "name": "stepforge_flow",
+  "version": "1.4",
+  "display_name": "StepForge Flow v1.4",
+  "codec_version": "1.0",
+  "created": "2026-11-15T22:02:46Z",
+  "opset": 17,
+  "files": {
+    "stage_a": "stage_a_rhythm.onnx",
+    "stage_b": "stage_b_choreo.onnx",
+    "stage_a_int8": "stage_a_rhythm.int8.onnx",
+    "stage_b_int8": "stage_b_choreo.int8.onnx"
+  },
+  "quantization": "fp32+int8",
+  "trained_with_stems": false,
+  "features": {
+    "sr": 22050,
+    "n_fft": 512,
+    "hop": 220,
+    "n_mel": 20,
+    "fmin": 30.0,
+    "fmax": 11000.0,
+    "d_in": 64,
+    "flux_lead_s": 0.003,
+    "ticks_per_measure": 48,
+    "ctx_k": 17,
+    "n_scalars": 31,
+    "cond_dim": 19,
+    "hold_dur_buckets": [
+      3,
+      6,
+      9,
+      12,
+      18,
+      24,
+      36,
+      48,
+      72,
+      96
+    ]
+  },
+  "stage_a": {
+    "config": {
+      "d_in": 64,
+      "cond_dim": 19,
+      "d_model": 256,
+      "n_layers": 6,
+      "n_heads": 4,
+      "ffn_mult": 4,
+      "conv_kernel": 7,
+      "dropout": 0.3
+    },
+    "params": 9643539,
+    "outputs": [
+      "onset_logit",
+      "jump_logit",
+      "hold_type_logits",
+      "hold_dur_logits",
+      "mine_logit",
+      "hidden_state"
+    ],
+    "parity_max_abs_diff": 5.7220458984375e-06
+  },
+  "stage_b": {
+    "config": {
+      "d_in": 64,
+      "ctx_k": 17,
+      "n_scalars": 31,
+      "cond_dim": 19,
+      "d_model": 320,
+      "n_layers": 8,
+      "n_heads": 8,
+      "ffn_mult": 4,
+      "d_audio": 128,
+      "dropout": 0.1
+    },
+    "params": 15216852,
+    "inputs": [
+      "ctx",
+      "scalars",
+      "tokens",
+      "cond"
+    ],
+    "parity_max_abs_diff": 7.62939453125e-06
+  },
+  "metrics": {
+    "stage_a": {
+      "focal": 0.051753721199929714,
+      "card": 1.0770825743675232,
+      "w1": 3.865469217300415,
+      "jump": 0.25271327048540115,
+      "hold_type": 0.32971128076314926,
+      "hold_dur": 2.8023869395256042,
+      "mine": 0.002685135928913951,
+      "loss": 5.531533479690552,
+      "ap": 0.7925829337916137,
+      "r_prec": 0.7801652329749075,
+      "f1": 0.7905731742798953,
+      "count_err": 1.0827489556937382,
+      "jump_acc": 0.9245939675174014,
+      "hold_type_acc": 0.9253266577115643
+    },
+    "stage_b": {
+      "ce": 1.417552411556244,
+      "ergo": 0.08816451206803322,
+      "acc": 0.3932814598083496,
+      "loss": 1.4219606518745422,
+      "acc_full": 0.34781290273671445,
+      "acc_half": 0.482265184959659,
+      "gen_cost": 0.11697872570695676,
+      "gen_hard": 0.0,
+      "gen_dstep": 0.0003003003003003003,
+      "ref_cost": 1.910839072642146,
+      "ref_hard": 0.0,
+      "ref_dstep": 0.011650316885303779
+    },
+    "stage_a_epoch": 44,
+    "stage_b_epoch": 120
+  }
+}

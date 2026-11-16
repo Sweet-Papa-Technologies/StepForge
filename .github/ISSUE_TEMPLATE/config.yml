@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Chat on Discord
+    url: https://discord.gg/kFHgCKr5E3
+    about: Questions, ideas and sharing charts
+  - name: Remove my song or chart from future models
+    url: https://github.com/Sweet-Papa-Technologies/StepForge/issues/new?title=Removal%20request&labels=removal-request
+    about: If you made a song or chart listed in models/stepforge_flow/CREDITS.csv

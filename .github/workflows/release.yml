@@ -1,0 +1,326 @@
+name: Release
+
+# Push a version tag that points at a commit on main -> signed builds for
+# macOS, Windows and Linux, published to the Releases page.
+#
+#   git tag -a v0.1.0-beta.1 -m "StepForge 0.1.0 beta 1" && git push origin v0.1.0-beta.1
+#
+# A tag with a hyphen (v0.2.0-beta.3) is published as a pre-release.
+#
+# Every build bundles its own Python runtime, the charting engine and the
+# StepForge Flow model (desktop/scripts/stage_runtime.py), so users install
+# nothing else.
+#
+# Signing (scripts/setup-ci.sh sets all of this up):
+#   macOS    secrets APPLE_CERT_P12, APPLE_CERT_PASSWORD (Developer ID Application
+#            .p12), APPLE_TEAM_ID; notarization with an App Store Connect API key:
+#            ASC_KEY_P8 (base64 .p8), ASC_KEY_ID, ASC_ISSUER_ID
+#   Windows  Azure Trusted Signing through GitHub OIDC: repository variables
+#            AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID, and the
+#            `release` environment that the Azure app trusts
+# A missing credential degrades that platform to an unsigned build with a
+# warning instead of failing the release.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to (re)build and publish, e.g. v0.1.0-beta.1"
+        required: true
+
+concurrency:
+  group: release-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  meta:
+    name: Version
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.v.outputs.tag }}
+      version: ${{ steps.v.outputs.version }}
+      prerelease: ${{ steps.v.outputs.prerelease }}
+      sha: ${{ steps.v.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.inputs.tag || github.ref }}
+      - id: v
+        run: |
+          set -euo pipefail
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]] \
+            || { echo "::error::$TAG is not a vX.Y.Z[-pre] tag"; exit 1; }
+          SHA=$(git rev-parse HEAD)
+          git fetch --quiet origin main
+          git merge-base --is-ancestor "$SHA" origin/main \
+            || { echo "::error::$TAG ($SHA) is not on main — releases are cut from main only"; exit 1; }
+          VERSION="${TAG#v}"
+          PRE=false; [[ "$VERSION" == *-* ]] && PRE=true
+          { echo "tag=$TAG"; echo "version=$VERSION"; echo "prerelease=$PRE"; echo "sha=$SHA"; } >> "$GITHUB_OUTPUT"
+          echo "Releasing $TAG ($VERSION, prerelease=$PRE) from $SHA"
+
+  macos:
+    name: macOS (Apple silicon)
+    needs: meta
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: "${{ needs.meta.outputs.sha }}" }
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with: { workspaces: desktop/src-tauri }
+
+      - name: Set the version
+        run: python3 desktop/scripts/set_version.py "${{ needs.meta.outputs.version }}"
+
+      - name: Import the Developer ID certificate
+        id: cert
+        env:
+          APPLE_CERT_P12: ${{ secrets.APPLE_CERT_P12 }}
+          APPLE_CERT_PASSWORD: ${{ secrets.APPLE_CERT_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "${APPLE_CERT_P12:-}" ]; then
+            echo "::warning::no APPLE_CERT_P12 secret — the macOS build will be unsigned"
+            echo "identity=" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          KEYCHAIN="$RUNNER_TEMP/signing.keychain-db"
+          PASS=$(openssl rand -hex 24)
+          security create-keychain -p "$PASS" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$PASS" "$KEYCHAIN"
+          printf '%s' "$APPLE_CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" -P "$APPLE_CERT_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$PASS" "$KEYCHAIN" >/dev/null
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+          rm -f "$RUNNER_TEMP/cert.p12"
+          ID=$(security find-identity -v -p codesigning "$KEYCHAIN" | grep -o '"Developer ID Application: [^"]*"' | head -1 | tr -d '"')
+          [ -n "$ID" ] || { echo "::error::the certificate holds no Developer ID Application identity"; exit 1; }
+          echo "identity=$ID" >> "$GITHUB_OUTPUT"
+          echo "signing as: $ID"
+
+      - name: Stage the bundled runtime
+        env:
+          SIGN_IDENTITY: ${{ steps.cert.outputs.identity }}
+        run: python3 desktop/scripts/stage_runtime.py --version "${{ needs.meta.outputs.version }}"
+
+      - name: App Store Connect key
+        id: asc
+        env:
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+        run: |
+          set -euo pipefail
+          if [ -z "${ASC_KEY_P8:-}" ] || [ -z "${{ steps.cert.outputs.identity }}" ]; then
+            echo "::warning::no notarization credential — the macOS build will not be notarized"
+            echo "path=" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          printf '%s' "$ASC_KEY_P8" | base64 --decode > "$RUNNER_TEMP/AuthKey.p8"
+          echo "path=$RUNNER_TEMP/AuthKey.p8" >> "$GITHUB_OUTPUT"
+
+      - name: Build, sign and notarize the app
+        working-directory: desktop
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ steps.cert.outputs.identity }}
+          APPLE_API_KEY_PATH: ${{ steps.asc.outputs.path }}
+          APPLE_API_KEY: ${{ secrets.ASC_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.ASC_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          npm ci
+          python3 -m pip install --quiet fonttools brotli
+          [ -n "$APPLE_API_KEY_PATH" ] || unset APPLE_API_KEY_PATH APPLE_API_KEY APPLE_API_ISSUER
+          [ -n "$APPLE_SIGNING_IDENTITY" ] || unset APPLE_SIGNING_IDENTITY
+          npx tauri build --config src-tauri/tauri.release.conf.json --bundles app,dmg
+
+      - name: Sign, notarize and staple the disk image
+        if: steps.asc.outputs.path != ''
+        env:
+          IDENTITY: ${{ steps.cert.outputs.identity }}
+          KEY: ${{ steps.asc.outputs.path }}
+          KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ISSUER: ${{ secrets.ASC_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          DMG=$(ls desktop/src-tauri/target/release/bundle/dmg/*.dmg | head -1)
+          codesign --force --timestamp --sign "$IDENTITY" "$DMG"
+          xcrun notarytool submit "$DMG" --key "$KEY" --key-id "$KEY_ID" --issuer "$ISSUER" --wait --timeout 60m
+          xcrun stapler staple "$DMG"
+          APP=desktop/src-tauri/target/release/bundle/macos/StepForge.app
+          spctl --assess --type execute -vv "$APP"
+          xcrun stapler validate "$DMG"
+
+      - name: Collect
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp desktop/src-tauri/target/release/bundle/dmg/*.dmg "dist/StepForge-${{ needs.meta.outputs.version }}-macos-arm64.dmg"
+          ls -la dist
+      - uses: actions/upload-artifact@v4
+        with: { name: macos, path: dist/*, if-no-files-found: error }
+
+  windows:
+    name: Windows (x64)
+    needs: meta
+    runs-on: windows-latest
+    environment: release
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: "${{ needs.meta.outputs.sha }}" }
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with: { workspaces: desktop/src-tauri }
+
+      - name: Set the version
+        shell: bash
+        run: python desktop/scripts/set_version.py "${{ needs.meta.outputs.version }}"
+
+      - name: Stage the bundled runtime
+        shell: bash
+        run: python desktop/scripts/stage_runtime.py --version "${{ needs.meta.outputs.version }}"
+
+      - name: Azure login (OIDC)
+        id: az
+        if: vars.AZURE_CLIENT_ID != ''
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Signing tool
+        if: steps.az.outcome == 'success'
+        shell: bash
+        run: dotnet tool install --global sign --prerelease
+
+      - name: Build (and sign)
+        working-directory: desktop
+        shell: bash
+        env:
+          SIGNED: ${{ steps.az.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          npm ci
+          python -m pip install --quiet fonttools brotli
+          CONFIGS=(--config src-tauri/tauri.release.conf.json)
+          if [ "$SIGNED" = true ]; then
+            CONFIGS+=(--config src-tauri/tauri.windows-sign.conf.json)
+          else
+            echo "::warning::no Azure login — the Windows build will be unsigned"
+          fi
+          npx tauri build "${CONFIGS[@]}" --bundles nsis
+
+      - name: Collect
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp desktop/src-tauri/target/release/bundle/nsis/*-setup.exe "dist/StepForge-${{ needs.meta.outputs.version }}-windows-x64-setup.exe"
+          ls -la dist
+      - uses: actions/upload-artifact@v4
+        with: { name: windows, path: dist/*, if-no-files-found: error }
+
+  linux:
+    name: Linux (x64)
+    needs: meta
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: "${{ needs.meta.outputs.sha }}" }
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with: { workspaces: desktop/src-tauri }
+      - name: System libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libssl-dev file
+      - name: Set the version
+        run: python3 desktop/scripts/set_version.py "${{ needs.meta.outputs.version }}"
+      - name: Stage the bundled runtime
+        run: python3 desktop/scripts/stage_runtime.py --version "${{ needs.meta.outputs.version }}"
+      - name: Build
+        working-directory: desktop
+        run: |
+          set -euo pipefail
+          npm ci
+          python3 -m pip install --quiet fonttools brotli
+          npx tauri build --config src-tauri/tauri.release.conf.json --bundles deb,appimage
+      - name: Collect
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          V="${{ needs.meta.outputs.version }}"
+          cp desktop/src-tauri/target/release/bundle/deb/*.deb "dist/StepForge-$V-linux-amd64.deb"
+          cp desktop/src-tauri/target/release/bundle/appimage/*.AppImage "dist/StepForge-$V-linux-x86_64.AppImage"
+          ls -la dist
+      - uses: actions/upload-artifact@v4
+        with: { name: linux, path: dist/*, if-no-files-found: error }
+
+  publish:
+    name: Publish
+    needs: [meta, macos, windows, linux]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.meta.outputs.sha }}
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: "{macos,windows,linux}"
+          merge-multiple: true
+      - name: Checksums
+        working-directory: dist
+        run: |
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.meta.outputs.tag }}
+          VERSION: ${{ needs.meta.outputs.version }}
+          PRE: ${{ needs.meta.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+          PREV=$(git describe --abbrev=0 --tags "$TAG^" 2>/dev/null || true)
+          CHANGES=$(git log ${PREV:+$PREV..}"$TAG" --no-merges --pretty='- %s' | awk 'NR<=40')
+          python3 .github/release_notes.py "$VERSION" "$PRE" "$PREV" > notes.md <<< "$CHANGES"
+          FLAGS=(--title "StepForge $VERSION" --notes-file notes.md --verify-tag)
+          [ "$PRE" = true ] && FLAGS+=(--prerelease)
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+            gh release edit "$TAG" --notes-file notes.md
+          else
+            gh release create "$TAG" dist/* "${FLAGS[@]}"
+          fi
+          gh release view "$TAG"

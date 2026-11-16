@@ -1,0 +1,129 @@
+"""footflow.py — the foot-state machine + comfort cost model (STEPFORGE §5,
+Appendix C). This is what makes a 4-panel chart feel good: the realizer solves a
+lowest-cost panel assignment over these penalties.
+
+State = (l_panel, r_panel, last_foot):
+  l_panel/r_panel ∈ {0,1,2,3}  which panel each foot currently rests on (L,D,U,R)
+  last_foot       ∈ {-1,0,1}   which foot moved last (-1 = none yet; 0=L, 1=R)
+"""
+from __future__ import annotations
+
+from .grammar import PANEL_POS
+
+# Penalty constants (tunable). double-step ≫ jack(low) > crossover > footswitch.
+DOUBLE_STEP = 8.0
+JACK = 6.0
+FOOTSWITCH = 2.0
+FOOTSWITCH_ILLEGAL = 40.0
+CROSSOVER = 5.0
+FORBIDDEN = 1e6
+ALT_BONUS = -1.0            # reward clean alternation
+DRIFT_BONUS = -0.8         # reward honoring the phrase movement direction
+
+LEFT, RIGHT, NONE = 0, 1, -1
+REST_STATE = (0, 3, NONE)  # left foot on L, right foot on R, nobody moved yet
+
+_CROSS_SCALE = {"none": 6.0, "light": 1.0, "moderate": 0.4}
+
+
+def _x(panel: int) -> float:
+    return PANEL_POS[panel][0]
+
+
+#: A repeated arrow is a jack only when it is fast. Stepping on the same arrow
+#: again a beat or two later is how beginner charts are written (30% of the
+#: steps in a typical human Beginner chart repeat the previous arrow); it costs
+#: nothing at JACK_FREE_S or slower, and the full jack cost at JACK_FULL_S or
+#: faster, linearly in between. Applied only when the caller says how long ago
+#: the previous step was.
+JACK_FREE_S = 0.65
+JACK_FULL_S = 0.35
+
+
+def repeat_scale(dt_s: float | None) -> float:
+    """Share of the repeat penalty that applies `dt_s` after the previous step."""
+    if dt_s is None:
+        return 1.0
+    return min(1.0, max(0.0, (JACK_FREE_S - dt_s) / (JACK_FREE_S - JACK_FULL_S)))
+
+
+def step(state, foot: int, new_panel: int, budget, movement: str, progress: float,
+         beat: float = 0.0, dt_s: float | None = None):
+    """Cost of moving `foot` onto `new_panel` from `state`, and the resulting
+    state. Returns (cost, new_state). `dt_s`, the time since the previous step,
+    lets a slow repeat of the same arrow go unpenalised (see JACK_FREE_S);
+    without it every repeat is scored as a jack, as before."""
+    l, r, last = state
+    if foot == LEFT:
+        moving_from, new_l, new_r = l, new_panel, r
+        other_panel = r
+    else:
+        moving_from, new_l, new_r = r, l, new_panel
+        other_panel = l
+
+    cost = 0.0
+    # double-step: same foot twice when we could have alternated
+    if last == foot:
+        if new_panel == moving_from:
+            # a jack: the same foot on the same panel again. Not a double-step
+            # in the sense that matters (the foot never leaves the panel), and
+            # no strain at all once the repeat is slow.
+            cost += (DOUBLE_STEP + JACK) * repeat_scale(dt_s)
+        else:
+            cost += DOUBLE_STEP
+    # footswitch: stepping on the panel the OTHER foot was resting on, alternating
+    if last != foot and last != NONE and new_panel == other_panel:
+        cost += FOOTSWITCH if budget.footswitch else FOOTSWITCH_ILLEGAL
+    # crossover: left foot ends up physically right of the right foot (or vice versa)
+    if _x(new_l) > _x(new_r) + 1e-9:
+        cost += CROSSOVER * _CROSS_SCALE.get(budget.crossover, 1.0)
+    # both feet on the same panel simultaneously is impossible only for jumps;
+    # for sequential steps it just means a footswitch handled above.
+    # comfort: clean alternation onto a fresh panel
+    if last != foot and new_panel != moving_from:
+        cost += ALT_BONUS
+    # D and U are symmetric in the horizontal cost model, so ties always fell to
+    # D and starved U (panel balance). Break the tie by beat parity so both
+    # vertical panels get exercised roughly evenly.
+    if new_panel in (1, 2):
+        prefer_u = int(round(beat * 2)) % 2 == 1
+        cost += -0.15 if (new_panel == 2) == prefer_u else 0.15
+    # honor the phrase's movement direction
+    cost += _movement_cost(new_panel, movement, progress)
+    return cost, (new_l, new_r, foot)
+
+
+# Jump-shape variety: rotating preferred bracket by beat so jumps aren't all the
+# same wide L+R. Order mixes horizontal (LR), vertical (DU) and diagonal brackets.
+_JUMP_SHAPES = [(0, 3), (0, 2), (1, 3), (0, 1), (2, 3), (1, 2)]  # LR LU DR LD UR DU
+
+
+def jump_cost(state, pl: int, pr: int, budget, beat: float = 0.0):
+    """Cost of a two-panel jump landing left foot on `pl`, right foot on `pr`."""
+    if pl == pr:
+        return FORBIDDEN, state
+    cost = 0.0
+    if _x(pl) > _x(pr) + 1e-9:          # crossed jump — physically a twist
+        cost += FORBIDDEN if budget.crossover == "none" else CROSSOVER * 3
+    # gently prefer feet on their natural sides (weak, so shape variety can win)
+    cost += 0.2 * (abs(_x(pl) - (-1)) + abs(_x(pr) - 1))
+    # reward the beat's rotating preferred bracket so consecutive jumps differ
+    pref = _JUMP_SHAPES[int(round(beat)) % len(_JUMP_SHAPES)]
+    if tuple(sorted((pl, pr))) == pref:
+        cost -= 1.5
+    return cost, (pl, pr, RIGHT)
+
+
+def _movement_cost(new_panel: int, movement: str, progress: float) -> float:
+    """Reward a panel whose horizontal position matches where the phrase's
+    movement wants the feet to be at `progress` (0..1 through the phrase)."""
+    x = _x(new_panel)                    # -1 (L) .. +1 (R)
+    if movement == "drift_L_to_R":
+        target = -1 + 2 * progress
+    elif movement == "drift_R_to_L":
+        target = 1 - 2 * progress
+    elif movement == "zigzag":
+        target = -1 if int(progress * 8) % 2 == 0 else 1
+    else:                                # static / box / unknown -> no drift pref
+        return 0.0
+    return DRIFT_BONUS * (1.0 - abs(x - target) / 2.0)

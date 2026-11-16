@@ -1,0 +1,71 @@
+name: CI
+
+# Runs on every pull request and on main. Branch protection requires these
+# checks, so nothing reaches main without them passing.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  engine:
+    name: Engine tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libsndfile1 ffmpeg
+          python -m pip install -r requirements.txt pytest "setuptools<81"
+          npm ci   # bsmap, for the Beat Saber serializer tests
+      - name: Tests
+        working-directory: tools
+        run: python -m pytest beatforge/tests -q -p no:cacheprovider
+
+  desktop:
+    name: Desktop app
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop/src-tauri
+      - name: System libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libssl-dev
+      - name: Frontend (type check + build)
+        working-directory: desktop
+        run: |
+          npm ci
+          npm run build
+      - name: Rust tests
+        working-directory: desktop/src-tauri
+        run: cargo test --locked
