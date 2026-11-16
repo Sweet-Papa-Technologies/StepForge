@@ -34,7 +34,8 @@ Get the latest build from the **[Releases page](https://github.com/Sweet-Papa-Te
 
 | Platform | File | Notes |
 |---|---|---|
-| macOS 11+ (Apple silicon) | `StepForge-…-macos-arm64.dmg` | Signed and notarized by Apple |
+| macOS 12.3+ (Apple silicon: M1 and later) | `StepForge-…-macos-arm64.dmg` | Signed and notarized by Apple |
+| macOS 12.3+ (Intel) | `StepForge-…-macos-x64.dmg` | Signed and notarized by Apple |
 | Windows 10 / 11 (x64) | `StepForge-…-windows-x64-setup.exe` | Signed |
 | Linux (x64) | `StepForge-…-linux-x86_64.AppImage` or `…-amd64.deb` | |
 

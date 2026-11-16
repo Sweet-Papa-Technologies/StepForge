@@ -24,7 +24,8 @@ the download.
 
 | Platform | File |
 |---|---|
-| macOS 11+ (Apple silicon) | `StepForge-{version}-macos-arm64.dmg` |
+| macOS 12.3+ (Apple silicon) | `StepForge-{version}-macos-arm64.dmg` |
+| macOS 12.3+ (Intel) | `StepForge-{version}-macos-x64.dmg` |
 | Windows 10/11 (x64) | `StepForge-{version}-windows-x64-setup.exe` |
 | Linux (x64) | `StepForge-{version}-linux-x86_64.AppImage` or `StepForge-{version}-linux-amd64.deb` |
 
