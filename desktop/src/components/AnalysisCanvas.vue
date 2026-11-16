@@ -297,7 +297,7 @@ onBeforeUnmount(() => {
       v-else-if="!analysis"
       class="absolute bottom-2 left-0 right-0 text-center font-label-mono text-[11px] text-on-surface-variant"
     >
-      Not analyzed yet — run Analyze to measure tempo, beat grid and onsets.
+      Not analyzed yet. Generating charts analyzes the song first (tempo, beat grid, onsets).
     </div>
   </div>
 </template>

@@ -32,23 +32,24 @@ const busy = computed(
   top: 0;
   left: 0;
   right: 0;
-  height: 3px;
+  height: 4px;
   z-index: 60;
   overflow: hidden;
   pointer-events: none;
-  background: rgba(188, 19, 254, 0.15);
+  background: rgba(188, 19, 254, 0.28);
+  box-shadow: 0 0 12px rgba(188, 19, 254, 0.55);
 }
 .activity-bar__run {
   position: absolute;
   top: 0;
   bottom: 0;
-  width: 35%;
-  background: linear-gradient(90deg, transparent, #bc13fe, #00eefc, transparent);
+  width: 40%;
+  background: linear-gradient(90deg, transparent, #e86bff, #00eefc, transparent);
   animation: activity-run 1.4s ease-in-out infinite;
 }
 @keyframes activity-run {
   from {
-    left: -35%;
+    left: -40%;
   }
   to {
     left: 100%;
