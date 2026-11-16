@@ -89,6 +89,11 @@ where it is clearly behind. Some decoder settings were tuned on 60 of the 180
 songs; on the other 120 the picture is the same (0.645 vs 0.671, not
 significant). Details: [model card](models/stepforge_flow/MODEL_CARD.md).
 
+We also checked for memorization. StepForge doesn't reproduce its training
+charts (its longest exact copy of one is 9 steps), and it carries fewer
+training patterns into new songs than human step artists do. See the
+[model card](models/stepforge_flow/MODEL_CARD.md#memorization-check).
+
 ## How it works
 
 1. **Listen.** Signal processing finds the song's tempo, beat grid and every onset.

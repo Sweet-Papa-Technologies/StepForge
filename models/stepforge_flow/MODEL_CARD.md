@@ -73,6 +73,32 @@ Validation (27 songs): Stage A precision at matched density 0.780, AP 0.793
 Stage B cross-entropy 1.418, 48% accuracy with half the notes masked (epoch 120
 of 140).
 
+## Memorization check
+
+Does v1.4 copy the charts it learned from? Two tests, both with exact matching
+on the 48-ticks-per-bar grid (so a mirrored or flipped copy would not be
+counted).
+
+- **Its own training songs.** v1.4 charted its 227 training songs (944 charts)
+  and 27 held-out songs from the same packs (116 charts). It reproduces the
+  training charts no better than the held-out ones: step-placement F1 0.733 vs
+  0.734 (difference −0.001, 95% interval −0.023 to +0.019). Where it steps on
+  the same tick as the human, it picks the same arrows no more often than
+  chance (24.4%, chance 24.7%). 0.1% of its bars are identical to the human
+  chart's, all of them plain four-step quarter/8th-note bars, and its longest
+  exact run of a training chart is 9 steps. For contrast, two human charts of
+  the same song (Hard and Challenge) share 5.6% of their bars, with runs of up
+  to 366 steps.
+- **New songs.** Of v1.4's 16-step sequences on the 180 benchmark songs, 0.016%
+  appear anywhere in its 950 training charts (270k steps), against 0.26% for
+  the human charts of the same songs; no 32-step sequence of either appears.
+  The longest shared runs (up to 25 steps) are steady quarter- or half-note
+  walks.
+
+One seed, in the most favorable setting for copying (the training songs'
+exact grids, no energy curve or onset filter). The held-out songs also chose
+the checkpoints, which could only hide a gap, not create one.
+
 ## Speed (Apple Silicon laptop CPU, fp32)
 
 Features 0.2–0.7 s per song; then 0.15–0.3 s per chart for a 53 s song, up to
