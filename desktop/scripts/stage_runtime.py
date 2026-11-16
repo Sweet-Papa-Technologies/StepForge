@@ -63,8 +63,9 @@ TK_FILE_RE = re.compile(r"^((lib)?(tcl|tk)\d[\w.]*\.(dll|dylib|so)|_tkinter\..*)
 #: time on Windows well beyond their size.
 SITE_PRUNE = (
     "onnxruntime/transformers", "onnxruntime/tools", "onnxruntime/quantization",
-    "onnxruntime/datasets", "numpy/f2py", "numpy/_core/include",
+    "onnxruntime/datasets", "numpy/_core/include",
 )
+# Not numpy/f2py: scipy imports it while loading (scipy.signal, .stats, …).
 #: Type stubs, C headers and Cython sources: build-time only.
 SITE_PRUNE_SUFFIXES = (".pyi", ".h", ".pxd", ".pxi", ".pyx")
 
@@ -190,8 +191,14 @@ def prune(py_root: Path) -> None:
     bytecode outside the bundle anyway). smoke_test() then charts a song end to
     end with what is left, so an over-eager rule fails the build, not a user."""
     before = sum(1 for f in py_root.rglob("*") if f.is_file())
-    lib = next((p for p in [py_root / "Lib", *sorted((py_root / "lib").glob("python3.*"))]
-                if p.is_dir()), None)
+    # The stdlib folder is the one holding os.py: python/lib/python3.x on macOS
+    # and Linux, python/Lib on Windows. (Testing for "Lib" alone matched
+    # python/lib on macOS's case-insensitive disk, so nothing in site-packages
+    # was pruned there and the Mac smoke test could not catch a bad rule.)
+    lib = next((p for p in [*sorted((py_root / "lib").glob("python3.*")), py_root / "Lib"]
+                if (p / "os.py").is_file()), None)
+    if lib is None:
+        raise SystemExit(f"no standard library found under {py_root}")
     if lib:
         for name in STDLIB_PRUNE:
             shutil.rmtree(lib / name, ignore_errors=True)
