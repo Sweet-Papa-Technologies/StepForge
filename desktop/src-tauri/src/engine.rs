@@ -280,6 +280,10 @@ pub fn save_settings(app: &AppHandle, s: &Settings) -> Result<(), String> {
 }
 
 /// Walk up from the current exe and cwd looking for the engine entrypoint.
+///
+/// A release build carries its own engine, so it never adopts a checkout just
+/// because it was started from inside one; only a development build (no
+/// bundled runtime) looks at the cwd. `BEATFORGE_REPO` still overrides both.
 fn detect_repo_root() -> Option<PathBuf> {
     if let Ok(env) = std::env::var("BEATFORGE_REPO") {
         let p = PathBuf::from(env);
@@ -288,8 +292,10 @@ fn detect_repo_root() -> Option<PathBuf> {
         }
     }
     let mut starts: Vec<PathBuf> = Vec::new();
-    if let Ok(cwd) = std::env::current_dir() {
-        starts.push(cwd);
+    if crate::install::bundled_runtime().is_none() {
+        if let Ok(cwd) = std::env::current_dir() {
+            starts.push(cwd);
+        }
     }
     if let Ok(exe) = std::env::current_exe() {
         starts.push(exe);
