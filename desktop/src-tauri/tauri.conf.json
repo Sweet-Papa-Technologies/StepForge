@@ -48,7 +48,7 @@
     "macOS": {
       "hardenedRuntime": true,
       "entitlements": "entitlements.plist",
-      "minimumSystemVersion": "11.0"
+      "minimumSystemVersion": "12.3"
     },
     "windows": {
       "webviewInstallMode": {

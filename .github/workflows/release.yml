@@ -1,7 +1,8 @@
 name: Release
 
 # Push a version tag that points at a commit on main -> signed builds for
-# macOS, Windows and Linux, published to the Releases page.
+# macOS (Apple silicon and Intel), Windows and Linux, published to the
+# Releases page.
 #
 #   git tag -a v0.1.0-beta.1 -m "StepForge 0.1.0 beta 1" && git push origin v0.1.0-beta.1
 #
@@ -68,9 +69,18 @@ jobs:
           echo "Releasing $TAG ($VERSION, prerelease=$PRE) from $SHA"
 
   macos:
-    name: macOS (Apple silicon)
+    name: macOS (${{ matrix.label }})
     needs: meta
-    runs-on: macos-15
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: macos-15, arch: arm64, label: Apple silicon }
+          # GitHub's last Intel image, supported until August 2027. After that,
+          # stage with --triple x86_64-apple-darwin under Rosetta on an Apple
+          # silicon runner and build with --target x86_64-apple-darwin.
+          - { runner: macos-15-intel, arch: x64, label: Intel }
     steps:
       - uses: actions/checkout@v4
         with: { ref: "${{ needs.meta.outputs.sha }}" }
@@ -168,10 +178,10 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist
-          cp desktop/src-tauri/target/release/bundle/dmg/*.dmg "dist/StepForge-${{ needs.meta.outputs.version }}-macos-arm64.dmg"
+          cp desktop/src-tauri/target/release/bundle/dmg/*.dmg "dist/StepForge-${{ needs.meta.outputs.version }}-macos-${{ matrix.arch }}.dmg"
           ls -la dist
       - uses: actions/upload-artifact@v4
-        with: { name: macos, path: dist/*, if-no-files-found: error }
+        with: { name: "macos-${{ matrix.arch }}", path: dist/*, if-no-files-found: error }
 
   windows:
     name: Windows (x64)
@@ -297,7 +307,7 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           path: dist
-          pattern: "{macos,windows,linux}"
+          pattern: "{macos-*,windows,linux}"
           merge-multiple: true
       - name: Checksums
         working-directory: dist

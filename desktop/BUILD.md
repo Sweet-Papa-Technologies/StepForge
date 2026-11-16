@@ -40,8 +40,18 @@ npx tauri build --config src-tauri/tauri.release.conf.json
 `stage_runtime.py` downloads a self-contained CPython
 ([python-build-standalone](https://github.com/astral-sh/python-build-standalone)),
 installs `requirements.txt` into it, copies the engine and the model next to it,
-stamps `ENGINE_VERSION`, and smoke-tests that the engine sees its model.
-`tauri.release.conf.json` bundles that folder as an app resource.
+stamps `ENGINE_VERSION`, and smoke-tests it by charting a synthetic click track
+with the real model. `tauri.release.conf.json` bundles that folder as an app
+resource.
+
+On macOS the stager installs wheels for the app's declared minimum
+(`bundle.macOS.minimumSystemVersion` in `tauri.conf.json`, currently 12.3), not
+for the build machine's macOS, then checks every bundled binary's load-command
+minimum and fails the build if one needs a newer system. (The macOS 12 floor is
+set by scipy's Apple silicon wheels; onnxruntime 1.19, the newest with macOS 12
+wheels, charts byte-for-byte the same as current releases.) To stage an Intel
+runtime on an Apple silicon Mac, run the stager under Rosetta:
+`arch -x86_64 /usr/bin/python3 desktop/scripts/stage_runtime.py`.
 
 On first launch the app copies `runtime/engine/` into a writable per-user
 workspace (the engine writes beside its code) and runs it with
@@ -65,8 +75,9 @@ inside the (signed) app bundle.
   tests, frontend type check and build, Rust tests. `main` is protected; changes
   land through pull requests with these checks green.
 - `.github/workflows/release.yml` runs when a `v*` tag on `main` is pushed. It
-  builds macOS (Apple silicon `.dmg`), Windows (`-setup.exe`) and Linux
-  (`.AppImage`, `.deb`) in parallel and publishes them, with `SHA256SUMS.txt`, to
+  builds macOS (Apple silicon and Intel `.dmg`s, on `macos-15` and
+  `macos-15-intel`), Windows (`-setup.exe`) and Linux (`.AppImage`, `.deb`) in
+  parallel and publishes them, with `SHA256SUMS.txt`, to
   the Releases page. Tags with a hyphen (`v0.2.0-beta.1`) become pre-releases.
 
 ```bash
