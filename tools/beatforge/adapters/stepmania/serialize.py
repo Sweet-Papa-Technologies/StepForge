@@ -14,6 +14,11 @@ from .grammar import BUDGETS
 from .quantize import to_simfile_notes
 
 
+
+#: Song and chart credit (the "step artist" ITGmania shows). It says what made
+#: the chart, so a chart shared without its context still discloses that.
+CHART_CREDIT = "StepForge (AI-generated)"
+
 def _sample_start(analysis: dict) -> float:
     bpm, offset = analysis["bpm"], analysis["offset"]
     best = max(analysis.get("sections", []),
@@ -41,7 +46,7 @@ def build_simfile(track_meta: dict, analysis: dict, charts_by_diff: dict,
     sf.samplestart = f"{_sample_start(analysis):.3f}"
     sf.samplelength = "12.000"
     sf.selectable = "YES"
-    sf.credit = "STEPFORGE"
+    sf.credit = CHART_CREDIT
     if banner:
         sf.banner = banner
     if background:
@@ -55,9 +60,9 @@ def build_simfile(track_meta: dict, analysis: dict, charts_by_diff: dict,
         chart.stepstype = "dance-single"
         chart.difficulty = budget.sm_difficulty
         chart.meter = str(meter)
-        chart.description = "STEPFORGE"
+        chart.description = CHART_CREDIT          # the step artist in .sm files
         if ssc:
-            chart.credit = "STEPFORGE"
+            chart.credit = CHART_CREDIT
         chart.notes = note_str
         sf.charts.append(chart)
     return sf

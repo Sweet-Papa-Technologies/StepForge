@@ -1,5 +1,5 @@
 """StepForge Flow — the custom beat-grid & biomechanical chart model
-(stepforge_neural_architecture_spec.md).
+(docs/stepforge_neural_architecture_spec.md).
 
 Runtime modules here (`codec`, `conditioning`, `grid_features`, `infer`,
 `style_rag`, `decisions_hook`) import only numpy / scipy / onnxruntime / simfile

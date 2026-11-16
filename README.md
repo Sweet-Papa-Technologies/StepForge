@@ -75,14 +75,19 @@ human charts, and compared step by step.
 
 | 180 held-out songs | StepForge Flow v1.4 | Best open-source auto-charter tested | Two humans |
 |---|---:|---:|---:|
-| Steps placed where the human charter put one (F1, ±20 ms) | **0.656** | 0.674 | ≈ 0.75 |
-| … Hard / Challenge | **0.714 / 0.726** | 0.703 / 0.712 | |
+| Steps placed where the human charter put one (F1, ±20 ms) | 0.656 | 0.674 | ≈ 0.75 |
+| … Beginner | 0.519 | 0.587 | |
+| … Hard / Challenge | 0.714 / 0.726 | 0.703 / 0.712 | |
+| … on the 120 songs never used for tuning | 0.645 | 0.671 | |
 | Chart statistics inside the human range | **98%** | 90% | 94% |
 | Unforced double-steps | **0.01%** of steps | 1.04% | 0.35% |
 
-StepForge is level with the best open-source tool on step placement, ahead at
-Hard and Challenge, and clearly cleaner to play. Beginner and Easy are its weakest
-difficulties today. Details: [model card](models/stepforge_flow/MODEL_CARD.md).
+StepForge is level with the best open-source tool on step placement overall,
+slightly ahead at Hard and Challenge (not statistically significant), and
+clearly cleaner to play. Beginner is its weakest difficulty today, and the one
+where it is clearly behind. Some decoder settings were tuned on 60 of the 180
+songs; on the other 120 the picture is the same (0.645 vs 0.671, not
+significant). Details: [model card](models/stepforge_flow/MODEL_CARD.md).
 
 ## How it works
 
@@ -94,8 +99,10 @@ difficulties today. Details: [model card](models/stepforge_flow/MODEL_CARD.md).
 4. **Check.** An exact search over every possible foot position picks the final
    arrows, which is why every chart is physically playable whatever the networks say.
 
-Both networks run with ONNX Runtime on the CPU. The architecture is described in
-[`stepforge_neural_architecture_spec.md`](stepforge_neural_architecture_spec.md).
+Both networks run with ONNX Runtime on the CPU. The
+[model card](models/stepforge_flow/MODEL_CARD.md) describes what was built; the
+original design plan is in
+[`docs/stepforge_neural_architecture_spec.md`](docs/stepforge_neural_architecture_spec.md).
 
 ### Training data and credits
 
@@ -137,7 +144,9 @@ Bug reports and ideas: [Issues](https://github.com/Sweet-Papa-Technologies/StepF
 - Source code: [MIT](LICENSE).
 - StepForge Flow model weights: [CC BY-NC-SA 4.0](models/stepforge_flow/LICENSE.md),
   because some of the training songs carry non-commercial and share-alike terms.
-- Charts you make with StepForge are yours.
+- Charts you make with StepForge are yours. Every chart it writes is credited
+  **StepForge (AI-generated)**; if you share charts made with it, please keep
+  that credit or say they were made with StepForge.
 
 StepForge is made by [Sweet Papa Technologies](https://github.com/Sweet-Papa-Technologies).
 It is not affiliated with StepMania, ITGmania, OutFox or any game publisher.

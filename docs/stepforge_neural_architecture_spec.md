@@ -1,3 +1,9 @@
+> **Original design spec, kept for history.** It is the plan StepForge Flow
+> started from, and parts of it were never built or were built differently
+> (for example the EmbeddingGemma and Decisions API pieces and the latency
+> target). What was actually built and shipped is described in the
+> [model card](../models/stepforge_flow/MODEL_CARD.md).
+
 # STEPFORGE_NEURAL.SPEC.MD — Custom Beat-Grid & Biomechanical Chart Model ("StepForge Flow")
 
 **Spec version:** 1.0  

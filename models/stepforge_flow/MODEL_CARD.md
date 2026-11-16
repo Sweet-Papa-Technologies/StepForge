@@ -1,6 +1,7 @@
 # StepForge Flow v1.4 — model card
 
-Trained 2026-11-15. Spec: `stepforge_neural_architecture_spec.md`. Codec 1.0.
+Trained 2026-11-15. Codec 1.0. This card describes what was built; the
+original design plan is `docs/stepforge_neural_architecture_spec.md`.
 This is the model the StepForge desktop app ships and uses. License:
 `LICENSE.md` (CC BY-NC-SA 4.0); credits: `CREDITS.csv`.
 
@@ -53,13 +54,17 @@ charter's chart of the same song matches the first.
 | … Beginner / Easy | 0.519 / 0.657 | 0.587 / 0.687 | |
 | … Medium | 0.689 | 0.689 | |
 | … Hard / Challenge | 0.714 / 0.726 | 0.703 / 0.712 | |
+| … on the 120 songs never used for tuning | 0.645 | 0.671 | |
 | Looks like a human chart (12 statistics) | 98% | 90% | 94% |
 | Unforced double-steps, share of notes | 0.01% | 1.04% | 0.35% |
 | Charts with no step the foot model rates forbidden | 100% | 84% | 78% |
 | Density follows song energy (Spearman ρ) | 0.674 | 0.446 | 0.417 |
 
-On placement v1.4 is level with smlab (−0.017, not significant), ahead of it
-on Hard and Challenge and behind it on Beginner. Playability does not depend on
+On placement v1.4 is level with smlab overall (−0.017, not significant) and
+slightly ahead on Hard (+0.011) and Challenge (+0.014), neither significant;
+it is significantly behind on Beginner (−0.069). (Paired bootstrap over songs,
+95% intervals.) The decoder's settings were tuned on 60 of the 180 songs; on
+the other 120 it scores 0.645 against smlab's 0.671 (−0.026, not significant). Playability does not depend on
 the training data: those guarantees come from the decoder and foot model. We
 could not check whether the 180 test songs appear in smlab's training data.
 
