@@ -588,9 +588,9 @@ pub const NEURAL_STYLE_KEYS: [&str; 8] = [
 ];
 
 /// The engine a run uses. An explicit `engine` wins; without one the legacy
-/// `deterministic` switch decides, so a caller written before `--engine`
-/// existed gets exactly the run it always got (and never drifts onto the neural
-/// model just because the weights turned up).
+/// `deterministic` switch picks the DSP path, and anything else charts with the
+/// onboard StepForge Flow model — the only engine StepForge offers. The LLM
+/// designer is reached only by asking for `llm` by name.
 pub fn resolve_chart_engine(engine: Option<&str>, deterministic: bool) -> Result<String, String> {
     match engine.map(str::trim).filter(|e| !e.is_empty()) {
         Some(e) if CHART_ENGINES.contains(&e) => Ok(e.to_string()),
@@ -598,7 +598,7 @@ pub fn resolve_chart_engine(engine: Option<&str>, deterministic: bool) -> Result
             "'{e}' is not a chart engine (expected one of {})",
             CHART_ENGINES.join(", ")
         )),
-        None => Ok(if deterministic { "deterministic" } else { "llm" }.to_string()),
+        None => Ok(if deterministic { "deterministic" } else { "neural" }.to_string()),
     }
 }
 
@@ -2173,7 +2173,8 @@ mod tests {
             .unwrap()
         };
         assert_eq!(flag(&run(None, true), "--engine"), Some("deterministic"));
-        assert_eq!(flag(&run(None, false), "--engine"), Some("llm"));
+        // No engine named: the onboard model, never the LLM designer.
+        assert_eq!(flag(&run(None, false), "--engine"), Some("neural"));
         // A blank engine is the same as none (an unset setting reaches us as "").
         assert_eq!(flag(&run(Some("  "), true), "--engine"), Some("deterministic"));
         // An explicit engine wins over the old switch…
@@ -2398,10 +2399,9 @@ mod tests {
             line(&run(None, true, legacy).unwrap()),
             "stepforge --track neon --difficulties easy,hard --deterministic --backend local"
         );
-        assert_eq!(
-            line(&run(None, false, legacy).unwrap()),
-            "stepforge --track neon --difficulties easy,hard --backend local"
-        );
+        // No engine named means the onboard model, which an engine this old
+        // cannot run: a clear error, not a silent fall back to the LLM.
+        assert!(run(None, false, legacy).is_err());
         // `auto` has no neural model to resolve to there: its fallback applies.
         assert_eq!(
             line(&run(Some("auto"), true, legacy).unwrap()),
