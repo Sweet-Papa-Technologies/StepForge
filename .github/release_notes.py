@@ -28,8 +28,9 @@ the download.
 | Windows 10/11 (x64) | `StepForge-{version}-windows-x64-setup.exe` |
 | Linux (x64) | `StepForge-{version}-linux-x86_64.AppImage` or `StepForge-{version}-linux-amd64.deb` |
 
-Verify a download with `SHA256SUMS.txt`. The macOS app is signed and notarized
-by Apple; the Windows installer is signed by Sweet Papa Technologies.
+Verify a download with `SHA256SUMS.txt`. The macOS app is signed with an Apple
+Developer ID and notarized by Apple; the Windows installer is signed through
+Microsoft Trusted Signing. Both show the publisher as **Forrester Terry**.
 
 ### Changes{f" since {prev}" if prev else ""}
 
