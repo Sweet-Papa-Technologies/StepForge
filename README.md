@@ -40,8 +40,9 @@ Get the latest build from the **[Releases page](https://github.com/Sweet-Papa-Te
 | Linux (x64) | `StepForge-…-linux-x86_64.AppImage` or `…-amd64.deb` | |
 
 Everything the app needs, including Python and the model, is inside the
-download (about 190 MB on Windows, 225 MB on macOS, 350 MB on Linux). You also want [ITGmania](https://www.itgmania.com/)
-(or StepMania 5) to play the charts.
+download (about 190 MB on Windows, 235–250 MB on macOS, 350 MB on Linux).
+You also want [ITGmania](https://www.itgmania.com/) (or StepMania 5) to play
+the charts.
 
 ## What it does
 

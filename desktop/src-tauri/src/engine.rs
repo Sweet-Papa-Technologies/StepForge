@@ -376,13 +376,36 @@ pub fn python_command(app: &AppHandle) -> Command {
         .map(|p| p.to_string_lossy() == py.as_str())
         .unwrap_or(false);
     if bundled {
-        cmd.env("PYTHONNOUSERSITE", "1");
         let cache = crate::install::workspace_dir()
             .unwrap_or_else(std::env::temp_dir)
             .join("build/pycache");
-        cmd.env("PYTHONPYCACHEPREFIX", cache);
+        for (k, v) in bundled_python_env(cache, |k| std::env::var_os(k).is_some()) {
+            cmd.env(k, v);
+        }
     }
     cmd
+}
+
+/// Environment for the bundled interpreter. `is_set` says whether the user's
+/// own environment already sets a variable (theirs wins for tuning knobs).
+///
+/// OpenBLAS threads: the bundled numpy/scipy use OpenBLAS, whose worker
+/// threads do not pay off on the engine's small matrices and spin-wait badly
+/// when the CPU is busy. Measured on Apple silicon (all five difficulties of a
+/// song): 4.6 s with the default threads, 4.1 s single-threaded, and far worse
+/// under load. onnxruntime keeps its own thread pool, so inference is unaffected.
+fn bundled_python_env(
+    pycache: PathBuf,
+    is_set: impl Fn(&str) -> bool,
+) -> Vec<(&'static str, std::ffi::OsString)> {
+    let mut env = vec![
+        ("PYTHONNOUSERSITE", "1".into()),
+        ("PYTHONPYCACHEPREFIX", pycache.into_os_string()),
+    ];
+    if !is_set("OPENBLAS_NUM_THREADS") {
+        env.push(("OPENBLAS_NUM_THREADS", "1".into()));
+    }
+    env
 }
 
 /// Build a `Command` for `python -m beatforge <args>` with PYTHONPATH + creds.
@@ -623,6 +646,17 @@ pub fn spawn_command(app: &AppHandle, job_id: String, mut cmd: Command) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_bundled_python_runs_openblas_single_threaded_unless_the_user_says_otherwise() {
+        let env = bundled_python_env(PathBuf::from("/ws/build/pycache"), |_| false);
+        let get = |k: &str| env.iter().find(|(n, _)| *n == k).map(|(_, v)| v.clone());
+        assert_eq!(get("OPENBLAS_NUM_THREADS"), Some("1".into()));
+        assert_eq!(get("PYTHONNOUSERSITE"), Some("1".into()));
+        assert_eq!(get("PYTHONPYCACHEPREFIX"), Some("/ws/build/pycache".into()));
+        let theirs = bundled_python_env(PathBuf::from("/ws"), |k| k == "OPENBLAS_NUM_THREADS");
+        assert!(theirs.iter().all(|(n, _)| *n != "OPENBLAS_NUM_THREADS"));
+    }
 
     /// The frontend keys log/exit events by `jobId`. A snake_case payload lands
     /// under `undefined`, which silently breaks streaming AND job completion —
