@@ -81,7 +81,17 @@ def test_inference_runs_end_to_end_with_torch_blocked(tmp_path):
     difficulties from audio and writes a .ssc that simfile re-opens."""
     script = textwrap.dedent(f"""
         import sys
-        sys.modules["torch"] = None                    # any `import torch` now raises
+        import importlib.abc
+
+        class _NoTorch(importlib.abc.MetaPathFinder):
+            # `import torch` raises, without leaving a placeholder in
+            # sys.modules (SciPy's array-API helpers inspect that).
+            def find_spec(self, name, path=None, target=None):
+                if name == "torch" or name.startswith("torch."):
+                    raise ModuleNotFoundError("torch is blocked", name=name)
+                return None
+
+        sys.meta_path.insert(0, _NoTorch())
         import json
         import numpy as np
         import simfile
@@ -113,7 +123,7 @@ def test_inference_runs_end_to_end_with_torch_blocked(tmp_path):
         text = open(path).read()
         assert str(simfile.loads(text)) == text        # byte-stable round trip
         bad = [m for m in sys.modules if m == "torch" or m.startswith("torch.")]
-        assert sys.modules.get("torch") is None and bad == ["torch"], bad
+        assert not bad, bad
         train = [m for m in sys.modules if ".neural.train" in m]
         assert not train, train
         print(json.dumps({{d: len(p) for d, (_, p) in charts.items()}}))
