@@ -565,7 +565,24 @@ def build_parser():
     return p
 
 
+def utf8_stdio() -> None:
+    """Write stdout/stderr as UTF-8 on every platform.
+
+    The engine's progress lines contain "…", "—" and song titles in any script.
+    On Windows, Python writes piped output in the ANSI code page (cp1252) by
+    default: "…" becomes the byte 0x85, which is not UTF-8, and characters
+    outside cp1252 (a Japanese title) raise UnicodeEncodeError. Whatever reads
+    the output (the desktop app, a script) gets UTF-8 instead; anything that
+    still cannot be encoded is replaced rather than ending the run."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError, OSError):
+            pass        # not a TextIOWrapper (redirected by a caller), or closed
+
+
 def main(argv=None):
+    utf8_stdio()
     args = build_parser().parse_args(argv)
     # A command that returns a code means it (the inkling checks) reports a
     # verdict rather than raising — propagate it so scripting and CI can branch

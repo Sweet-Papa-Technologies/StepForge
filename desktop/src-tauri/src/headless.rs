@@ -23,7 +23,7 @@
 //!   StepForge --headless batch    --manifest mix.json [--force]
 
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 
@@ -84,9 +84,7 @@ fn run_engine(app: &AppHandle, args: Vec<String>) -> Result<i32, String> {
         .spawn()
         .map_err(|e| format!("failed to launch engine: {e}"))?;
     if let Some(stdout) = child.stdout.take() {
-        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-            eprintln!("{line}");
-        }
+        crate::engine::for_each_line_lossy(stdout, |line| eprintln!("{line}"));
     }
     let status = child.wait().map_err(|e| e.to_string())?;
     Ok(status.code().unwrap_or(-1))
