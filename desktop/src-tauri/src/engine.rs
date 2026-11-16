@@ -4,7 +4,7 @@
 //! cost) do not need Python and are handled here too.
 
 use std::collections::{BTreeMap, HashMap};
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
@@ -372,6 +372,9 @@ pub fn repo_root(app: &AppHandle) -> Result<PathBuf, String> {
 pub fn python_command(app: &AppHandle) -> Command {
     let py = python_bin(app);
     let mut cmd = Command::new(&py);
+    for (k, v) in UTF8_ENV {
+        cmd.env(k, v);
+    }
     let bundled = crate::install::bundled_python()
         .map(|p| p.to_string_lossy() == py.as_str())
         .unwrap_or(false);
@@ -384,6 +387,38 @@ pub fn python_command(app: &AppHandle) -> Command {
         }
     }
     cmd
+}
+
+/// Every engine process talks UTF-8, whatever the platform. The app decodes
+/// the engine's output as UTF-8; on Windows, Python otherwise writes piped
+/// output in the ANSI code page (cp1252), where the "…" in the progress lines
+/// is the byte 0x85 — not UTF-8. UTF-8 mode also makes the engine's file I/O
+/// default to UTF-8 there, as it already is on macOS and Linux.
+pub const UTF8_ENV: [(&str, &str); 2] = [("PYTHONUTF8", "1"), ("PYTHONIOENCODING", "utf-8")];
+
+/// Call `f` with each line read from `r`, without the line ending.
+///
+/// Bytes that are not valid UTF-8 are decoded lossily (as U+FFFD) instead of
+/// ending the loop. `BufRead::lines()` stops at the first such line, and the
+/// reader is then dropped, which closes the pipe: the engine's next write
+/// fails ("OSError: [Errno 22] Invalid argument" on Windows) and the run dies.
+pub fn for_each_line_lossy<R: Read>(r: R, mut f: impl FnMut(String)) {
+    let mut reader = BufReader::new(r);
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        match reader.read_until(b'\n', &mut buf) {
+            Ok(0) => break,
+            Ok(_) => {
+                while matches!(buf.last(), Some(b'\n' | b'\r')) {
+                    buf.pop();
+                }
+                f(String::from_utf8_lossy(&buf).into_owned());
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
 }
 
 /// Environment for the bundled interpreter. `is_set` says whether the user's
@@ -588,7 +623,7 @@ pub fn spawn_command(app: &AppHandle, job_id: String, mut cmd: Command) -> Resul
         let app = app.clone();
         let jid = job_id.clone();
         std::thread::spawn(move || {
-            for line in BufReader::new(out).lines().map_while(Result::ok) {
+            for_each_line_lossy(out, |line| {
                 let _ = app.emit(
                     "engine:log",
                     LogEvent {
@@ -597,7 +632,7 @@ pub fn spawn_command(app: &AppHandle, job_id: String, mut cmd: Command) -> Resul
                         line,
                     },
                 );
-            }
+            });
         })
     });
     // stderr reader + wait-for-exit
@@ -605,7 +640,7 @@ pub fn spawn_command(app: &AppHandle, job_id: String, mut cmd: Command) -> Resul
     let jid2 = job_id.clone();
     std::thread::spawn(move || {
         if let Some(err) = stderr {
-            for line in BufReader::new(err).lines().map_while(Result::ok) {
+            for_each_line_lossy(err, |line| {
                 let _ = app2.emit(
                     "engine:log",
                     LogEvent {
@@ -614,7 +649,7 @@ pub fn spawn_command(app: &AppHandle, job_id: String, mut cmd: Command) -> Resul
                         line,
                     },
                 );
-            }
+            });
         }
         // Drain stdout fully before reporting exit, so the UI never shows a
         // finished job whose last lines are still in flight (the failure banner
@@ -646,6 +681,27 @@ pub fn spawn_command(app: &AppHandle, job_id: String, mut cmd: Command) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Windows Python writes "…" as cp1252 0x85 when its output is piped. The
+    /// reader must carry on past it (and past CRLF endings), not stop and close
+    /// the pipe under the engine.
+    #[test]
+    fn engine_output_that_is_not_utf8_does_not_stop_the_reader() {
+        let bytes: &[u8] = b"grid\x85\r\nnext line\r\nlast, no newline";
+        let mut got = Vec::new();
+        for_each_line_lossy(bytes, |l| got.push(l));
+        assert_eq!(got, vec!["grid\u{FFFD}", "next line", "last, no newline"]);
+
+        let mut utf8 = Vec::new();
+        for_each_line_lossy("beat-warping\u{2026}\n消えてゆく\n".as_bytes(), |l| utf8.push(l));
+        assert_eq!(utf8, vec!["beat-warping\u{2026}", "消えてゆく"]);
+    }
+
+    #[test]
+    fn every_engine_process_is_told_to_speak_utf8() {
+        assert!(UTF8_ENV.contains(&("PYTHONUTF8", "1")));
+        assert!(UTF8_ENV.contains(&("PYTHONIOENCODING", "utf-8")));
+    }
 
     #[test]
     fn the_bundled_python_runs_openblas_single_threaded_unless_the_user_says_otherwise() {
