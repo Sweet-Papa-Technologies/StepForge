@@ -13,6 +13,7 @@ import GateChip from "../components/GateChip.vue";
 import TransportBar from "../components/TransportBar.vue";
 import NotePlayer from "../components/NotePlayer.vue";
 import ContextMenu, { type MenuItem } from "../components/ContextMenu.vue";
+import Spinner from "../components/Spinner.vue";
 import type { Chart } from "../lib/types";
 
 const props = defineProps<{ base?: string }>();
@@ -361,8 +362,8 @@ onMounted(async () => {
         </div>
 
         <div class="flex-1 min-h-0">
-          <div v-if="loading" class="h-full flex items-center justify-center font-label-mono text-on-surface-variant">
-            Loading result…
+          <div v-if="loading" class="h-full flex items-center justify-center gap-2 font-label-mono text-on-surface-variant">
+            <Spinner :size="18" /> Loading result…
           </div>
 
           <!-- Live player -->

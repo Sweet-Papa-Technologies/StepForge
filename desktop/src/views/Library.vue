@@ -14,6 +14,7 @@ import type { Analysis, ChartEngine, PackInfo, SongAssets, Track } from "../lib/
 import PackCombobox from "../components/PackCombobox.vue";
 import DropZone from "../components/DropZone.vue";
 import TrackCard from "../components/TrackCard.vue";
+import Spinner from "../components/Spinner.vue";
 import AnalysisCanvas from "../components/AnalysisCanvas.vue";
 import EngineBanner from "../components/EngineBanner.vue";
 import ContextMenu, { type MenuItem } from "../components/ContextMenu.vue";
@@ -33,18 +34,6 @@ function trackMenu({ event, track }: { event: MouseEvent; track: Track }) {
   const base = track.base;
   const items: MenuItem[] = [
     {
-      label: "Open (Analyze)",
-      icon: "graphic_eq",
-      disabled: !track.isOgg,
-      action: () => void router.push({ name: "analyze", params: { base } }),
-    },
-    {
-      label: "Analyze now",
-      icon: "play_arrow",
-      disabled: !track.isOgg || !lib.engineReady,
-      action: () => void router.push({ name: "analyze", params: { base }, query: { run: "1" } }),
-    },
-    {
       label: "Generate charts…",
       icon: "auto_awesome",
       disabled: !track.isOgg,
@@ -55,6 +44,25 @@ function trackMenu({ event, track }: { event: MouseEvent; track: Track }) {
       icon: "analytics",
       disabled: !track.targets.length,
       action: () => void router.push({ name: "results", params: { base } }),
+    },
+    {
+      label: "View analysis",
+      icon: "graphic_eq",
+      disabled: !track.isOgg,
+      action: () => void router.push({ name: "analyze", params: { base } }),
+    },
+    {
+      label: "Re-analyze now",
+      icon: "play_arrow",
+      disabled: !track.isOgg || !lib.engineReady,
+      action: () => void router.push({ name: "analyze", params: { base }, query: { run: "1" } }),
+    },
+    {
+      label: checked.value.has(base) ? "Deselect" : "Select for bulk generation",
+      icon: "done_all",
+      separatorBefore: true,
+      disabled: !track.isOgg,
+      action: () => toggleCheck({ base, range: false }),
     },
     {
       label: "Install song to game",
@@ -93,6 +101,7 @@ function trackMenu({ event, track }: { event: MouseEvent; track: Track }) {
   menu.value?.open(event, items);
 }
 
+const isMac = /mac/i.test(navigator.platform || navigator.userAgent);
 const lib = useLibrary();
 const engine = useEngine();
 const settings = useSettings();
@@ -251,7 +260,67 @@ const packOptions = computed(() => {
   }));
 });
 
-/* ------------------------- batch: generate every track -------------------- */
+/* -------------------- selection: tick songs for bulk generation ----------- */
+/** Ticked songs (by base). A new Set on every change keeps it simply reactive. */
+const checked = ref<Set<string>>(new Set());
+let lastChecked: string | null = null;
+/** Songs that can be ticked in the current view (converted, search applied). */
+const selectable = computed(() => filtered.value.filter((t) => t.isOgg));
+const checkedTracks = computed(() => lib.tracks.filter((t) => t.isOgg && checked.value.has(t.base)));
+const allChecked = computed(() => selectable.value.length > 0 && selectable.value.every((t) => checked.value.has(t.base)));
+const someChecked = computed(() => !allChecked.value && selectable.value.some((t) => checked.value.has(t.base)));
+
+function toggleCheck({ base, range }: { base: string; range: boolean }) {
+  const next = new Set(checked.value);
+  const list = selectable.value.map((t) => t.base);
+  if (range && lastChecked && list.includes(lastChecked) && list.includes(base)) {
+    const [a, b] = [list.indexOf(lastChecked), list.indexOf(base)].sort((x, y) => x - y);
+    for (const s of list.slice(a, b + 1)) next.add(s);
+  } else if (next.has(base)) {
+    next.delete(base);
+  } else {
+    next.add(base);
+  }
+  lastChecked = base;
+  checked.value = next;
+}
+/** Tick every song in view, or untick them if all are ticked. */
+function toggleAll() {
+  const next = new Set(checked.value);
+  if (allChecked.value) selectable.value.forEach((t) => next.delete(t.base));
+  else selectable.value.forEach((t) => next.add(t.base));
+  checked.value = next;
+}
+function clearChecked() {
+  checked.value = new Set();
+  lastChecked = null;
+}
+// Forget ticks for songs that are gone (deleted, renamed on disk).
+watch(
+  () => lib.tracks,
+  (tracks) => {
+    const alive = new Set(tracks.map((t) => t.base));
+    if ([...checked.value].some((b) => !alive.has(b)))
+      checked.value = new Set([...checked.value].filter((b) => alive.has(b)));
+  },
+);
+// Cmd/Ctrl+A ticks every song in view; Escape clears. Not while typing.
+function onKey(e: KeyboardEvent) {
+  const el = e.target as HTMLElement | null;
+  if (el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.isContentEditable)) return;
+  if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "a") {
+    e.preventDefault();
+    const next = new Set(checked.value);
+    selectable.value.forEach((t) => next.add(t.base));
+    checked.value = next;
+  } else if (e.key === "Escape" && checked.value.size && !batchOpen.value) {
+    clearChecked();
+  }
+}
+window.addEventListener("keydown", onKey);
+onBeforeUnmount(() => window.removeEventListener("keydown", onKey));
+
+/* --------------------- batch: generate the ticked songs ------------------- */
 const batchOpen = ref(false);
 const batchPack = ref("");
 const batchInstall = ref(true);
@@ -260,11 +329,11 @@ const batchEngine = computed<ChartEngine>(() => "neural");
 const batchEngineLabel = computed(() =>
   batchEngine.value === "neural" ? "StepForge Flow" : batchEngine.value === "deterministic" ? "Deterministic DSP" : "AI Designer",
 );
-/** What a batch would chart: every converted track, or the search results. */
-const batchTracks = computed(() => filtered.value.filter((t) => t.isOgg));
+/** What a batch charts: the ticked songs. */
+const batchTracks = computed(() => checkedTracks.value);
 const batchBlocker = computed(() => {
   if (!lib.engineReady) return "The engine environment is not ready.";
-  if (!batchTracks.value.length) return "No converted tracks to chart.";
+  if (!batchTracks.value.length) return "Tick the songs to chart first.";
   if (batchEngine.value === "llm")
     return "A batch runs only on a local engine, so it can never run up a bill. Choose Neural or Deterministic on the Generate screen.";
   if (batchEngine.value === "neural" && !neural.ready) return "The neural model is not installed. See Settings.";
@@ -293,8 +362,10 @@ async function startBatch() {
   const preset = settings.value.neuralStylePreset;
   batchOpen.value = false;
   lib.error = null;
+  const tracks = [...batchTracks.value];
+  clearChecked();
   await batch.start({
-    tracks: batchTracks.value,
+    tracks,
     engine: batchEngine.value,
     difficulties: await api.difficultiesFor("stepforge"),
     stylePreset: preset && neural.presets.includes(preset) ? preset : null,
@@ -430,23 +501,16 @@ async function saveMeta() {
         <button
           class="w-10 h-10 rounded-full flex items-center justify-center text-on-surface-variant hover:bg-surface-variant transition-colors"
           title="Rescan track folders"
+          :disabled="lib.loading"
           @click="lib.refresh()"
         >
-          <span class="material-symbols-outlined">refresh</span>
+          <span class="material-symbols-outlined" :class="{ spinner: lib.loading }">refresh</span>
         </button>
-        <button
-          class="border border-outline-variant text-on-surface px-5 py-2 rounded-full font-label-mono hover:bg-surface-variant transition-colors flex items-center gap-2 disabled:opacity-50"
-          :disabled="batch.running"
-          title="Chart every track in one go with the local engine"
-          @click="openBatch"
-        >
-          <span class="material-symbols-outlined text-[18px]">library_music</span>
-          Generate all
-        </button>
+
         <button
           class="bg-primary-container text-on-primary-container px-6 py-2 rounded-full font-label-mono hover:bg-primary hover:text-on-primary transition-colors flex items-center gap-2 disabled:opacity-50"
           :disabled="!lib.canImport"
-          :title="lib.canImport ? 'Import audio' : 'ffmpeg is required to import'"
+          :title="lib.canImport ? 'Import audio' : lib.statusLoading ? 'Starting the charting engine…' : 'The charting engine is not ready (see the banner)'"
           @click="importSongs"
         >
           <span class="material-symbols-outlined text-[18px]">add</span>
@@ -458,8 +522,8 @@ async function saveMeta() {
     <!-- Batch: set-up, progress, summary -->
     <div v-if="batchOpen" class="border-b border-outline-variant bg-surface-container px-margin-desktop py-3 flex flex-wrap items-center gap-3 text-[12px]">
       <span class="text-on-surface">
-        Chart <b>{{ batchTracks.length }}</b> {{ batchTracks.length === 1 ? "track" : "tracks" }}{{ query.trim() ? " (search results)" : "" }}
-        with <b>{{ batchEngineLabel }}</b>, all five difficulties.
+        Chart the <b>{{ batchTracks.length }}</b> selected {{ batchTracks.length === 1 ? "song" : "songs" }}
+        with <b>{{ batchEngineLabel }}</b>, all five difficulties. Songs are analyzed first if they need it.
       </span>
       <label class="text-on-surface-variant">Pack</label>
       <div class="w-56 flex"><PackCombobox v-model="batchPack" :options="packOptions" placeholder="Leave songs unfiled" /></div>
@@ -480,7 +544,7 @@ async function saveMeta() {
       </div>
     </div>
     <div v-else-if="batch.running" class="border-b border-outline-variant bg-surface-container px-margin-desktop py-3 flex items-center gap-4 text-[12px]">
-      <span class="material-symbols-outlined spinner text-secondary">progress_activity</span>
+      <Spinner :size="18" class="text-secondary" label="Generating" />
       <span class="text-on-surface">Generating {{ batch.index }} / {{ batch.total }}</span>
       <span class="text-on-surface-variant truncate">{{ batch.current }}</span>
       <div class="flex-1 h-1 rounded bg-surface-variant overflow-hidden min-w-[80px]">
@@ -516,7 +580,9 @@ async function saveMeta() {
           {{ lib.error }}
         </div>
 
-        <div v-if="lib.loading" class="text-on-surface-variant font-label-mono">Loading library…</div>
+        <div v-if="lib.loading && !lib.tracks.length" class="text-on-surface-variant font-label-mono flex items-center gap-2 py-6">
+          <Spinner :size="18" /> Loading library…
+        </div>
 
         <div v-else-if="!filtered.length" class="text-on-surface-variant font-body-md py-16 text-center">
           <p class="mb-2">No tracks yet.</p>
@@ -526,18 +592,54 @@ async function saveMeta() {
           </p>
         </div>
 
-        <div v-else class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-gutter pb-8">
-          <TrackCard
-            v-for="t in filtered"
-            :key="t.base"
-            :track="t"
-            :selected="t.base === lib.selectedBase"
-            :busy="converting === t.base"
-            @select="lib.select($event)"
-            @convert="convert"
-            @menu="trackMenu"
-          />
-        </div>
+        <template v-else>
+          <!-- Selection toolbar: tick songs (or all of them) to chart in bulk -->
+          <div
+            class="sticky top-0 z-10 -mx-2 mb-4 px-3 py-2 rounded-xl flex flex-wrap items-center gap-3 text-[12px] transition-colors"
+            :class="checked.size ? 'bg-surface-container-high border border-secondary-container/40' : 'bg-surface/90 backdrop-blur border border-transparent'"
+          >
+            <label class="flex items-center gap-2 cursor-pointer select-none text-on-surface">
+              <input
+                type="checkbox"
+                class="w-4 h-4 accent-[#00eefc] cursor-pointer"
+                :checked="allChecked"
+                :indeterminate="someChecked"
+                :disabled="!selectable.length"
+                @change="toggleAll"
+              />
+              {{ allChecked ? "Deselect all" : "Select all" }}
+            </label>
+            <span v-if="checked.size" class="font-label-mono text-on-surface-variant">
+              {{ checked.size }} selected
+              <button class="ml-2 underline hover:text-on-surface" @click="clearChecked">Clear</button>
+            </span>
+            <span v-else class="text-on-surface-variant">Tick songs to generate several at once (Shift-click for a range, {{ isMac ? "⌘" : "Ctrl+" }}A for all).</span>
+            <button
+              class="ml-auto bg-primary-container text-on-primary-container px-4 py-1.5 rounded-full font-label-mono hover:bg-primary hover:text-on-primary transition-colors flex items-center gap-2 disabled:opacity-40"
+              :disabled="!checked.size || batch.running"
+              :title="batch.running ? 'A bulk run is already going' : 'Generate charts for the selected songs'"
+              @click="openBatch"
+            >
+              <span class="material-symbols-outlined text-[16px]">auto_awesome</span>
+              Generate {{ checked.size ? `${checked.size} selected` : "selected" }}
+            </button>
+          </div>
+
+          <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-gutter pb-8">
+            <TrackCard
+              v-for="t in filtered"
+              :key="t.base"
+              :track="t"
+              :selected="t.base === lib.selectedBase"
+              :checked="checked.has(t.base)"
+              :busy="converting === t.base"
+              @select="lib.select($event)"
+              @check="toggleCheck"
+              @convert="convert"
+              @menu="trackMenu"
+            />
+          </div>
+        </template>
       </div>
 
       <aside v-if="lib.selected" class="bg-surface-container border-l border-outline-variant flex flex-col p-gutter w-sidebar-width shrink-0 overflow-y-auto">
@@ -549,7 +651,16 @@ async function saveMeta() {
 
         <div class="flex-1 flex flex-col gap-6">
           <div>
-            <span class="text-on-surface-variant text-[10px] font-label-mono uppercase tracking-widest mb-2 block">Audio Profile</span>
+            <div class="flex items-center justify-between mb-2">
+              <span class="text-on-surface-variant text-[10px] font-label-mono uppercase tracking-widest">Audio Profile</span>
+              <router-link
+                v-if="lib.selected.isOgg"
+                :to="{ name: 'analyze', params: { base: lib.selected.base } }"
+                class="text-[11px] text-secondary-container hover:underline flex items-center gap-1"
+              >
+                View analysis <span class="material-symbols-outlined text-[14px]">arrow_forward</span>
+              </router-link>
+            </div>
             <div class="w-full h-24 bg-surface-container-lowest rounded-lg border border-outline-variant overflow-hidden">
               <AnalysisCanvas :audio-path="selectedAudio" :analysis="selectedAnalysis" />
             </div>
@@ -729,13 +840,13 @@ async function saveMeta() {
             class="w-full bg-primary-container text-on-primary-container py-2 rounded-lg font-label-mono hover:bg-primary transition-colors flex items-center justify-center gap-2"
             @click="
               router.push({
-                name: lib.selected!.status === 'charted' ? 'results' : lib.selected!.status === 'analyzed' ? 'generate' : 'analyze',
+                name: lib.selected!.status === 'charted' ? 'results' : 'generate',
                 params: { base: lib.selected!.base },
               })
             "
           >
             <span class="material-symbols-outlined text-[18px]">arrow_forward</span>
-            {{ lib.selected.status === "charted" ? "Open Results" : lib.selected.status === "analyzed" ? "Generate Charts" : "Analyze" }}
+            {{ lib.selected.status === "charted" ? "Open Results" : "Generate Charts" }}
           </button>
         </div>
       </aside>

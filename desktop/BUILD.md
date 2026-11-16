@@ -103,21 +103,27 @@ Each track has one obvious next step, derived from what actually exists on disk,
 the card's primary button is always that step:
 
 ```
-import/convert → Analyze → Generate → Results → Export
-   (ffmpeg)      (DSP)     (adapters)  (review)  (song folder)
+import/convert → Generate → Results → Export
+   (ffmpeg)      (analysis runs here when needed)   (review)  (song folder)
 ```
 
 | Track state | Meaning | Next action |
 |---|---|---|
 | `Needs .ogg` | source isn't .ogg, engine can't open it | **Convert to .ogg** |
-| `Draft` | .ogg present, no analysis yet | **Analyze** |
+| `Ready` | .ogg present, no analysis yet | **Generate** |
 | `Analyzed` | `analysis.json` exists | **Generate** |
 | `Charted` | a song folder / qa.json exists | **Results** |
 
 Notes on practicality:
-- Analysis is **not** a manual prerequisite for Generate — `stepforge`/`saberforge`
-  call `analyze_track` themselves. Analyze is there to *see and verify* the grid
-  before spending model calls.
+- There is no separate Analyze step. `stepforge`/`saberforge` call
+  `analyze_track` themselves, and its cache is keyed by the audio's SHA-256 (plus
+  the analysis version), so a song is analyzed on its first run and again only
+  if its audio changed. The Analyze screen is still there to *see* the tempo, grid
+  and onsets: "View analysis" in the Library inspector, on the Generate screen,
+  and in a card's right-click menu.
+- **Bulk generation:** tick cards (Shift-click for a range, Cmd/Ctrl+A for all,
+  Escape to clear), then *Generate N selected*. The run is sequential, survives
+  navigation, can file the songs under a pack and install them to the game.
 - The Generate screen lists the blockers preventing a run (no difficulty picked,
   rights not acknowledged, engine not ready) instead of a dead button.
 - Every run streams the engine's real stdout/stderr; a failure shows the tail of

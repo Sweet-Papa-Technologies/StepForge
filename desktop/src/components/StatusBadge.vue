@@ -13,7 +13,8 @@ const cfg = computed(() => {
     case "unconverted":
       return { label: "Needs .ogg", cls: "bg-error-container/30 text-error border-error/40" };
     default:
-      return { label: "Draft", cls: "bg-tertiary-container/10 text-tertiary-fixed-dim border-tertiary-container/30" };
+      // Converted and ready: generating analyzes it on the way.
+      return { label: "Ready", cls: "bg-tertiary-container/10 text-tertiary-fixed-dim border-tertiary-container/30" };
   }
 });
 </script>

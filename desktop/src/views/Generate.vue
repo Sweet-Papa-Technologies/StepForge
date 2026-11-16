@@ -310,6 +310,14 @@ onMounted(async () => {
             <span class="material-symbols-outlined text-sm">music_note</span>
             {{ track?.title ?? "No track selected" }}
             <span v-if="track?.artist" class="text-on-surface-variant">— {{ track.artist }}</span>
+            <router-link
+              v-if="track?.isOgg"
+              :to="{ name: 'analyze', params: { base: track.base } }"
+              class="ml-2 text-[12px] text-secondary-container hover:underline flex items-center gap-1"
+              title="Tempo, beat grid and onsets. Generating analyzes the song automatically when it needs to."
+            >
+              <span class="material-symbols-outlined text-[14px]">graphic_eq</span> View analysis
+            </router-link>
           </p>
         </header>
 
