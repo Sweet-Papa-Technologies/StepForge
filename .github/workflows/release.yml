@@ -287,11 +287,15 @@ jobs:
           # own. linuxdeploy, which tauri runs, reads this; keep it in sync with
           # EXCLUDED in desktop/scripts/check_appimage.py.
           LINUXDEPLOY_EXCLUDED_LIBRARIES: "libsystemd.so*;libudev.so*;libdbus-1.so*;libwayland-*.so*;libepoxy.so*;libnghttp2.so*"
+        # Tauri CLI 2.12+ for Linux: older CLIs download a linuxdeploy that ignores
+        # LINUXDEPLOY_EXCLUDED_LIBRARIES (2.11.4 still bundled every family above).
+        # Pinned here rather than in package.json so the signed macOS and Windows
+        # builds keep the CLI they were verified with.
         run: |
           set -euo pipefail
           npm ci
           python3 -m pip install --quiet fonttools brotli
-          npx tauri build --config src-tauri/tauri.release.conf.json --bundles deb,appimage
+          npx --yes @tauri-apps/cli@2.12.5 build --config src-tauri/tauri.release.conf.json --bundles deb,appimage
       - name: Collect
         run: |
           set -euo pipefail
