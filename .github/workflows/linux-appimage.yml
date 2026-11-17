@@ -1,0 +1,73 @@
+name: Linux AppImage
+
+# Builds the Linux AppImage the way the release does and runs
+# desktop/scripts/check_appimage.py on it, for pull requests that touch the app,
+# its runtime staging or the Linux packaging. Linux packaging problems (libraries
+# copied from the build machine, the AppImage launcher's environment) only show
+# up in the finished AppImage, and the release is the only other place it is
+# built. The AppImage is kept as an artifact for a week, for testing on other
+# distributions.
+#
+# Keep the build steps in step with the `linux` job in release.yml.
+
+on:
+  pull_request:
+    paths:
+      - "desktop/src-tauri/**"
+      - "desktop/scripts/**"
+      - ".github/workflows/linux-appimage.yml"
+      - ".github/workflows/release.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: linux-appimage-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  appimage:
+    name: Build and check
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with: { workspaces: desktop/src-tauri }
+      - name: System libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libssl-dev file xvfb
+      - name: Stage the bundled runtime
+        run: python3 desktop/scripts/stage_runtime.py --version 0.0.0-check
+      - name: Build
+        working-directory: desktop
+        env:
+          LINUXDEPLOY_EXCLUDED_LIBRARIES: "libsystemd.so*;libudev.so*;libdbus-1.so*;libwayland-*.so*;libepoxy.so*;libnghttp2.so*"
+        run: |
+          set -euo pipefail
+          npm ci
+          python3 -m pip install --quiet fonttools brotli
+          npx tauri build --config src-tauri/tauri.release.conf.json --bundles appimage
+      - name: Collect
+        run: |
+          mkdir -p dist
+          cp desktop/src-tauri/target/release/bundle/appimage/*.AppImage dist/StepForge-check-linux-x86_64.AppImage
+      # Uploaded before the check so a failing AppImage can still be inspected.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-appimage
+          path: dist/*.AppImage
+          retention-days: 7
+          if-no-files-found: error
+      - name: Check the AppImage
+        run: xvfb-run -a python3 desktop/scripts/check_appimage.py dist/StepForge-check-linux-x86_64.AppImage

@@ -379,6 +379,14 @@ pub fn python_command(app: &AppHandle) -> Command {
         .map(|p| p.to_string_lossy() == py.as_str())
         .unwrap_or(false);
     if bundled {
+        // The bundled interpreter finds its own standard library next to the
+        // executable. An inherited PYTHONHOME redirects it, and the interpreter
+        // then dies before running a line ("No module named 'encodings'"):
+        // the AppImage launcher exports PYTHONHOME=$APPDIR/usr/ for the app, and
+        // Conda and some shells set it too. An inherited PYTHONPATH can shadow
+        // the bundled packages; callers that need one set it after this.
+        cmd.env_remove("PYTHONHOME");
+        cmd.env_remove("PYTHONPATH");
         let cache = crate::install::workspace_dir()
             .unwrap_or_else(std::env::temp_dir)
             .join("build/pycache");
@@ -397,7 +405,66 @@ pub fn python_command(app: &AppHandle) -> Command {
 pub fn command(program: impl AsRef<std::ffi::OsStr>) -> Command {
     let mut cmd = Command::new(program);
     hide_console(&mut cmd);
+    #[cfg(target_os = "linux")]
+    if let Some(appdir) = std::env::var_os("APPDIR") {
+        for (var, value) in appimage_child_env(&appdir.to_string_lossy(), |k| std::env::var(k).ok())
+        {
+            match value {
+                Some(v) => cmd.env(var, v),
+                None => cmd.env_remove(var),
+            };
+        }
+    }
     cmd
+}
+
+/// Variables the AppImage launcher prefixes with its own mount (`$APPDIR`) so
+/// the app finds its bundled libraries. Programs the app starts — the bundled
+/// Python, the system's ffmpeg — are not part of that bundle and must see the
+/// user's environment: a system ffmpeg loading the AppImage's Ubuntu-built
+/// libraries, or Python told its home is `$APPDIR/usr/`, breaks.
+#[cfg(any(test, target_os = "linux"))]
+const APPIMAGE_PATH_VARS: [&str; 6] = [
+    "LD_LIBRARY_PATH",
+    "PATH",
+    "PYTHONPATH",
+    "PERLLIB",
+    "QT_PLUGIN_PATH",
+    "GSETTINGS_SCHEMA_DIR",
+];
+
+/// Changes that undo the AppImage launcher's environment for a child process:
+/// `(var, Some(value))` to set, `(var, None)` to remove. Entries inside
+/// `appdir` are dropped from the path lists; whatever the user had stays.
+#[cfg(any(test, target_os = "linux"))]
+fn appimage_child_env(
+    appdir: &str,
+    get: impl Fn(&str) -> Option<String>,
+) -> Vec<(&'static str, Option<String>)> {
+    let root = appdir.trim_end_matches('/');
+    if root.is_empty() {
+        return Vec::new();
+    }
+    let inside = |p: &str| {
+        let p = p.trim_end_matches('/');
+        p == root || p.starts_with(&format!("{root}/"))
+    };
+    let mut out = Vec::new();
+    if get("PYTHONHOME").is_some_and(|h| inside(&h)) {
+        out.push(("PYTHONHOME", None));
+    }
+    for var in APPIMAGE_PATH_VARS {
+        let Some(value) = get(var) else { continue };
+        if !value.split(':').any(|e| !e.is_empty() && inside(e)) {
+            continue;
+        }
+        let kept: Vec<&str> = value
+            .split(':')
+            .filter(|e| !e.is_empty() && !inside(e))
+            .collect();
+        out.push((var, (!kept.is_empty()).then(|| kept.join(":"))));
+    }
+    out
 }
 
 #[cfg(windows)]
@@ -733,6 +800,70 @@ mod tests {
         assert_eq!(get("PYTHONPYCACHEPREFIX"), Some("/ws/build/pycache".into()));
         let theirs = bundled_python_env(PathBuf::from("/ws"), |k| k == "OPENBLAS_NUM_THREADS");
         assert!(theirs.iter().all(|(n, _)| *n != "OPENBLAS_NUM_THREADS"));
+    }
+
+    /// What the AppImage launcher (AppImageKit's AppRun) exports, with
+    /// APPDIR=/tmp/.mount_StepFoXYZ. Children must get the user's values back.
+    #[test]
+    fn children_of_an_appimage_do_not_inherit_its_bundle_paths() {
+        let d = "/tmp/.mount_StepFoXYZ";
+        let env: std::collections::HashMap<&str, String> = [
+            ("PYTHONHOME", format!("{d}/usr/")),
+            ("PYTHONPATH", format!("{d}/usr/share/pyshared/:")),
+            (
+                "LD_LIBRARY_PATH",
+                format!("{d}/usr/lib/:{d}/usr/lib/x86_64-linux-gnu/:{d}/lib64/:"),
+            ),
+            (
+                "PATH",
+                format!("{d}/usr/bin/:{d}/usr/sbin/:/usr/local/bin:/usr/bin:/bin"),
+            ),
+            ("PERLLIB", format!("{d}/usr/share/perl5/:/opt/perl")),
+            ("HOME", "/home/me".into()),
+        ]
+        .into_iter()
+        .collect();
+        let changes = appimage_child_env(d, |k| env.get(k).cloned());
+        let get = |k: &str| {
+            changes
+                .iter()
+                .find(|(n, _)| *n == k)
+                .map(|(_, v)| v.clone())
+        };
+
+        assert_eq!(get("PYTHONHOME"), Some(None), "removed");
+        assert_eq!(
+            get("PYTHONPATH"),
+            Some(None),
+            "nothing of the user's left: removed"
+        );
+        assert_eq!(get("LD_LIBRARY_PATH"), Some(None));
+        assert_eq!(
+            get("PATH"),
+            Some(Some("/usr/local/bin:/usr/bin:/bin".into()))
+        );
+        assert_eq!(
+            get("PERLLIB"),
+            Some(Some("/opt/perl".into())),
+            "the user's entry kept"
+        );
+        assert_eq!(get("HOME"), None, "untouched");
+    }
+
+    #[test]
+    fn outside_an_appimage_the_environment_is_left_alone() {
+        let env = |k: &str| match k {
+            "PATH" => Some("/usr/local/bin:/usr/bin".to_string()),
+            "LD_LIBRARY_PATH" => Some("/opt/cuda/lib64".to_string()),
+            "PYTHONHOME" => Some("/opt/conda".to_string()),
+            _ => None,
+        };
+        assert!(appimage_child_env("/tmp/.mount_StepFoXYZ", env).is_empty());
+        assert!(appimage_child_env("", env).is_empty());
+        // A sibling directory that merely shares the prefix is not inside it.
+        let sib =
+            |k: &str| (k == "PATH").then(|| "/tmp/.mount_StepFoXYZ2/bin:/usr/bin".to_string());
+        assert!(appimage_child_env("/tmp/.mount_StepFoXYZ", sib).is_empty());
     }
 
     /// The frontend keys log/exit events by `jobId`. A snake_case payload lands
