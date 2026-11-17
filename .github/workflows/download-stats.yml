@@ -1,0 +1,52 @@
+name: Download stats
+
+# Once a day, record GitHub's release download counters on the `stats` branch
+# (downloads.csv + a README summary), because GitHub itself keeps only running
+# totals with no history. See .github/download_stats.py.
+#
+# Note: GitHub pauses scheduled workflows in a public repository after 60 days
+# with no commits; re-enable it from the Actions tab if that happens.
+
+on:
+  schedule:
+    - cron: "23 6 * * *" # 06:23 UTC daily
+  workflow_dispatch:
+
+concurrency:
+  group: download-stats
+  cancel-in-progress: false
+
+permissions:
+  contents: write # push to the `stats` branch (main stays PR-only)
+
+jobs:
+  snapshot:
+    name: Snapshot
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check out the stats branch
+        run: |
+          set -euo pipefail
+          if git ls-remote --exit-code --heads origin stats >/dev/null; then
+            git fetch --depth=1 origin stats
+            git worktree add --detach stats-branch FETCH_HEAD
+          else
+            git worktree add --detach stats-branch
+            git -C stats-branch checkout --orphan stats
+            git -C stats-branch rm -rfq .
+          fi
+      - name: Snapshot the counters
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 .github/download_stats.py stats-branch
+      - name: Commit
+        working-directory: stats-branch
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then echo "no change"; exit 0; fi
+          git commit -q -m "Download counts $(date -u +%F)"
+          git push origin HEAD:stats
