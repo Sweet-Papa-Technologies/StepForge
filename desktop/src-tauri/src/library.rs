@@ -121,16 +121,37 @@ pub fn detect_song_dirs() -> Vec<PathBuf> {
     out
 }
 
-pub fn copy_dir_recursive(src: &Path, dest: &Path) -> std::io::Result<()> {
+/// The engine's own working files in an emitted song folder: the run report,
+/// per-difficulty design notes, critic and QA scores, preview images and the
+/// assist-click tracks the app's player uses. The app reads them from `build/`;
+/// a game never does. Copied into a game they cost about 5 MB per song.
+pub fn is_work_file(name: &str) -> bool {
+    matches!(name, "report.json" | ".saberforge_payload.json")
+        || [".assist.ogg", ".design.json", ".critic.json", ".qa.json", ".notefield.png"]
+            .iter()
+            .any(|suffix| name.ends_with(suffix))
+}
+
+/// Copy an emitted song folder to where a game (or a person) will use it:
+/// the charts, the music and the artwork, without the engine's working files.
+/// Working files an older version copied into `dest` are removed, so
+/// installing a song again also cleans it up.
+pub fn copy_song_folder(src: &Path, dest: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dest)?;
     for e in std::fs::read_dir(src)? {
         let e = e?;
         let from = e.path();
         let to = dest.join(e.file_name());
         if from.is_dir() {
-            copy_dir_recursive(&from, &to)?;
-        } else {
+            copy_song_folder(&from, &to)?;
+        } else if !is_work_file(&e.file_name().to_string_lossy()) {
             std::fs::copy(&from, &to)?;
+        }
+    }
+    for e in std::fs::read_dir(dest)? {
+        let e = e?;
+        if e.path().is_file() && is_work_file(&e.file_name().to_string_lossy()) {
+            std::fs::remove_file(e.path())?;
         }
     }
     Ok(())
@@ -215,22 +236,44 @@ mod tests {
         let src = d.join("build/stepmania/my_song");
         std::fs::create_dir_all(src.join("nested")).unwrap();
         std::fs::write(src.join("my_song.ssc"), "#TITLE:x;").unwrap();
+        std::fs::write(src.join("my_song.sm"), "#TITLE:x;").unwrap();
         std::fs::write(src.join("my_song.ogg"), "audio").unwrap();
-        std::fs::write(src.join("nested/easy.notefield.png"), "png").unwrap();
+        std::fs::write(src.join("my_song-banner.png"), "png").unwrap();
+        std::fs::write(src.join("nested/extra.png"), "png").unwrap();
+        // …with the engine's working files beside the charts.
+        for f in ["report.json", "hard.assist.ogg", "hard.design.json", "hard.critic.json",
+                  "hard.qa.json", "hard.notefield.png", "nested/easy.notefield.png"] {
+            std::fs::write(src.join(f), "work").unwrap();
+        }
 
-        // …copied to <Songs>/<Pack>/<Song>/ the way the game expects.
+        // An older version already installed the song, working files included.
         let songs = d.join("Songs");
         let dest = songs.join("My Pack").join("my_song");
-        copy_dir_recursive(&src, &dest).unwrap();
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::write(dest.join("easy.assist.ogg"), "stale").unwrap();
+        std::fs::write(dest.join("my_song.sm"), "stale").unwrap();
 
-        assert!(dest.join("my_song.ssc").is_file());
-        assert!(dest.join("my_song.ogg").is_file());
-        assert!(dest.join("nested/easy.notefield.png").is_file(), "recursive copy");
-        assert_eq!(
-            std::fs::read_to_string(dest.join("my_song.ssc")).unwrap(),
-            "#TITLE:x;"
-        );
+        // Copied to <Songs>/<Pack>/<Song>/ the way the game expects.
+        copy_song_folder(&src, &dest).unwrap();
+
+        for f in ["my_song.ssc", "my_song.sm", "my_song.ogg", "my_song-banner.png", "nested/extra.png"] {
+            assert!(dest.join(f).is_file(), "{f} is game content");
+        }
+        for f in ["report.json", "hard.assist.ogg", "hard.design.json", "hard.critic.json",
+                  "hard.qa.json", "hard.notefield.png", "nested/easy.notefield.png",
+                  "easy.assist.ogg"] {
+            assert!(!dest.join(f).exists(), "{f} is a working file");
+        }
+        assert_eq!(std::fs::read_to_string(dest.join("my_song.sm")).unwrap(), "#TITLE:x;");
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn game_content_is_never_a_work_file() {
+        for f in ["song.ogg", "song.ssc", "song.sm", "song-bg.png", "Info.dat", "ExpertPlus.dat",
+                  "cover.jpg", "song.egg", "bg.mp4", "lyrics.lrc"] {
+            assert!(!is_work_file(f), "{f}");
+        }
     }
 
     #[test]
