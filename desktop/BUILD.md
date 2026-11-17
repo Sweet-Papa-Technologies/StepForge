@@ -85,6 +85,25 @@ inside the (signed) app bundle.
   `macos-15-intel`), Windows (`-setup.exe`) and Linux (`.AppImage`, `.deb`) in
   parallel and publishes them, with `SHA256SUMS.txt`, to
   the Releases page. Tags with a hyphen (`v0.2.0-beta.1`) become pre-releases.
+- `.github/workflows/linux-appimage.yml` builds the AppImage on pull requests
+  that touch the app or its packaging, and keeps it as an artifact for testing
+  on other distributions.
+
+The AppImage is built on Ubuntu 22.04. Two rules keep it working on newer
+distributions, and `scripts/check_appimage.py` enforces both before a release
+is published:
+
+- Host-owned libraries (systemd, udev, D-Bus, Wayland, epoxy, nghttp2) are left
+  out of the bundle (`LINUXDEPLOY_EXCLUDED_LIBRARIES`). An old bundled
+  libwayland made Mesa abort with `EGL_BAD_PARAMETER` on Arch.
+- The AppImage launcher exports `PYTHONHOME`, `LD_LIBRARY_PATH` and `PATH` into
+  its own mount for the app. `engine::command` takes those back out for every
+  program the app starts, and the bundled Python never inherits `PYTHONHOME`.
+  The check charts a song through `AppRun --headless` to prove it.
+
+On Linux the app also starts WebKitGTK with `WEBKIT_DISABLE_DMABUF_RENDERER=1`
+(unless the user sets it), which fixes blank or black windows on NVIDIA and
+similar setups.
 
 ```bash
 git tag -a v0.1.0-beta.2 -m "StepForge 0.1.0 beta 2"

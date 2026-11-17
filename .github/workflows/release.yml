@@ -272,18 +272,30 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libssl-dev file
+            libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libssl-dev file xvfb
       - name: Set the version
         run: python3 desktop/scripts/set_version.py "${{ needs.meta.outputs.version }}"
       - name: Stage the bundled runtime
         run: python3 desktop/scripts/stage_runtime.py --version "${{ needs.meta.outputs.version }}"
       - name: Build
         working-directory: desktop
+        env:
+          # Host-owned library families stay out of the AppImage: copies from this
+          # Ubuntu 22.04 runner break on newer distributions (an old libwayland made
+          # Mesa abort with EGL_BAD_PARAMETER on Arch; old libsystemd and nghttp2
+          # fail symbol versions). Every distribution the AppImage targets has its
+          # own. linuxdeploy, which tauri runs, reads this; keep it in sync with
+          # EXCLUDED in desktop/scripts/check_appimage.py.
+          LINUXDEPLOY_EXCLUDED_LIBRARIES: "libsystemd.so*;libudev.so*;libdbus-1.so*;libwayland-*.so*;libepoxy.so*;libnghttp2.so*"
+        # Tauri CLI 2.12+ for Linux: older CLIs download a linuxdeploy that ignores
+        # LINUXDEPLOY_EXCLUDED_LIBRARIES (2.11.4 still bundled every family above).
+        # Pinned here rather than in package.json so the signed macOS and Windows
+        # builds keep the CLI they were verified with.
         run: |
           set -euo pipefail
           npm ci
           python3 -m pip install --quiet fonttools brotli
-          npx tauri build --config src-tauri/tauri.release.conf.json --bundles deb,appimage
+          npx --yes @tauri-apps/cli@2.12.5 build --config src-tauri/tauri.release.conf.json --bundles deb,appimage
       - name: Collect
         run: |
           set -euo pipefail
@@ -292,6 +304,12 @@ jobs:
           cp desktop/src-tauri/target/release/bundle/deb/*.deb "dist/StepForge-$V-linux-amd64.deb"
           cp desktop/src-tauri/target/release/bundle/appimage/*.AppImage "dist/StepForge-$V-linux-x86_64.AppImage"
           ls -la dist
+      - name: Check the AppImage
+        # No host-owned libraries inside, and a song charted end to end through
+        # the AppImage's own launcher (its environment reaches the engine).
+        run: |
+          xvfb-run -a python3 desktop/scripts/check_appimage.py \
+            "dist/StepForge-${{ needs.meta.outputs.version }}-linux-x86_64.AppImage"
       - uses: actions/upload-artifact@v4
         with: { name: linux, path: dist/*, if-no-files-found: error }
 

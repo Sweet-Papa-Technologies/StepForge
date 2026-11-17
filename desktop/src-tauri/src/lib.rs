@@ -8,8 +8,28 @@ mod simfile;
 use engine::JobRegistry;
 use tauri::Manager;
 
+/// WebKitGTK settings applied unless the user's environment already sets them.
+///
+/// WebKitGTK's DMABUF renderer leaves the window blank or black on many Linux
+/// setups (NVIDIA's driver especially, and AppImages running on newer distros
+/// than they were built on). Turning it off costs the faster compositing path,
+/// which this UI does not need: it draws with 2D canvas, never WebGL. A user can
+/// still opt back in with WEBKIT_DISABLE_DMABUF_RENDERER=0.
+#[cfg(any(test, target_os = "linux"))]
+fn webkit_env_defaults(is_set: impl Fn(&str) -> bool) -> Vec<(&'static str, &'static str)> {
+    [("WEBKIT_DISABLE_DMABUF_RENDERER", "1")]
+        .into_iter()
+        .filter(|(k, _)| !is_set(k))
+        .collect()
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Before anything starts a thread or initialises GTK.
+    #[cfg(target_os = "linux")]
+    for (k, v) in webkit_env_defaults(|k| std::env::var_os(k).is_some()) {
+        std::env::set_var(k, v);
+    }
     // Scripted mode is decided BEFORE the builder runs, so a headless call never
     // creates a window and never needs an event loop. It builds its own handle
     // from the same context, so it resolves settings exactly as the GUI does.
@@ -74,4 +94,18 @@ pub fn run() {
         ])
         .run(ctx)
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::webkit_env_defaults;
+
+    #[test]
+    fn the_dmabuf_renderer_is_off_unless_the_user_chose() {
+        assert_eq!(
+            webkit_env_defaults(|_| false),
+            vec![("WEBKIT_DISABLE_DMABUF_RENDERER", "1")]
+        );
+        assert!(webkit_env_defaults(|k| k == "WEBKIT_DISABLE_DMABUF_RENDERER").is_empty());
+    }
 }
