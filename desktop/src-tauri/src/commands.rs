@@ -1333,7 +1333,7 @@ pub fn install_to_game(
             .or_else(|| assignments.get(&b).cloned())
             .unwrap_or_else(|| "StepForge".to_string());
         let dest = songs_dir.join(&pack_name).join(&b);
-        crate::library::copy_dir_recursive(&src, &dest).map_err(|e| e.to_string())?;
+        crate::library::copy_song_folder(&src, &dest).map_err(|e| e.to_string())?;
         installed.push(dest.to_string_lossy().to_string());
     }
     if installed.is_empty() {
@@ -1897,23 +1897,8 @@ pub fn export_song_folder(
         return Err(format!("no emitted {target} folder for '{base}'"));
     }
     let dest = PathBuf::from(&dest_dir).join(&base);
-    copy_dir_recursive(&src, &dest).map_err(|e| e.to_string())?;
+    crate::library::copy_song_folder(&src, &dest).map_err(|e| e.to_string())?;
     Ok(dest.to_string_lossy().into())
-}
-
-fn copy_dir_recursive(src: &Path, dest: &Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(dest)?;
-    for e in std::fs::read_dir(src)? {
-        let e = e?;
-        let from = e.path();
-        let to = dest.join(e.file_name());
-        if from.is_dir() {
-            copy_dir_recursive(&from, &to)?;
-        } else {
-            std::fs::copy(&from, &to)?;
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]
