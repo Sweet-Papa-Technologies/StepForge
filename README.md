@@ -1,22 +1,22 @@
 # StepForge downloads
 
-Updated 2026-11-17 (UTC) by the `download-stats` workflow from GitHub's release download counters. Raw data: [downloads.csv](downloads.csv).
+Updated 2026-11-18 (UTC) by the `download-stats` workflow from GitHub's release download counters. Raw data: [downloads.csv](downloads.csv).
 
-**58 downloads** of installers across 6 releases.
+**63 downloads** of installers across 6 releases.
 
 | Platform | Downloads |
 |---|---:|
-| Windows | 17 |
-| macOS (Apple silicon) | 11 |
+| Windows | 20 |
+| macOS (Apple silicon) | 12 |
 | macOS (Intel) | 6 |
-| Linux AppImage | 17 |
+| Linux AppImage | 18 |
 | Linux .deb | 7 |
 
 ## By release
 
 | Release | Windows | macOS (Apple silicon) | macOS (Intel) | Linux AppImage | Linux .deb | Total |
 |---|---:|---:|---:|---:|---:|---:|
-| [v0.1.0-beta.6](https://github.com/Sweet-Papa-Technologies/StepForge/releases/tag/v0.1.0-beta.6) | 2 | 1 | 1 | 2 | 1 | 7 |
+| [v0.1.0-beta.6](https://github.com/Sweet-Papa-Technologies/StepForge/releases/tag/v0.1.0-beta.6) | 5 | 2 | 1 | 3 | 1 | 12 |
 | [v0.1.0-beta.5](https://github.com/Sweet-Papa-Technologies/StepForge/releases/tag/v0.1.0-beta.5) | 6 | 4 | 1 | 10 | 1 | 22 |
 | [v0.1.0-beta.4](https://github.com/Sweet-Papa-Technologies/StepForge/releases/tag/v0.1.0-beta.4) | 3 | 1 | 1 | 1 | 1 | 7 |
 | [v0.1.0-beta.3](https://github.com/Sweet-Papa-Technologies/StepForge/releases/tag/v0.1.0-beta.3) | 2 | 1 | 1 | 1 | 1 | 6 |
@@ -29,6 +29,7 @@ Each day's increase in the running total (all releases and platforms).
 
 | Date | New | Running total |
 |---|---:|---:|
+| 2026-11-18 | 5 | 63 |
 | 2026-11-17 | (first snapshot) | 58 |
 
 ## Reading these numbers
