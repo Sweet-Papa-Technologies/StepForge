@@ -574,6 +574,19 @@ def phase_margin(engine) -> float:
     return float(v) if isinstance(v, (int, float)) else PHASE_MARGIN
 
 
+def phase_rule(engine) -> str:
+    """How this model decides the half-beat question: 'margin' (the default)
+    or 'vote', from `decoder.phase_rule` in model_meta.json. See verify_phase."""
+    meta = getattr(getattr(engine, "model", None), "meta", None) or {}
+    v = (meta.get("decoder") or {}).get("phase_rule")
+    return v if v in ("margin", "vote") else "margin"
+
+
+#: Core feature channel of the percussive mid-band (150 Hz - 2 kHz) onset flux:
+#: snares, claps and hats. See grid_features' channel layout.
+PERC_MID = GF.FLUX.start + 4
+
+
 def verify_phase(engine, core: np.ndarray, dt_ms: np.ndarray) -> dict:
     """Is the beat grid seated on the beats, and does bar 1 start on a downbeat?
     Ask the rhythm model.
@@ -595,6 +608,27 @@ def verify_phase(engine, core: np.ndarray, dt_ms: np.ndarray) -> dict:
     Moving the grid when the gain exceeds PHASE_MARGIN — set on 59 songs —
     fixed 44 of the 45 across all 168 and moved no correct grid.
 
+    That is the 'margin' rule, and it leans on how sure the model is. A model
+    trained on a few hundred songs is less sure: with the v1.4 weights the
+    margin rule left the grid half a beat out on 18 of 149 songs, and on those
+    a Beginner or Easy chart is wrong from the first note to the last. No
+    margin fixed it. A model can instead carry `decoder.phase_rule = "vote"`:
+    three independent views each say whether the grid should move, and two
+    carry it —
+
+    - the statistic above, with no margin: is the Beginner onset probability
+      better gathered on the quarter notes after the move than before it;
+    - the same question asked of the JUMP probability at Medium (jumps go on
+      the beat, and the jump head is a different output of the network);
+    - the audio alone: is there more mid-band percussive onset energy on the
+      off-beats than on the beats. Backbeats and hats are not proof on their
+      own, which is why this is one vote and not the rule.
+
+    On the same 149 songs the vote is wrong on 5 (1 of the 51 tuning songs, 4
+    of the other 98). It was chosen with all 149 in view, among majority votes
+    over seven such statistics whose error counts ranged from 5 to 17 with a
+    median of 8 — expect something between those on new songs, against 18.
+
     **Which beat is beat 1.** dsp.py's beat 0 is the first beat it tracked, not
     a downbeat: on 166 songs its bar lines matched the charter's on 44 (27%).
     The networks are told where each tick sits in the bar, and jumps at the low
@@ -605,13 +639,16 @@ def verify_phase(engine, core: np.ndarray, dt_ms: np.ndarray) -> dict:
     bar lines on 145 of 166 (87%).
 
     Returns {'half_beat', 'gain' (nats), 'bar_shift_beats' (0-3, later),
-    'bar_share'}.
+    'bar_share', 'rule', 'votes' (None under the margin rule)}.
     """
     cv = engine.cond_for(cond.resolve_style("beginner"))
 
-    def onset_p(shift: int) -> np.ndarray:
+    def heads(shift: int, cond_vec, name: str) -> np.ndarray:
         x = GF.assemble(core[shift:], dt_ms[shift:])
-        return infer.sigmoid(engine.model.rhythm(x, cv)["onset"].astype(np.float64))
+        return infer.sigmoid(engine.model.rhythm(x, cond_vec)[name].astype(np.float64))
+
+    def onset_p(shift: int) -> np.ndarray:
+        return heads(shift, cv, "onset")
 
     def contrast(p: np.ndarray) -> float:
         k = np.arange(len(p)) % C.TICKS_PER_BEAT
@@ -621,13 +658,25 @@ def verify_phase(engine, core: np.ndarray, dt_ms: np.ndarray) -> dict:
         k = np.arange(len(p))
         return float(p[k % C.G == 0].sum() / (p[k % C.TICKS_PER_BEAT == 0].sum() + 1e-9))
 
-    out = {"half_beat": False, "gain": 0.0, "bar_shift_beats": 0, "bar_share": None}
+    rule = phase_rule(engine)
+    out = {"half_beat": False, "gain": 0.0, "bar_shift_beats": 0, "bar_share": None,
+           "rule": rule, "votes": None}
     if len(core) < 8 * C.G:
         return out
     half = C.TICKS_PER_BEAT // 2
     p0, p_half = onset_p(0), onset_p(half)
     gain = contrast(p_half) - contrast(p0)
-    out.update(half_beat=bool(gain > phase_margin(engine)), gain=round(gain, 2))
+    if rule == "vote":
+        cm = engine.cond_for(cond.resolve_style("medium"))
+        jump = contrast(heads(half, cm, "jump")) - contrast(heads(0, cm, "jump"))
+        k = np.arange(len(core)) % C.TICKS_PER_BEAT
+        perc = np.maximum(core[:, PERC_MID].astype(np.float64), 0.0)
+        audio = float(np.log((perc[k == half].sum() + 1e-6) / (perc[k == 0].sum() + 1e-6)))
+        votes = {"onset": round(gain, 2), "jump": round(jump, 2), "audio": round(audio, 2)}
+        out.update(half_beat=sum(v > 0 for v in (gain, jump, audio)) >= 2, votes=votes,
+                   gain=round(gain, 2))
+    else:
+        out.update(half_beat=bool(gain > phase_margin(engine)), gain=round(gain, 2))
     base = half if out["half_beat"] else 0
     share = [on_beat_one(p_half if out["half_beat"] else p0)]
     share += [on_beat_one(onset_p(base + k * C.TICKS_PER_BEAT)) for k in (1, 2, 3)]
@@ -668,7 +717,8 @@ def _features(audio_path: str, bpm: float, offset: float, duration_s: float,
                  tempo_ratio=check["ratio"],
                  tempo_switched_by=check["by"],
                  tempo_fit=check["fit"], dsp_tempo_fit=check["dsp_fit"],
-                 phase_shift_beats=0.0, phase_gain=None, bar_share=None)
+                 phase_shift_beats=0.0, phase_gain=None, bar_share=None,
+                 phase_rule=None, phase_votes=None)
 
     def warp():
         timing = GF.TimingMap.constant(align["bpm"], align["offset"])
@@ -678,6 +728,7 @@ def _features(audio_path: str, bpm: float, offset: float, duration_s: float,
     if engine is not None:
         phase = verify_phase(engine, core, dt_ms)
         align["phase_gain"], align["bar_share"] = phase["gain"], phase["bar_share"]
+        align["phase_rule"], align["phase_votes"] = phase["rule"], phase["votes"]
         shift = 0.5 * phase["half_beat"] + phase["bar_shift_beats"]
         if shift:
             align["offset"] += shift * 60.0 / align["bpm"]
@@ -688,10 +739,12 @@ def _features(audio_path: str, bpm: float, offset: float, duration_s: float,
 
 def _chart_report(placements, analysis, difficulty, meter, chart, tick_times, out_dir,
                   audio_path, style, preset, preview_analysis=None,
-                  previews: bool = True) -> dict:
+                  previews: bool = True, engine_keep: dict | None = None) -> dict:
     """QA row for one chart. `analysis` is the DSP's (the frame its onsets live
     in); `preview_analysis`, if given, carries the audio-true offset the
-    previews should be rendered against."""
+    previews should be rendered against. `engine_keep` overrides entries of
+    the row's `engine` block: after a bar range was re-rolled, the chart's own
+    preset, sliders and options are still the ones it was generated with."""
     from .. import density as sm_density
     metrics = sm_qa.chart_metrics(placements, analysis, difficulty)
     dreport = sm_density.measure(placements, analysis, difficulty)
@@ -716,6 +769,9 @@ def _chart_report(placements, analysis, difficulty, meter, chart, tick_times, ou
                              for f, v in zip(cond.FIELDS, style)},
                    **chart.stats},
     }
+    if engine_keep is not None:
+        row["engine"].pop("options", None)
+        row["engine"].update(engine_keep)
     (out_dir / f"{difficulty}.qa.json").write_text(json.dumps(
         {"difficulty": difficulty, "meter": meter, "metrics": metrics,
          "previews": previews, "critic": None, "engine": row["engine"]}, indent=2))
@@ -727,9 +783,22 @@ def _design_note(difficulty: str, style, preset, stats: dict) -> dict:
     prose, so say what the engine was asked for and what it did."""
     asked = [f"{f}={float(v):.2f}" for f, v in zip(cond.FIELDS[1:9], style[1:9]) if v >= 0]
     r = stats.get("rhythm", {})
+    opts = stats.get("options") or {}
+    said = []
+    if opts.get("max_subdivision"):
+        said.append(f"nothing finer than {opts['max_subdivision']}ths")
+    s = r.get("stream")
+    if s:
+        said.append(f"Stream mode ({s['subdivision']}ths, {s['stream_bars']} of "
+                    f"{s['playable_bars']} bars, {s['nps']:g} notes/s"
+                    + (", above this difficulty's usual peak rate" if s["over_tier_rate"] else "")
+                    + ")")
+    if opts.get("crossovers") is False:
+        said.append("no crossovers")
     note = (f"StepForge Flow (neural). Preset: {preset or 'none'}. "
             f"Style sliders: {', '.join(asked) if asked else 'left to the model'}. "
-            f"Threshold {r.get('theta')}, {r.get('notes')} notes "
+            + (f"Rhythm: {'; '.join(said)}. " if said else "")
+            + f"Threshold {r.get('theta')}, {r.get('notes')} notes "
             f"({r.get('jumps', 0)} jumps, {r.get('holds', 0)} freezes).")
     return {"engine": ENGINE_NAME, "design_notes": note, "sections": [], "stats": stats}
 
@@ -739,9 +808,11 @@ def build_song(track_id: str, opts: config.RunOptions, difficulties=ALL_DIFFICUL
                style_overrides: dict | None = None, seed: int | None = None,
                tau: float = infer.DEFAULT_TAU, int8: bool = False,
                engine: infer.StepManiaNeuralEngine | None = None,
-               style_rag: bool = False) -> dict:
+               style_rag: bool = False,
+               options: infer.DecodeOptions | None = None) -> dict:
     """Chart `track_id` at each of `difficulties` with the neural engine and
     write the song folder. Returns the same report dict the LLM path returns.
+    `options` are the decoder settings (subdivision cap, Stream mode, ...).
 
     With `style_rag`, sliders the caller left unset are filled from the phrase
     index (if one is installed beside the model): the style human charters used
@@ -756,7 +827,7 @@ def build_song(track_id: str, opts: config.RunOptions, difficulties=ALL_DIFFICUL
                              _track_meta(track_id, analysis), difficulties, engine,
                              track_id=track_id, style_preset=style_preset,
                              style_overrides=style_overrides, seed=seed, tau=tau,
-                             style_rag=style_rag)
+                             style_rag=style_rag, options=options)
         report["out"] = str(out_dir.relative_to(config.REPO_ROOT))
         (out_dir / "report.json").write_text(json.dumps(report, indent=2))
         return report
@@ -812,7 +883,7 @@ def chart_song(ctx: SongContext, difficulties, engine: infer.StepManiaNeuralEngi
                track_id: str, style_preset: str | None = None,
                style_overrides: dict | None = None, seed: int | None = None,
                tau: float = infer.DEFAULT_TAU, style_rag: bool = False,
-               log=None) -> tuple:
+               log=None, options: infer.DecodeOptions | None = None) -> tuple:
     """The charts themselves: (charts, styles, retrieved), each keyed by
     difficulty. Writes nothing."""
     g, analysis = ctx.g, ctx.analysis
@@ -840,6 +911,7 @@ def chart_song(ctx: SongContext, difficulties, engine: infer.StepManiaNeuralEngi
             seed=_default_seed(track_id, diff) if seed is None else seed,
             tau=tau, energy_per_bar=analysis.get("energy_curve"),
             veto=flow_veto(diff, analysis["bpm"]), on_transient=ctx.on_transient,
+            options=options,
             progress=(lambda stage, d=diff: log(f"    [{d}] neural: {stage}…", flush=True))
             if log else None)
     return charts, styles, retrieved
@@ -851,7 +923,8 @@ def chart_audio(audio, analysis: dict, out_dir, meta: dict,
                 track_id: str | None = None, model_dir=None,
                 style_preset: str | None = None, style_overrides: dict | None = None,
                 seed: int | None = None, tau: float = infer.DEFAULT_TAU,
-                style_rag: bool = False, previews: bool = True, log=print) -> dict:
+                style_rag: bool = False, previews: bool = True, log=print,
+                options: infer.DecodeOptions | None = None) -> dict:
     """Chart one audio file into `out_dir` given its DSP analysis.
 
     The catalogue-free core of `build_song`: `audio` is any decodable file,
@@ -869,7 +942,8 @@ def chart_audio(audio, analysis: dict, out_dir, meta: dict,
     dsp_bpm, dsp_offset, bpm = ctx.dsp_bpm, ctx.dsp_offset, align["bpm"]
     charts, styles, retrieved = chart_song(
         ctx, difficulties, engine, track_id=track_id, style_preset=style_preset,
-        style_overrides=style_overrides, seed=seed, tau=tau, style_rag=style_rag, log=log)
+        style_overrides=style_overrides, seed=seed, tau=tau, style_rag=style_rag, log=log,
+        options=options)
 
     placements = {d: infer.to_placements(c) for d, c in charts.items()}
     meters = _strict_meters({d: compute_meter(p, bpm, d)
@@ -887,12 +961,15 @@ def chart_audio(audio, analysis: dict, out_dir, meta: dict,
                          "dsp_tempo_fit": align["dsp_tempo_fit"],
                          "phase_shift_beats": align["phase_shift_beats"],
                          "phase_gain": align["phase_gain"],
+                         "phase_rule": align.get("phase_rule"),
+                         "phase_votes": align.get("phase_votes"),
                          "bar_share": align["bar_share"],
                          "grid_shift_ms": round(align["shift_s"] * 1000, 1),
                          "grid_contrast": round(align["contrast"], 3),
                          "sync_lead_ms": HUMAN_SYNC_LEAD_S * 1000,
                          "quantization": engine.model.quantization,
                          "codec_version": C.CODEC_VERSION, "preset": style_preset,
+                         "options": (options.to_dict() if options else {}) or None,
                          "style_rag": {d: {k: round(v, 4) for k, v in r.items()}
                                        for d, r in retrieved.items()} or None}}
     per_difficulty = {}
@@ -968,6 +1045,26 @@ def _recorded_style(chart_row: dict) -> tuple:
     return None, over          # the sliders already include what the preset set
 
 
+def _analysis_on_grid(cached: dict | None, engine_row: dict, bpm: float,
+                      offset_true: float, duration_s: float) -> dict:
+    """The song's DSP analysis expressed on the grid a chart was written on,
+    on the DSP's own clock — what `prepare_song` handed the QA gates when the
+    chart was generated. `offset_true` is the simfile's beat 0 in audio time.
+
+    The simfile's grid differs from the DSP's by the clock correction
+    (`grid_shift_ms`), the sync lead, and possibly a replaced tempo or a moved
+    bar line, so the per-bar energy and the sections are re-read by time."""
+    if not cached:
+        return {"bpm": bpm, "offset": offset_true, "duration_s": duration_s,
+                "onsets": [], "sections": [], "energy_curve": [], "meter": 4}
+    shift_s = float(engine_row.get("grid_shift_ms") or 0.0) / 1000.0
+    lead_s = float(engine_row.get("sync_lead_ms") or 0.0) / 1000.0
+    offset = offset_true + lead_s - shift_s
+    out = _rebar(cached, bpm, offset)
+    out.update(bpm=bpm, offset=offset)
+    return out
+
+
 def parse_bars(spec: str) -> tuple:
     """'16:24' -> (16, 24). Bars are 0-based and the end is exclusive."""
     try:
@@ -983,10 +1080,18 @@ def inpaint_song(difficulty: str, bars: tuple, *, track_id: str | None = None,
                  ssc: str | None = None, seed: int | None = None, model_dir=None,
                  style_preset: str | None = None, style_overrides: dict | None = None,
                  tau: float = infer.DEFAULT_TAU, int8: bool = False,
-                 engine: infer.StepManiaNeuralEngine | None = None) -> dict:
+                 engine: infer.StepManiaNeuralEngine | None = None,
+                 regenerate: bool = False,
+                 options: infer.DecodeOptions | None = None) -> dict:
     """Re-roll bars [start, end) of one chart in place: rewrite that chart in
     the folder's .ssc and .sm, refresh its previews and its report entry, and
-    leave every other chart byte-identical."""
+    leave every other chart byte-identical.
+
+    By default the notes stay where they are and only their panels are chosen
+    again. With `regenerate` the range is written again from the audio —
+    which ticks carry notes as well — under `style_overrides` and `options`
+    given for that range alone (`engine.regenerate_section`); notes outside
+    the range do not change either way."""
     import simfile
     from simfile.timing import TimingData
     from ..quantize import to_simfile_notes
@@ -1023,15 +1128,36 @@ def inpaint_song(difficulty: str, bars: tuple, *, track_id: str | None = None,
     report = json.loads(report_path.read_text()) if report_path.exists() else {
         "track_id": track_id or base, "mode": ENGINE_NAME, "charts": {}}
     old = report.get("charts", {}).get(difficulty, {})
-    if style_preset is None and not style_overrides:
-        # re-roll in the style the chart was generated with, as recorded
-        style_preset, style_overrides = _recorded_style(old)
-    style = cond.resolve_style(difficulty, style_preset, style_overrides)
+    local = dict(style_overrides or {})
+    if style_preset is None:
+        # start from the style the chart was generated with, as recorded; what
+        # was asked for this range goes on top of it
+        _, recorded = _recorded_style(old)
+        style_overrides = {**recorded, **local}
+    style = cond.resolve_style(difficulty, style_preset, style_overrides or None)
     if seed is None:
         seed = int(np.random.SeedSequence().entropy % (2 ** 31))
-    result = engine.inpaint_section(events, g.X, g.tick_times_sec, difficulty, style,
-                                    start_bar, end_bar, seed=seed, tau=tau,
-                                    veto=flow_veto(difficulty, bpms[0][1]))
+    from ....analyze import load_cached
+    cached = (load_cached(track_id) if track_id else None) or load_cached(base)
+    analysis = _analysis_on_grid(cached, report.get("engine") or {}, bpms[0][1],
+                                 -float(td.offset), duration)
+    veto = flow_veto(difficulty, bpms[0][1])
+    if regenerate:
+        result = engine.regenerate_section(
+            events, g.X, g.tick_times_sec, difficulty, style, start_bar, end_bar,
+            duration, options=options, seed=seed, tau=tau, veto=veto,
+            energy_per_bar=analysis.get("energy_curve") or None,
+            on_transient=transient_ticks(analysis, len(g.X)) if cached else None)
+        result.stats["changed"] = int(len(set(map(str, result.events.rows()))
+                                          ^ set(map(str, events.rows()))))
+    else:
+        opts = options or infer.DecodeOptions()
+        if opts.to_dict().keys() - {"crossovers"}:
+            raise ValueError("these options change which notes a range has; ask for the "
+                             "range to be re-generated (--regenerate), not only re-rolled")
+        result = engine.inpaint_section(events, g.X, g.tick_times_sec, difficulty, style,
+                                        start_bar, end_bar, seed=seed, tau=tau, veto=veto,
+                                        crossovers=opts.crossovers)
     placements = infer.to_placements(result)
 
     notes = str(to_simfile_notes(placements, TICK_SUBDIV))
@@ -1046,22 +1172,29 @@ def inpaint_song(difficulty: str, bars: tuple, *, track_id: str | None = None,
         written.append(str(path))
 
     # refresh this chart's previews + report entry; other charts are untouched
-    from ....analyze import load_cached
-    analysis = (load_cached(track_id) if track_id else None) or load_cached(base) or {
-        "bpm": bpms[0][1], "offset": -float(td.offset), "duration_s": duration,
-        "onsets": [], "sections": [], "energy_curve": [], "meter": 4}
     meter = int(old.get("meter") or float(chart.meter))
     true_frame = dict(analysis, bpm=bpms[0][1], offset=-float(td.offset))
+    # the chart as a whole is still the one that was generated: keep what its
+    # report says it was made with, and log this edit beside it
+    old_engine = old.get("engine") or {}
+    keep = {k: old_engine[k] for k in ("preset", "style", "options", "rhythm", "choreo",
+                                       "seed", "tau") if k in old_engine}
+    edit = {"bars": [start_bar, end_bar], "seed": seed, "changed": result.stats["changed"]}
+    if regenerate:
+        edit.update(regenerated=True, notes_before=result.stats["notes_before"],
+                    notes=result.stats["notes_in_section"],
+                    options=(options.to_dict() if options else {}),
+                    style={k: float(v) for k, v in local.items()})
+    keep["inpainted"] = old_engine.get("inpainted", []) + [edit]
     row = _chart_report(placements, analysis, difficulty, meter, result,
                         g.tick_times_sec, folder, str(audio), style, style_preset,
-                        preview_analysis=true_frame)
-    row["engine"]["inpainted"] = (old.get("engine", {}).get("inpainted", [])
-                                  + [{"bars": [start_bar, end_bar], "seed": seed,
-                                      "changed": result.stats["changed"]}])
+                        preview_analysis=true_frame, engine_keep=keep if old_engine else
+                        {"inpainted": keep["inpainted"]})
     report.setdefault("charts", {})[difficulty] = row
     report_path.write_text(json.dumps(report, indent=2))
     return {"track_id": track_id or base, "difficulty": difficulty,
             "bars": [start_bar, end_bar], "seed": seed,
-            "changed": result.stats["changed"],
+            "changed": result.stats["changed"], "regenerated": bool(regenerate),
+            "notes_before": result.stats.get("notes_before"),
             "notes_in_section": result.stats["notes_in_section"],
             "files": written, "out": str(folder)}

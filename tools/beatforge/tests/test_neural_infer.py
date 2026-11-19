@@ -224,7 +224,7 @@ def test_decode_respects_the_tier(difficulty):
     for g in np.diff(plan.tick):
         run = run + 1 if g <= 6 else 1
         longest = max(longest, run)
-    assert longest <= b.max_run
+    assert longest <= infer.RUN_LIMIT[difficulty]
 
 
 def test_threshold_calibration_hits_the_nps_slider():
