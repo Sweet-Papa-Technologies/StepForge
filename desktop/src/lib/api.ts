@@ -97,6 +97,9 @@ export const api = {
 
   /** Memoized in Rust (~0.7s to probe); pass force to re-run the checks. */
   engineStatus: (force = false) => invoke<EngineStatus>("engine_status", { force }),
+  /** The "Copy diagnostics" text: app, OS, CPU, engine self-test, last error.
+   *  Runs the self-test (a few seconds). No audio, song names or user folders. */
+  engineDiagnostics: () => invoke<string>("engine_diagnostics"),
   getSettings: () => invoke<Settings>("get_settings"),
   saveSettings: (settings: Settings) => invoke<void>("save_settings", { settings }),
 

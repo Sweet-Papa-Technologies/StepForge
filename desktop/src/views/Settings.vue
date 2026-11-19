@@ -6,6 +6,8 @@ import { useLibrary } from "../stores/library";
 import { useNeural } from "../stores/neural";
 import { api } from "../lib/api";
 import type { PackInfo } from "../lib/types";
+import { engineAdvice, engineProblems, neuralProblem } from "../lib/engineProblems";
+import CopyDiagnostics from "../components/CopyDiagnostics.vue";
 
 const settings = useSettings();
 const lib = useLibrary();
@@ -23,6 +25,13 @@ async function pickFile(field: "pythonPath" | "ffmpegPath") {
 }
 
 const rechecking = ref(false);
+
+/** Engine and model problems, each with its real cause (lib/engineProblems). */
+const engineIssues = computed(() => (lib.status ? engineProblems(lib.status) : []));
+const neuralIssue = computed(() => neuralProblem(neural.status));
+/** The model's files are in place — true even when onnxruntime, which runs
+ *  them, is what failed (that is not "model not installed"). */
+const modelFiles = computed(() => !!neural.status?.weights_present);
 
 // --- Neural engine (StepForge Flow) ---------------------------------------- //
 // No credential and nothing to test against a server: the only question is
@@ -138,21 +147,19 @@ onMounted(async () => {
 
     <div class="flex-1 overflow-y-auto p-margin-desktop max-w-3xl">
       <!-- Only shown when something is wrong -->
-      <section v-if="lib.status && (!lib.status.beatforgeOk || !lib.status.onnxruntimeOk)" class="mb-10">
-        <div v-if="lib.status && !lib.status.beatforgeOk" class="mt-3 p-3 rounded-lg border border-error/40 bg-error-container/20">
-          <p class="font-label-mono text-label-mono text-error mb-1">The charting engine did not import</p>
-          <p v-if="lib.status.importError" class="text-[11px] text-on-surface-variant font-label-mono whitespace-pre-wrap">
-            {{ lib.status.importError }}
+      <section v-if="engineIssues.length" class="mb-10">
+        <div class="mt-3 p-3 rounded-lg border border-error/40 bg-error-container/20">
+          <p class="font-label-mono text-label-mono text-error mb-1">The charting engine is not working</p>
+          <p
+            v-for="issue in engineIssues"
+            :key="issue"
+            class="text-[11px] text-on-surface-variant font-label-mono whitespace-pre-wrap break-words"
+          >
+            {{ issue }}
           </p>
-          <p class="text-[12px] text-on-surface-variant mt-2">
-            Install the engine dependencies:
-            <code class="font-label-mono">python3 -m pip install -r requirements.txt</code>
-          </p>
+          <p class="text-[12px] text-on-surface-variant mt-2">{{ engineAdvice(lib.status) }}</p>
         </div>
-
-        <p v-if="lib.status?.beatforgeOk && !lib.status.onnxruntimeOk" class="text-[12px] text-tertiary-fixed-dim mt-2">
-          onnxruntime did not import, so StepForge Flow cannot run. Reinstall StepForge.
-        </p>
+        <div class="mt-3"><CopyDiagnostics /></div>
       </section>
 
       <!-- Chart model. Local ONNX models: no credential and
@@ -181,12 +188,12 @@ onMounted(async () => {
           <div class="bg-surface-container border border-outline-variant rounded-lg p-3 flex items-center gap-2">
             <span
               class="material-symbols-outlined"
-              :class="!neural.status ? 'text-on-surface-variant' : neural.installed ? 'text-green-400' : 'text-error'"
+              :class="!neural.status ? 'text-on-surface-variant' : modelFiles ? 'text-green-400' : 'text-error'"
             >
-              {{ !neural.status ? "progress_activity" : neural.installed ? "check_circle" : "cancel" }}
+              {{ !neural.status ? "progress_activity" : modelFiles ? "check_circle" : "cancel" }}
             </span>
             <span class="font-label-mono text-[12px] text-on-surface">
-              {{ !neural.status ? "Checking…" : neural.installed ? "Model installed" : "Model not installed" }}
+              {{ !neural.status ? "Checking…" : modelFiles ? "Model files present" : "Model files missing" }}
             </span>
           </div>
           <div class="bg-surface-container border border-outline-variant rounded-lg p-3 flex items-center gap-2">
@@ -209,8 +216,8 @@ onMounted(async () => {
             {{ neural.status?.display_name || "StepForge Flow" }}
             <span class="text-[11px] text-on-surface-variant">· the model that ships with the app</span>
           </p>
-          <p v-if="neural.status?.model_dir" class="text-[11px] mt-1 break-all" :class="neural.installed ? 'text-green-400' : 'text-tertiary-fixed-dim'">
-            {{ neural.status.model_dir }} · {{ neural.installed ? "model found" : "no model here" }}
+          <p v-if="neural.status?.model_dir" class="text-[11px] mt-1 break-all" :class="modelFiles ? 'text-green-400' : 'text-tertiary-fixed-dim'">
+            {{ neural.status.model_dir }} · {{ modelFiles ? "model found" : "no model here" }}
           </p>
           <p class="text-[11px] text-on-surface-variant mt-1">
             Training data and credits: <code class="font-label-mono">MODEL_CARD.md</code> and
@@ -245,28 +252,11 @@ onMounted(async () => {
           </div>
         </div>
 
-        <div v-if="neural.status && !neural.ready" class="p-3 rounded-lg border border-error/40 bg-error-container/20">
-          <p class="font-label-mono text-label-mono text-error mb-1">
-            {{
-              neural.legacy
-                ? "The installed engine is too old for the neural model"
-                : neural.installed
-                  ? "onnxruntime did not import"
-                  : "The neural model is not installed"
-            }}
-          </p>
-          <p v-if="neural.legacy" class="text-[11px] text-on-surface-variant mb-2">
-            The engine at the engine root above predates the neural chart engine — an app update does not replace
-            the engine code of a workspace that already exists. Update or reinstall the engine there, then Re-check.
-          </p>
-          <p v-if="neural.status.error" class="text-[11px] text-on-surface-variant whitespace-pre-wrap">{{ neural.status.error }}</p>
-          <p v-else-if="neural.installed" class="text-[11px] text-on-surface-variant">
-            Install the engine dependencies:
-            <code class="font-label-mono">python3 -m pip install -r requirements.txt</code>
-          </p>
-          <p class="text-[11px] text-on-surface-variant mt-2">
-            The AI Designer and Deterministic engines do not need it and keep working.
-          </p>
+        <div v-if="neuralIssue" class="p-3 rounded-lg border border-error/40 bg-error-container/20">
+          <p class="font-label-mono text-label-mono text-error mb-1">{{ neuralIssue.title }}</p>
+          <p v-if="neuralIssue.detail" class="text-[11px] text-on-surface-variant whitespace-pre-wrap break-words">{{ neuralIssue.detail }}</p>
+          <p v-if="!neural.legacy" class="text-[12px] text-on-surface-variant mt-2">{{ engineAdvice(lib.status) }}</p>
+          <div class="mt-2"><CopyDiagnostics /></div>
         </div>
       </section>
 

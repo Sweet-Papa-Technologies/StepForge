@@ -16,6 +16,9 @@
 //!
 //!   StepForge --headless tracks
 //!   StepForge --headless settings
+//!   StepForge --headless status              (what the GUI is told about the engine)
+//!   StepForge --headless selftest            (does this install work? exit 0/1)
+//!   StepForge --headless diagnostics         (the "Copy diagnostics" text, on stderr)
 //!   StepForge --headless generate --track my_song --difficulties easy,hard
 //!   StepForge --headless generate --track my_song --difficulties easy,hard \
 //!       --style-preset itg_stamina --style-json '{"jump_share":0.12}'
@@ -283,6 +286,31 @@ fn batch(app: &AppHandle, kv: &HashMap<String, String>, flags: &[String]) -> boo
     failed.is_empty()
 }
 
+/// `--headless selftest [--no-chart] [--self-contained]`: one NDJSON line with
+/// the engine's report and the media check; exit 0 only if everything passed.
+fn selftest(app: &AppHandle, flags: &[String]) -> bool {
+    let has = |f: &str| flags.iter().any(|x| x == f);
+    let media = crate::diagnostics::media_report();
+    let media_ok = media["ok"].as_bool().unwrap_or(false);
+    match crate::diagnostics::run_selftest(app, !has("no-chart"), has("self-contained")) {
+        Ok(report) => {
+            let ok = report["ok"].as_bool().unwrap_or(false) && media_ok;
+            for line in crate::diagnostics::selftest_lines(&Ok(report.clone())) {
+                eprintln!("{line}");
+            }
+            if !media_ok {
+                eprintln!("Audio playback (GStreamer): MISSING {}", media["missing"]);
+            }
+            out(json!({"ok": ok, "op": "selftest", "report": report, "media": media}));
+            ok
+        }
+        Err(e) => {
+            out(json!({"ok": false, "op": "selftest", "error": e, "media": media}));
+            false
+        }
+    }
+}
+
 /// Entry point. Builds a real app handle, runs one subcommand, exits.
 ///
 /// Takes the context rather than expanding `generate_context!` itself: that
@@ -296,7 +324,7 @@ pub fn main(ctx: tauri::Context) -> ! {
         .cloned()
         .collect();
     let sub = rest.first().cloned().unwrap_or_else(|| {
-        fail("usage: --headless <tracks|settings|generate|install|batch> [flags]")
+        fail("usage: --headless <tracks|settings|status|selftest|diagnostics|generate|install|batch> [flags]")
     });
     let (kv, flags) = parse_flags(&rest[1..]);
 
@@ -346,6 +374,27 @@ pub fn main(ctx: tauri::Context) -> ! {
                        "repoRoot": crate::engine::repo_root(&handle).ok()
                                      .map(|p| p.to_string_lossy().to_string()),
                        "settings": serde_json::to_value(&s).unwrap_or(Value::Null)}));
+            true
+        }
+        // What the GUI's banner and Settings are told about the engine and the
+        // model: the two status checks, verbatim.
+        "status" => {
+            let engine = crate::commands::engine_status(handle.clone(), Some(true));
+            let neural = crate::commands::neural_status(handle.clone()).unwrap_or(Value::Null);
+            let ok = engine["pythonOk"].as_bool().unwrap_or(false)
+                && engine["beatforgeOk"].as_bool().unwrap_or(false)
+                && neural["installed"].as_bool().unwrap_or(false);
+            out(json!({"ok": ok, "op": "status", "engine": engine, "neural": neural}));
+            ok
+        }
+        // Does this install work? Imports, both models, a 20-second clip charted
+        // end to end, and (Linux) the audio elements the Results screen needs.
+        // The release smoke test runs this on every installer before publishing.
+        "selftest" => selftest(&handle, &flags),
+        // The same text as the GUI's "Copy diagnostics".
+        "diagnostics" => {
+            eprintln!("{}", crate::diagnostics::report(&handle));
+            out(json!({"ok": true, "op": "diagnostics"}));
             true
         }
         "generate" => generate(&handle, &kv, &flags),

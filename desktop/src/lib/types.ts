@@ -180,6 +180,18 @@ export interface NeuralStatus {
   style_fields: NeuralStyleField[];
   /** False when the onnxruntime package does not import in the engine's Python. */
   onnxruntime: boolean;
+  /** Why it did not import: the real exception ("ImportError: DLL load failed
+   *  …"). Null when it imported, or from an engine that does not report it. */
+  onnxruntime_error: string | null;
+  /** The model's files are in place. `installed` also needs onnxruntime, so a
+   *  complete model beside a broken onnxruntime is `installed: false` with this
+   *  true — which is not "no model". */
+  weights_present: boolean;
+  /** The engine ran and does not know `neural-status`: it predates the model.
+   *  Nothing else sets this (a broken or missing engine is `probe_failed`). */
+  legacy: boolean;
+  /** The status check itself got no answer; `error` says how it failed. */
+  probe_failed: boolean;
   error: string | null;
 }
 
@@ -267,8 +279,18 @@ export interface EngineStatus {
   engineRoot: string | null;
   python: string;
   pythonOk: boolean;
+  /** Why the interpreter did not start ("" when it did). */
+  pythonError: string;
   beatforgeOk: boolean;
+  /** The first required module that failed and its real exception, or how
+   *  Python died while importing ("" when the engine is fine). */
   importError: string;
+  /** module -> exception, for every module that did not import. */
+  moduleErrors: Record<string, string>;
+  /** Why onnxruntime did not import ("" when it did). */
+  onnxruntimeError: string;
+  /** The engine runs on the Python inside the app (release builds). */
+  bundled: boolean;
   ffmpeg: string;
   ffmpegOk: boolean;
   /** Needed by the neural engine only — never part of "is the engine ready". */

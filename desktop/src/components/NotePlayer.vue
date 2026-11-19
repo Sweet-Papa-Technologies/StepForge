@@ -13,7 +13,7 @@
  * position and play state, so toggling mid-song is seamless.
  */
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
-import { convertFileSrc } from "@tauri-apps/api/core";
+import { useMediaSrc } from "../lib/mediaSrc";
 import type { Chart, ChartNote } from "../lib/types";
 import { fmtDuration } from "../lib/format";
 
@@ -49,14 +49,13 @@ let notes: ChartNote[] = [];
 let cols = 4;
 let hitFlash: number[] = [];
 let cursor = 0;
+let autoplayWhenReady = false;
 /** Canvas CSS size, maintained by the ResizeObserver (never inside rAF). */
 let cssW = 0;
 let cssH = 0;
 
-const songUrl = computed(() => (props.audioPath ? convertFileSrc(props.audioPath) : ""));
-const assistUrl = computed(() =>
-  props.assistPath ? convertFileSrc(props.assistPath) + (props.rev ? `?v=${props.rev}` : "") : "",
-);
+const songUrl = useMediaSrc(() => props.audioPath);
+const assistUrl = useMediaSrc(() => props.assistPath, () => props.rev);
 const hasAssist = computed(() => !!assistUrl.value);
 const activeUrl = computed(() =>
   assist.value && assistUrl.value ? assistUrl.value : songUrl.value,
@@ -142,16 +141,27 @@ function resyncCursor(t: number) {
 watch(activeUrl, (url) => {
   const a = audio.value;
   const keep = a ? a.currentTime : 0;
-  const resume = a ? !a.paused : false;
+  let resume = a ? !a.paused : false;
+  if (url && autoplayWhenReady) {
+    resume = true;
+    autoplayWhenReady = false;
+  }
   setSource(url, keep, resume);
 });
+
+/** Start a chart from the top. Where the audio address arrives a moment later
+ *  (see lib/mediaSrc), the autoplay is remembered until it does. */
+function startChart() {
+  autoplayWhenReady = !!props.autoplay && !activeUrl.value;
+  setSource(activeUrl.value, 0, props.autoplay);
+}
 
 watch(
   () => props.chart,
   () => {
     resetChart();
     assist.value = true; // fresh difficulty -> assist back on
-    setSource(activeUrl.value, 0, props.autoplay);
+    startChart();
   },
 );
 
@@ -303,7 +313,7 @@ onMounted(() => {
   resize();
   ro = new ResizeObserver(resize);
   if (wrap.value) ro.observe(wrap.value);
-  setSource(activeUrl.value, 0, props.autoplay);
+  startChart();
   raf = requestAnimationFrame(frame);
 });
 onBeforeUnmount(() => {

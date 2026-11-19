@@ -20,6 +20,7 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use tauri::AppHandle;
 
+use crate::diagnostics;
 use crate::engine::{self, Settings};
 
 /// Difficulty sets, straight from the engine (config.DIFFICULTIES and each
@@ -668,17 +669,35 @@ pub enum CliSupport {
 
 /// Read the `neural-status` probe as a statement about the CLI itself.
 ///
-/// The command's contract is "always one JSON object, always exit 0" — with
-/// the weights installed or not. So ANY JSON object back means a current CLI,
-/// and no usable answer (argparse "invalid choice", a process that would not
-/// start, output that is not an object) means one that predates the command.
-/// `installed` is deliberately not consulted: a current CLI without weights
-/// still wants `--engine`.
+/// LEGACY means one thing: the engine ran, and its argparse said `neural-status`
+/// is not a command it has. Nothing else is evidence of an old engine. A probe
+/// that failed any other way — the interpreter did not start, Python crashed
+/// loading a library, the engine's files were mid-update — used to be read as
+/// "too old" as well, which sent users with a broken install looking for an
+/// update. Those are failures of the current engine and are reported as what
+/// they are (`probe_failure`).
 pub fn cli_support(probe: &Result<Value, String>) -> CliSupport {
     match probe {
-        Ok(v) if v.is_object() => CliSupport::Current,
-        _ => CliSupport::Legacy,
+        Err(e) if is_unknown_command(e, "neural-status") => CliSupport::Legacy,
+        _ => CliSupport::Current,
     }
+}
+
+/// Did argparse reject `sub` as a subcommand? (`run_check_args` puts the tail
+/// of stderr in its error: "… error: argument cmd: invalid choice: 'x' …".)
+fn is_unknown_command(err: &str, sub: &str) -> bool {
+    err.contains("invalid choice") && err.contains(&format!("'{sub}'"))
+}
+
+/// The status object the frontend gets when the probe gave no status: which of
+/// the two it was (`legacy`), and the real reason in `error`.
+pub fn probe_failure(err: &str) -> Value {
+    json!({
+        "installed": false,
+        "legacy": is_unknown_command(err, "neural-status"),
+        "probe_failed": true,
+        "error": err,
+    })
 }
 
 /// One `stepforge` run, as both the GUI and `--headless generate` describe it.
@@ -1609,52 +1628,40 @@ pub fn engine_status(app: AppHandle, force: Option<bool>) -> Value {
     v
 }
 
-/// The import probe. The first line is the engine's hard requirements and
-/// decides `beatforgeOk`. onnxruntime is tried separately and only REPORTED:
-/// it is needed by the neural engine alone, so a machine without it must still
-/// read as ready for the LLM and deterministic engines.
-const STATUS_PROBE: &str = "import beatforge, numpy, scipy, soundfile
-try:
-    import onnxruntime
-    print('onnxruntime=ok')
-except Exception:
-    print('onnxruntime=missing')
-";
-
 fn probe_engine_status(app: AppHandle) -> Value {
     let root = engine::repo_root(&app).ok();
     let py = engine::python_bin(&app);
 
-    let python_ok = engine::python_command(&app)
-        .arg("--version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-    let mut beatforge_ok = false;
-    let mut onnxruntime_ok = false;
-    let mut import_error = String::new();
-    if let Some(r) = &root {
-        match engine::python_command(&app)
-            .args(["-c", STATUS_PROBE])
+    // Does the interpreter start at all? Kept apart from the import probe so
+    // "the path is wrong" and "a library is broken" are never the same message.
+    let python_error = match engine::python_command(&app).arg("--version").output() {
+        Ok(o) if o.status.success() => String::new(),
+        Ok(o) => format!("Python did not start: {}", diagnostics::describe_failure(&o)),
+        Err(e) => format!("Python could not be started: {e}"),
+    };
+    let python_ok = python_error.is_empty();
+
+    let mut probe = diagnostics::ImportProbe::default();
+    let mut probed = false;
+    if let (true, Some(r)) = (python_ok, &root) {
+        probed = true;
+        probe = match engine::python_command(&app)
+            .args(["-c", diagnostics::STATUS_PROBE])
             .env("PYTHONPATH", r.join("tools"))
             .current_dir(r)
             .output()
         {
-            Ok(o) => {
-                beatforge_ok = o.status.success();
-                onnxruntime_ok =
-                    beatforge_ok && String::from_utf8_lossy(&o.stdout).contains("onnxruntime=ok");
-                if !beatforge_ok {
-                    import_error = String::from_utf8_lossy(&o.stderr)
-                        .trim()
-                        .lines()
-                        .last()
-                        .unwrap_or("")
-                        .to_string();
-                }
-            }
-            Err(e) => import_error = e.to_string(),
-        }
+            Ok(o) => diagnostics::probe_from_output(&o),
+            Err(e) => diagnostics::ImportProbe {
+                died: Some(format!("it could not be started: {e}")),
+                ..Default::default()
+            },
+        };
+    }
+    let beatforge_ok = probed && probe.engine_ok();
+    let import_error = if probed { probe.engine_error() } else { String::new() };
+    for e in [&python_error, &import_error] {
+        diagnostics::record_error(e.as_str());
     }
     let ffmpeg = engine::ffmpeg_bin(&app);
     let ffmpeg_ok = engine::command(&ffmpeg)
@@ -1662,17 +1669,33 @@ fn probe_engine_status(app: AppHandle) -> Value {
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false);
+    let bundled = crate::install::bundled_python()
+        .map(|p| p.to_string_lossy() == py.as_str())
+        .unwrap_or(false);
 
     json!({
         "engineRoot": root.map(|r| r.to_string_lossy().to_string()),
         "python": py,
         "pythonOk": python_ok,
+        "pythonError": python_error,
         "beatforgeOk": beatforge_ok,
         "importError": import_error,
+        "moduleErrors": probe.failed,
         "ffmpeg": ffmpeg,
         "ffmpegOk": ffmpeg_ok,
-        "onnxruntimeOk": onnxruntime_ok,
+        "onnxruntimeOk": probed && probe.onnxruntime_ok(),
+        "onnxruntimeError": probe.failed.get("onnxruntime").cloned().unwrap_or_default(),
+        // The app's own Python: "pip install" is never the fix, reinstalling is.
+        "bundled": bundled,
     })
+}
+
+/// The text behind "Copy diagnostics": app version, OS, CPU, the engine's
+/// self-test and the last error, with the user's folders, name and song names
+/// taken out. Runs the self-test, so it takes a few seconds.
+#[tauri::command(async)]
+pub fn engine_diagnostics(app: AppHandle) -> String {
+    diagnostics::report(&app)
 }
 
 #[tauri::command(async)]
@@ -1731,8 +1754,18 @@ fn run_check_args(
     serde_json::from_str::<Value>(line).map_err(|_| {
         let err = String::from_utf8_lossy(&out.stderr);
         let tail: Vec<&str> = err.trim().lines().rev().take(6).collect();
+        // How it ended comes first: a crash (a missing DLL, an instruction the
+        // CPU lacks) leaves no traceback, and used to read as "no result".
+        let how = diagnostics::describe_status(&out.status)
+            .map(|h| format!(" It {h}."))
+            .unwrap_or_default();
+        let hint = if timeout_hint.is_empty() {
+            String::new()
+        } else {
+            format!(" ({timeout_hint})")
+        };
         format!(
-            "the engine returned no result for `{sub}` ({timeout_hint}).\n{}",
+            "The engine gave no answer to `{sub}`{hint}.{how}\n{}",
             tail.into_iter().rev().collect::<Vec<_>>().join("\n")
         )
     })
@@ -1782,7 +1815,16 @@ pub fn argon_check(app: AppHandle) -> Result<Value, String> {
 pub fn neural_status(app: AppHandle) -> Result<Value, String> {
     let probe = probe_neural_status(&app);
     remember_cli_support(cli_support(&probe));
-    probe
+    // Always an object: a probe that failed is an answer too, and carries its
+    // real reason instead of collapsing into "the engine is too old".
+    Ok(match probe {
+        Ok(v) if v.is_object() => v,
+        Ok(v) => probe_failure(&format!("the engine answered `neural-status` with {v}, not a status")),
+        Err(e) => {
+            diagnostics::record_error(e.as_str());
+            probe_failure(&e)
+        }
+    })
 }
 
 fn probe_neural_status(app: &AppHandle) -> Result<Value, String> {
@@ -1793,7 +1835,7 @@ fn probe_neural_status(app: &AppHandle) -> Result<Value, String> {
         app.clone(),
         "neural-status",
         &["--json"],
-        "an engine from before the neural chart engine does not have this command",
+        "",
     )
 }
 
@@ -2338,17 +2380,33 @@ mod tests {
 
         // What `run_check_args` returns when argparse rejects the subcommand.
         let unknown: Result<Value, String> = Err(
-            "the engine returned no result for `neural-status` (…).\n\
+            "The engine gave no answer to `neural-status`. It exited with code 2.\n\
              beatforge: error: argument cmd: invalid choice: 'neural-status'"
                 .into(),
         );
         assert_eq!(cli_support(&unknown), CliSupport::Legacy);
-        let no_process: Result<Value, String> =
-            Err("could not run the engine (neural-status): No such file or directory".into());
-        assert_eq!(cli_support(&no_process), CliSupport::Legacy);
-        // A JSON line that is not the status object is not an answer either.
-        assert_eq!(cli_support(&Ok(json!([]))), CliSupport::Legacy);
-        assert_eq!(cli_support(&Ok(Value::Null)), CliSupport::Legacy);
+        // An engine that did not START is not an old engine. Each of these was
+        // reported as "the installed engine is too old for the neural model".
+        for failure in [
+            "could not run the engine (neural-status): No such file or directory (os error 2)",
+            "The engine gave no answer to `neural-status`. It crashed (0xC0000135, a DLL it needs was not found).\n",
+            "The engine gave no answer to `neural-status`. It exited with code 1.\n\
+             /app/python/bin/python3: No module named beatforge",
+            "The engine gave no answer to `neural-status`. It exited with code 1.\n\
+             ModuleNotFoundError: No module named 'numpy'",
+        ] {
+            let probe: Result<Value, String> = Err(failure.into());
+            assert_eq!(cli_support(&probe), CliSupport::Current, "{failure}");
+            let status = probe_failure(failure);
+            assert_eq!(status["legacy"], false, "{failure}");
+            assert_eq!(status["error"], failure, "the real reason reaches the UI");
+            assert_eq!(status["installed"], false);
+        }
+        assert_eq!(probe_failure(unknown.as_ref().unwrap_err())["legacy"], true);
+        // A JSON line that is not the status object is a broken answer, not an
+        // old engine.
+        assert_eq!(cli_support(&Ok(json!([]))), CliSupport::Current);
+        assert_eq!(cli_support(&Ok(Value::Null)), CliSupport::Current);
     }
 
     /// An engine from before `--engine` gets exactly the argv it always got —
@@ -2616,19 +2674,5 @@ mod tests {
             .unwrap_err()
             .contains("not a stepforge difficulty"));
         assert!(inpaint_args("  ", "hard", 0, 4, None).is_err());
-    }
-
-    /// onnxruntime is the neural engine's dependency only. The probe must report
-    /// it without letting its absence fail the line that decides `beatforgeOk`.
-    #[test]
-    fn a_missing_onnxruntime_cannot_fail_the_engine_probe() {
-        let mut lines = STATUS_PROBE.lines();
-        let required = lines.next().unwrap();
-        assert_eq!(required, "import beatforge, numpy, scipy, soundfile");
-        assert!(!required.contains("onnxruntime"));
-        let rest: Vec<&str> = lines.collect();
-        assert_eq!(rest[0], "try:");
-        assert!(rest[1].trim() == "import onnxruntime");
-        assert!(rest.iter().any(|l| l.starts_with("except")));
     }
 }

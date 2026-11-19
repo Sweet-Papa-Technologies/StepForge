@@ -69,3 +69,7 @@ jobs:
       - name: Rust tests
         working-directory: desktop/src-tauri
         run: cargo test --locked
+      - name: Packaging script tests
+        # The dependency audit and the Windows runtime bundling, on synthesized
+        # binaries (standard library only).
+        run: python3 -m unittest discover -s desktop/scripts -p "test_*.py" -v

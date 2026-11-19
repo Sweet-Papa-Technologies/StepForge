@@ -331,6 +331,59 @@ pub fn refresh_workspace() -> Result<bool, String> {
     refresh_models(&engine, &ws)
 }
 
+/// "Has the startup refresh finished?" — `false` only between
+/// `begin_startup_refresh` and the end of the refresh it starts.
+pub struct RefreshGate {
+    running: Mutex<bool>,
+    done: std::sync::Condvar,
+}
+
+impl RefreshGate {
+    pub const fn new() -> Self {
+        Self { running: Mutex::new(false), done: std::sync::Condvar::new() }
+    }
+
+    pub fn begin(&self) {
+        *self.running.lock().unwrap_or_else(|p| p.into_inner()) = true;
+    }
+
+    pub fn finish(&self) {
+        *self.running.lock().unwrap_or_else(|p| p.into_inner()) = false;
+        self.done.notify_all();
+    }
+
+    /// Block while a refresh is running. Returns at once when none is (or none
+    /// was ever started: tests, the headless path, a development build).
+    pub fn wait(&self) {
+        let mut running = self.running.lock().unwrap_or_else(|p| p.into_inner());
+        while *running {
+            running = self.done.wait(running).unwrap_or_else(|p| p.into_inner());
+        }
+    }
+}
+
+static STARTUP_REFRESH: RefreshGate = RefreshGate::new();
+
+/// Bring the workspace up to date with the installed app, off the calling
+/// thread (after an update it can be ~150 MB to copy). Until it finishes,
+/// `wait_for_startup_refresh` holds back everything that would run the engine.
+///
+/// Without that, the first status checks of a freshly updated app raced the
+/// copy: `tools/` is removed and rewritten, and a Python started in that window
+/// failed with "No module named beatforge" — which the app then reported as
+/// "the installed engine is too old", until the next restart.
+pub fn begin_startup_refresh() {
+    STARTUP_REFRESH.begin();
+    std::thread::spawn(|| {
+        let _ = refresh_workspace();
+        STARTUP_REFRESH.finish();
+    });
+}
+
+pub fn wait_for_startup_refresh() {
+    STARTUP_REFRESH.wait();
+}
+
 /// Give an EXISTING workspace the neural model the installed app ships.
 ///
 /// `ensure_workspace` provisions a workspace once and then leaves it alone, so
@@ -425,6 +478,31 @@ mod tests {
         assert!(!ws.join("tools/beatforge/removed.py").exists(), "stale module dropped");
         assert!(ws.join("tools/beatforge/__main__.py").is_file());
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The engine must not be started while the workspace's code is being
+    /// replaced: callers wait for the refresh that began before them.
+    #[test]
+    fn engine_calls_wait_for_a_refresh_in_progress() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let gate = Arc::new(RefreshGate::new());
+        gate.wait(); // nothing running: returns at once
+
+        gate.begin();
+        let refreshed = Arc::new(AtomicBool::new(false));
+        let (g, r) = (gate.clone(), refreshed.clone());
+        let caller = std::thread::spawn(move || {
+            g.wait();
+            r.load(Ordering::SeqCst) // what the engine call would have seen
+        });
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        assert!(!caller.is_finished(), "the caller ran before the refresh finished");
+        refreshed.store(true, Ordering::SeqCst);
+        gate.finish();
+        assert!(caller.join().unwrap(), "the caller saw the refreshed workspace");
+        gate.wait(); // and nothing is held afterwards
     }
 
     #[test]

@@ -354,6 +354,10 @@ pub fn ffmpeg_bin(app: &AppHandle) -> String {
 
 /// The resolved repo root, honouring the saved setting first.
 pub fn repo_root(app: &AppHandle) -> Result<PathBuf, String> {
+    // After an update the app replaces the workspace's engine code at startup.
+    // Anything that would run the engine waits for that to finish: a probe that
+    // started Python while `tools/` was being swapped found half an engine.
+    crate::install::wait_for_startup_refresh();
     let s = load_settings(app);
     if !s.engine_root.trim().is_empty() {
         let p = PathBuf::from(&s.engine_root);
@@ -727,8 +731,16 @@ pub fn spawn_command(app: &AppHandle, job_id: String, mut cmd: Command) -> Resul
     let app2 = app.clone();
     let jid2 = job_id.clone();
     std::thread::spawn(move || {
+        // The last few things the engine said, for the diagnostics report.
+        let mut tail: std::collections::VecDeque<String> = std::collections::VecDeque::new();
         if let Some(err) = stderr {
             for_each_line_lossy(err, |line| {
+                if !line.trim().is_empty() {
+                    if tail.len() == 3 {
+                        tail.pop_front();
+                    }
+                    tail.push_back(line.trim().to_string());
+                }
                 let _ = app2.emit(
                     "engine:log",
                     LogEvent {
@@ -749,7 +761,19 @@ pub fn spawn_command(app: &AppHandle, job_id: String, mut cmd: Command) -> Resul
         let reg = app2.state::<JobRegistry>();
         let child = reg.0.lock().unwrap().remove(&jid2);
         let code = if let Some(mut c) = child {
-            c.wait().ok().and_then(|s| s.code()).unwrap_or(-1)
+            let status = c.wait().ok();
+            // A job the user did not cancel and that did not finish cleanly:
+            // remember how it ended (a crash has no exit code on Unix) and what
+            // it said last.
+            if let Some(how) = status.as_ref().and_then(crate::diagnostics::describe_status) {
+                let said = tail.iter().cloned().collect::<Vec<_>>().join(" | ");
+                crate::diagnostics::record_error(if said.is_empty() {
+                    format!("an engine job {how}")
+                } else {
+                    format!("an engine job {how}: {said}")
+                });
+            }
+            status.and_then(|s| s.code()).unwrap_or(-1)
         } else {
             // Already removed (cancelled).
             -1

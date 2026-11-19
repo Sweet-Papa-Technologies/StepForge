@@ -39,6 +39,9 @@ import urllib.request
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+import native_audit  # noqa: E402
+
 DESKTOP = HERE.parent
 REPO = DESKTOP.parent
 OUT = DESKTOP / "src-tauri" / "runtime"
@@ -203,6 +206,13 @@ def prune(py_root: Path) -> None:
         for name in STDLIB_PRUNE:
             shutil.rmtree(lib / name, ignore_errors=True)
         (lib / "turtle.py").unlink(missing_ok=True)
+        # `crypt` (deprecated, removed in Python 3.13, unused here): its
+        # extension links libcrypt.so.1, which Arch-based distributions do not
+        # install. Nothing loads it, but it is the one library in the bundle
+        # that a supported system may not have, so it does not ship.
+        (lib / "crypt.py").unlink(missing_ok=True)
+        for f in (lib / "lib-dynload").glob("_crypt.*"):
+            f.unlink()
         site = lib / "site-packages"
         # `bin` holds console scripts that `pip install --target` drops there.
         for d in list(site.glob("pip")) + list(site.glob("pip-*.dist-info")) + [site / "bin"]:
@@ -232,6 +242,70 @@ def prune(py_root: Path) -> None:
             shutil.rmtree(d, ignore_errors=True)
     after = sum(1 for f in py_root.rglob("*") if f.is_file())
     log(f"pruned the runtime: {before} -> {after} files")
+
+
+def platform_of(triple: str) -> str:
+    return ("windows" if "windows" in triple else "macos" if triple.endswith("-apple-darwin")
+            else "linux")
+
+
+def vc_redist_dirs() -> list[Path]:
+    """Where this build machine keeps redistributable copies of the Visual C++
+    runtime, best first: Visual Studio's own redist folder (newest toolset),
+    then System32 (present when the VC++ redistributable is installed)."""
+    dirs: list[Path] = []
+    pf86 = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
+    vswhere = Path(pf86) / "Microsoft Visual Studio" / "Installer" / "vswhere.exe"
+    if vswhere.is_file():
+        r = subprocess.run([str(vswhere), "-latest", "-products", "*", "-property", "installationPath"],
+                           capture_output=True, text=True)
+        for line in r.stdout.splitlines():
+            base = Path(line.strip()) / "VC" / "Redist" / "MSVC"
+            if base.is_dir():
+                # 14.44.35112/x64/Microsoft.VC143.CRT — newest version first.
+                found = [d for d in base.glob("*/x64/Microsoft.VC*.CRT") if d.is_dir()]
+                dirs += sorted(found, key=lambda d: [int(x) if x.isdigit() else 0
+                                                     for x in d.parts[-3].split(".")], reverse=True)
+    dirs.append(Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32")
+    return dirs
+
+
+def bundle_vc_runtime(py_root: Path, sources: list[Path] | None = None) -> list[str]:
+    """Copy the Visual C++ runtime DLLs the bundle imports but lacks to next to
+    python.exe (the application directory, which Windows searches before
+    System32). Returns the names copied.
+
+    python-build-standalone ships vcruntime140.dll and vcruntime140_1.dll;
+    numpy brings a private msvcp140. onnxruntime imports msvcp140.dll and
+    msvcp140_1.dll and brings neither, so on a PC without the VC++
+    redistributable `import onnxruntime` failed ("DLL load failed") while
+    everything else worked. Driven by the audit, so a future dependency on
+    another of these DLLs is picked up without editing a list."""
+    sources = vc_redist_dirs() if sources is None else sources
+    copied: list[str] = []
+    for _ in range(4):                       # a copied DLL can import another
+        missing = [n for n in native_audit.audit(py_root, "windows") if native_audit.VC_RUNTIME.match(n)]
+        if not missing:
+            break
+        for name in missing:
+            src = next((d / name for d in sources if (d / name).is_file()), None)
+            if src is None:
+                raise SystemExit(f"the bundle needs {name} and this machine has no copy to ship "
+                                 f"(looked in: {', '.join(str(d) for d in sources)})")
+            shutil.copy2(src, py_root / name)
+            copied.append(name)
+            log(f"bundled {name} from {src.parent}")
+    return copied
+
+
+def audit_native(py_root: Path, triple: str) -> None:
+    """Fail the build if the runtime loads a library it does not contain and
+    the operating system does not provide (native_audit.py)."""
+    missing = native_audit.audit(py_root, platform_of(triple))
+    if missing:
+        raise SystemExit("the bundled runtime loads libraries it does not contain, so it would only "
+                         "work on machines that happen to have them:\n" + native_audit.describe(missing))
+    log("every native library the runtime loads is bundled or part of the OS")
 
 
 def copy_engine(dest: Path, version: str) -> None:
@@ -274,29 +348,8 @@ def sign_macos(root: Path, identity: str) -> None:
     log("signatures applied")
 
 
-INFER_CHECK = """
-import sys
-import numpy as np
-import onnxruntime
-from beatforge.adapters.stepmania.neural import conditioning as cond
-from beatforge.adapters.stepmania.neural import grid_features as GF
-from beatforge.adapters.stepmania.neural import infer
-rng = np.random.default_rng(3)
-y = np.zeros(int(30 * GF.SR), np.float32)
-for b in range(140):                               # a click every 0.2 s (150 BPM)
-    k = int((0.2 + b * 0.2) * GF.SR)
-    y[k:k + 60] += rng.standard_normal(60).astype(np.float32)
-g = GF.extract_grid_features(y, GF.TimingMap.constant(150.0, 0.2))
-eng = infer.StepManiaNeuralEngine(sys.argv[1])
-counts = {}
-for d in ("easy", "hard"):
-    ch = eng.generate(g.X, g.tick_times_sec, d, cond.resolve_style(d), 30.0, seed=1)
-    counts[d] = len(infer.to_placements(ch))
-assert all(counts.values()), counts
-print(f"{onnxruntime.__version__} (charted easy {counts['easy']} / hard {counts['hard']} notes)")
-"""
-
-
+#: A 24 s click track, written with the bundled interpreter. check_appimage.py
+#: uses it for the song it imports through the app.
 E2E_AUDIO = """
 import sys
 import numpy as np
@@ -311,58 +364,37 @@ sf.write(sys.argv[1], np.stack([y, y], axis=1), sr)
 """
 
 
-def end_to_end(py: Path, engine: Path) -> str:
-    """Chart a synthetic song through the real command line, in a scratch
-    workspace: to-ogg (libsndfile), analysis (scipy), the model (onnxruntime),
-    the foot model, .ssc/.sm writing (simfile) and the preview PNG (Pillow)."""
-    with tempfile.TemporaryDirectory(prefix="stepforge-smoke-") as tmp:
-        ws = Path(tmp)
-        shutil.copytree(engine / "tools", ws / "tools")
-        for d in ("assets/tracks", "public/assets/tracks", "public/maps", "build"):
-            (ws / d).mkdir(parents=True, exist_ok=True)
-        env = dict(os.environ, PYTHONPATH=str(ws / "tools"), PYTHONNOUSERSITE="1",
-                   PYTHONDONTWRITEBYTECODE="1", PYTHONUTF8="1", PYTHONIOENCODING="utf-8",
-                   BEATFORGE_NEURAL_MODEL_DIR=str(engine / "models" / "stepforge_flow"))
+def smoke_test(py: Path, engine: Path, triple: str) -> None:
+    """Run the engine's own self-test with the staged interpreter: every
+    dependency imports, both networks load, and a 20-second clip is charted end
+    to end through the real command line (to-ogg, analysis, the model, the foot
+    model, .ssc/.sm writing, the preview PNG). An over-eager pruning rule or an
+    onnxruntime build that loads but cannot run fails here, not on a user's PC.
 
-        def run(*args: str, timeout: int = 600) -> None:
-            r = subprocess.run([str(py), *args], cwd=ws, env=env, capture_output=True,
-                               text=True, timeout=timeout)
-            if r.returncode != 0:
-                raise SystemExit(f"smoke test failed at {' '.join(args[:3])}:\n{r.stdout[-1500:]}\n{r.stderr[-3000:]}")
-
-        wav = ws / "assets/tracks/smoke.wav"
-        run("-c", E2E_AUDIO, str(wav))
-        run("-m", "beatforge", "to-ogg", "--in", str(wav), "--out", str(ws / "public/assets/tracks/smoke.ogg"))
-        wav.unlink()
-        run("-m", "beatforge", "stepforge", "--track", "smoke", "--difficulties", "easy,hard",
-            "--engine", "neural", "--backend", "local")
-        song = ws / "build" / "stepmania" / "smoke"
-        missing = [n for n in ("smoke.ssc", "smoke.sm", "hard.notefield.png") if not (song / n).is_file()]
-        if missing:
-            raise SystemExit(f"smoke test: the chart run did not write {missing} (got {sorted(p.name for p in song.glob('*'))})")
-        charts = (song / "smoke.ssc").read_text(encoding="utf-8").count("#NOTEDATA:")
-        return f"charted a song end to end ({charts} charts)"
-
-
-def smoke_test(py: Path, engine: Path) -> None:
+    On Windows it also has to be self-contained: no Visual C++ runtime DLL may
+    come from the build machine's System32."""
     env = dict(os.environ, PYTHONPATH=str(engine / "tools"), PYTHONNOUSERSITE="1",
-               PYTHONDONTWRITEBYTECODE="1")
-    out = subprocess.run([str(py), "-m", "beatforge", "neural-status", "--json"],
-                         cwd=engine, env=env, capture_output=True, text=True, check=True)
-    status = json.loads(out.stdout.strip().splitlines()[-1])
-    if not status.get("installed"):
-        raise SystemExit(f"the staged engine does not see its model: {status.get('error')}")
-    # Loading is not running: chart a synthetic click track with the real
-    # model, so an onnxruntime build that loads the model but cannot execute
-    # it (each platform resolves its own onnxruntime version) fails here.
-    run = subprocess.run([str(py), "-c", INFER_CHECK, str(engine / "models" / "stepforge_flow")],
-                         cwd=engine, env=env, capture_output=True, text=True)
-    if run.returncode != 0:
-        raise SystemExit(f"the staged engine could not chart:\n{run.stderr[-3000:]}")
-    log(f"smoke test ok: {status.get('display_name')} via onnxruntime "
-        f"{run.stdout.strip().splitlines()[-1]}, "
-        f"style index {'yes' if status.get('style_rag_available') else 'no'}")
-    log(f"smoke test ok: {end_to_end(py, engine)}")
+               PYTHONDONTWRITEBYTECODE="1", PYTHONUTF8="1", PYTHONIOENCODING="utf-8")
+    env.pop("BEATFORGE_NEURAL_MODEL_DIR", None)
+    cmd = [str(py), "-m", "beatforge.selftest", "--json", "--chart"]
+    if platform_of(triple) == "windows":
+        cmd.append("--self-contained")
+    run = subprocess.run(cmd, cwd=engine, env=env, capture_output=True, text=True,
+                         encoding="utf-8", errors="replace", timeout=1200)
+    try:
+        report = json.loads(run.stdout.strip().splitlines()[-1])
+    except (IndexError, ValueError):
+        raise SystemExit(f"the staged engine's self-test gave no report (exit {run.returncode}):\n"
+                         f"{run.stdout[-1500:]}\n{run.stderr[-3000:]}") from None
+    if not report.get("ok"):
+        raise SystemExit("the staged engine failed its self-test:\n  "
+                         + "\n  ".join(report.get("errors") or ["(no reason given)"])
+                         + f"\n{run.stderr[-2000:]}")
+    mods = report["modules"]
+    log(f"smoke test ok: {report['model'].get('display_name')} via onnxruntime "
+        f"{mods['onnxruntime'].get('version')}, numpy {mods['numpy'].get('version')}")
+    log(f"smoke test ok: charted a {report['chart']['seconds']} s clip end to end "
+        f"({report['chart']['charts']})")
 
 
 def tree_size(p: Path) -> int:
@@ -392,9 +424,12 @@ def main() -> int:
         prune(py_root)
         if a.triple.endswith("-apple-darwin"):
             check_macos_minimum(py_root)
+    if platform_of(a.triple) == "windows":
+        bundle_vc_runtime(py_root)
+    audit_native(py_root, a.triple)
     shutil.rmtree(engine, ignore_errors=True)
     copy_engine(engine, a.version)
-    smoke_test(python_exe(py_root), engine)
+    smoke_test(python_exe(py_root), engine, a.triple)
     for p in out.rglob("__pycache__"):
         shutil.rmtree(p, ignore_errors=True)
 

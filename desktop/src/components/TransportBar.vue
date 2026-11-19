@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, watch, onBeforeUnmount, computed } from "vue";
-import { convertFileSrc } from "@tauri-apps/api/core";
+import { useMediaSrc } from "../lib/mediaSrc";
 import { fmtDuration } from "../lib/format";
 
 /** `rev` is bumped when the file at `src` was rewritten in place, so the webview
@@ -12,9 +12,7 @@ const playing = ref(false);
 const current = ref(0);
 const duration = ref(0);
 
-const url = computed(() =>
-  props.src ? convertFileSrc(props.src) + (props.rev ? `?v=${props.rev}` : "") : "",
-);
+const url = useMediaSrc(() => props.src, () => props.rev);
 
 watch(url, () => {
   playing.value = false;

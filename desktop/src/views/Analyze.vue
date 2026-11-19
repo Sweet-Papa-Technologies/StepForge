@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, shallowRef, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
-import { convertFileSrc } from "@tauri-apps/api/core";
+import { useMediaSrc } from "../lib/mediaSrc";
 import { api } from "../lib/api";
 import { useLibrary } from "../stores/library";
 import { useEngine } from "../stores/engine";
@@ -43,7 +43,7 @@ const busyReason = computed(() =>
       ? "A chart run is still in progress…"
       : "",
 );
-const audioUrl = computed(() => (audioPath.value ? convertFileSrc(audioPath.value) : ""));
+const audioUrl = useMediaSrc(() => audioPath.value);
 
 const duration = computed(() => analysis.value?.duration_s ?? track.value?.durationSec ?? 0);
 
