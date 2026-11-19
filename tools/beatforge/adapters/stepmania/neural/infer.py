@@ -1064,7 +1064,11 @@ def decode_rhythm(logits: dict, tick_times: np.ndarray, difficulty: str,
     pj = sigmoid(logits["jump"][ticks].astype(np.float64))
     share = float(style[3]) if style[3] >= 0 else JUMP_SHARE_BOOST * float(pj.mean())
     stats["jump_share_model"] = round(float(pj.mean()), 4)
-    n_jump = int(math.floor(min(share, _JUMP_MAX_FRAC[b.jumps]) * n + 1e-9))
+    # shares are of the notes that can carry a jump or a freeze at all: in
+    # Stream mode that is the breaks, and the whole chart's share spent there
+    # would turn every break note into a jump
+    n_open = int((~in_stream).sum())
+    n_jump = int(math.floor(min(share, _JUMP_MAX_FRAC[b.jumps]) * n_open + 1e-9))
     is_jump = np.zeros(n, bool)
     if n_jump > 0:
         ok = (ticks % _JUMP_TICKS[b.jumps] == 0) & ~in_stream
@@ -1085,7 +1089,7 @@ def decode_rhythm(logits: dict, tick_times: np.ndarray, difficulty: str,
     # floor, not round: 8 freezes in 95 notes is 8.4%, over an 8% ceiling. The
     # tier's share is the only limit: its fixed count (max_holds, written for
     # the LLM designer) held a 400-note Hard chart to 3% freezes.
-    n_hold = int(math.floor(min(share, b.hold_share[1]) * n + 1e-9))
+    n_hold = int(math.floor(min(share, b.hold_share[1]) * n_open + 1e-9))
     flavor = np.zeros(n, np.int64)
     dur = np.zeros(n, np.int64)
     if n_hold > 0:

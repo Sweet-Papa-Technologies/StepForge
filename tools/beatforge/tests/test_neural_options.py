@@ -166,6 +166,10 @@ def check_stream_plan(plan, opts: DecodeOptions, step: int):
     # streams carry plain steps: no jump and no freeze starts inside one
     inside = in_stream[plan.tick] & ~np.isin(plan.tick, [b * 48 for _, b in info["segments"]])
     assert not plan.is_jump[inside].any() and not (plan.flavor[inside] > 0).any()
+    # ...and the breaks are not made to carry the whole chart's share of them
+    n_break = int((~in_stream[plan.tick]).sum())
+    assert plan.is_jump.sum() <= 0.12 * n_break + 1
+    assert (plan.flavor > 0).sum() <= 0.10 * n_break + 1
     return info
 
 
