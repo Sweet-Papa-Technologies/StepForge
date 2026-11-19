@@ -4,25 +4,18 @@
 import { computed } from "vue";
 import { useLibrary } from "../stores/library";
 import Spinner from "./Spinner.vue";
+import CopyDiagnostics from "./CopyDiagnostics.vue";
+import { engineAdvice, engineProblems } from "../lib/engineProblems";
 
 const lib = useLibrary();
 
 /** Still probing, and nothing known yet: say so, rather than "not found". */
 const starting = computed(() => lib.statusLoading && !lib.status);
 
-const problems = computed(() => {
-  if (starting.value) return [];
-  const s = lib.status;
-  const out: string[] = [];
-  if (!s) return ["Could not locate the StepForge engine. Set the engine root in Settings."];
-  if (!s.engineRoot) out.push("Engine root not found — set it in Settings.");
-  if (!s.pythonOk) out.push(`Python not runnable (${s.python}).`);
-  else if (!s.beatforgeOk)
-    out.push(
-      `The charting engine or its dependencies did not import${s.importError ? `: ${s.importError}` : ""}. Run: python3 -m pip install -r requirements.txt`,
-    );
-  return out;
-});
+/** Each problem with its real cause (the exception, how Python died), never a
+ *  guess: see lib/engineProblems.ts. */
+const problems = computed(() => (starting.value ? [] : engineProblems(lib.status)));
+const advice = computed(() => engineAdvice(lib.status));
 </script>
 
 <template>
@@ -43,14 +36,18 @@ const problems = computed(() => {
         Engine not ready
       </p>
       <ul class="text-body-md text-on-surface-variant space-y-0.5">
-        <li v-for="p in problems" :key="p">• {{ p }}</li>
+        <li v-for="p in problems" :key="p" class="break-words">• {{ p }}</li>
       </ul>
+      <p class="text-[12px] text-on-surface-variant mt-1.5">{{ advice }}</p>
     </div>
-    <router-link
-      :to="{ name: 'settings' }"
-      class="shrink-0 px-3 py-1.5 rounded border border-outline-variant text-on-surface hover:bg-surface-variant font-label-mono text-label-mono"
-    >
-      Settings
-    </router-link>
+    <div class="shrink-0 flex items-start gap-2">
+      <CopyDiagnostics />
+      <router-link
+        :to="{ name: 'settings' }"
+        class="px-3 py-1.5 rounded border border-outline-variant text-on-surface hover:bg-surface-variant font-label-mono text-label-mono"
+      >
+        Settings
+      </router-link>
+    </div>
   </div>
 </template>

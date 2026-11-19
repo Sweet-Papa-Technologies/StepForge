@@ -98,12 +98,21 @@ def is_installed(model_dir=None) -> bool:
     return (resolve_model_dir(model_dir) / META_FILE).exists()
 
 
-def _have_onnxruntime() -> bool:
+def _onnxruntime_error() -> str | None:
+    """None when onnxruntime imports, else the real failure ("ImportError: DLL
+    load failed while importing onnxruntime_pybind11_state: …"). The reason is
+    the useful part: "not importable" covers a missing package, a missing system
+    library and a CPU the build cannot run on, which have nothing in common."""
     try:
         import onnxruntime  # noqa: F401
-        return True
-    except Exception:
-        return False
+        return None
+    except Exception as e:                       # noqa: BLE001 — reported, not raised
+        msg = str(e).strip()
+        return f"{type(e).__name__}: {msg}" if msg else type(e).__name__
+
+
+def _have_onnxruntime() -> bool:
+    return _onnxruntime_error() is None
 
 
 STYLE_FIELDS = [
@@ -122,14 +131,18 @@ STYLE_FIELDS = [
 def neural_status(model_dir=None) -> dict:
     """The `beatforge neural-status --json` payload. Never raises."""
     d = resolve_model_dir(model_dir)
-    out = {"installed": False, "model_dir": str(d),
+    ort_error = _onnxruntime_error()
+    # `installed` means "a neural run can start" (weights AND onnxruntime).
+    # `weights_present` and `onnxruntime_error` say which half is missing, so a
+    # complete model next to a broken onnxruntime is not reported as "no model".
+    out = {"installed": False, "weights_present": False, "model_dir": str(d),
            "default_model_dir": str(default_model_dir()), "quantization": "none",
            "style_rag_available": False, "presets": list(cond.PRESET_NAMES),
            "codec_version": None, "trained_with_stems": False, "params": None,
            "version": None, "display_name": None,
            "metrics": {}, "style_fields": STYLE_FIELDS,
-           "difficulties": list(BUDGETS), "onnxruntime": _have_onnxruntime(),
-           "error": None}
+           "difficulties": list(BUDGETS), "onnxruntime": ort_error is None,
+           "onnxruntime_error": ort_error, "error": None}
     try:
         from . import style_rag
         out["style_rag_available"] = style_rag.index_path(d).exists()
@@ -148,6 +161,7 @@ def neural_status(model_dir=None) -> dict:
         if missing:
             out["error"] = f"model_meta.json names missing file(s): {', '.join(missing)}"
             return out
+        out["weights_present"] = True
         _check_compat(meta)
         out.update(quantization=meta.get("quantization", "fp32"),
                    codec_version=meta.get("codec_version"),
@@ -157,8 +171,8 @@ def neural_status(model_dir=None) -> dict:
                            "stage_b": meta["stage_b"]["params"]},
                    metrics=meta.get("metrics", {}))
         if not out["onnxruntime"]:
-            out["error"] = ("weights are present but the `onnxruntime` package is not "
-                            "importable; install it with `pip install onnxruntime`.")
+            out["error"] = ("The model files are present, but onnxruntime (which runs "
+                            f"them) did not load: {ort_error}")
             return out
         out["installed"] = True
     except Exception as e:
@@ -198,8 +212,8 @@ class FlowModel:
             import onnxruntime as ort
         except ImportError as e:
             raise ModelNotInstalled(
-                "The neural engine needs the `onnxruntime` package "
-                "(pip install onnxruntime).") from e
+                "onnxruntime, which runs the model, did not load: "
+                f"{type(e).__name__}: {e}") from e
         self.meta = json.loads(meta_path.read_text())
         _check_compat(self.meta)
         files = self.meta["files"]

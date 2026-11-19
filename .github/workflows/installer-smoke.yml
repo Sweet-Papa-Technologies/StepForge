@@ -1,0 +1,76 @@
+name: Installers (Windows, macOS)
+
+# Builds the Windows installer and the macOS disk image the way the release
+# does (unsigned), installs each one, and runs desktop/scripts/smoke_test.py on
+# it — for pull requests that touch the app, its bundled runtime or the
+# packaging. The release runs the same test on signed builds and will not
+# publish without it; this is so a packaging mistake is found on the pull
+# request and not on release day.
+#
+# The installers are kept as artifacts for a week, for testing by hand on
+# machines CI does not have (a clean Windows 10 or 11 PC).
+#
+# Linux has its own workflow (linux-appimage.yml). Keep the build steps in step
+# with the `macos` and `windows` jobs in release.yml.
+
+on:
+  pull_request:
+    paths:
+      - "desktop/src-tauri/**"
+      - "desktop/scripts/**"
+      - "tools/beatforge/selftest.py"
+      - "requirements.txt"
+      - ".github/workflows/installer-smoke.yml"
+      - ".github/workflows/release.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: installer-smoke-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  installer:
+    name: Build and smoke test (${{ matrix.label }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: windows-latest, label: Windows, bundle: nsis, artifact: "desktop/src-tauri/target/release/bundle/nsis/*-setup.exe" }
+          - { runner: macos-15, label: macOS, bundle: "app,dmg", artifact: "desktop/src-tauri/target/release/bundle/dmg/*.dmg" }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with: { workspaces: desktop/src-tauri }
+      - name: Stage the bundled runtime
+        shell: bash
+        run: python desktop/scripts/stage_runtime.py --version 0.0.0-check
+      - name: Build (unsigned)
+        working-directory: desktop
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm ci
+          python -m pip install --quiet fonttools brotli
+          npx tauri build --config src-tauri/tauri.release.conf.json --bundles "${{ matrix.bundle }}"
+      # Uploaded before the test so a failing installer can still be inspected.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: installer-${{ matrix.label }}
+          path: ${{ matrix.artifact }}
+          retention-days: 7
+          if-no-files-found: error
+      - name: Install it and chart a clip
+        shell: bash
+        run: python desktop/scripts/smoke_test.py ${{ matrix.artifact }}

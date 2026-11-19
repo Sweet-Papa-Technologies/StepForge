@@ -1,16 +1,27 @@
 name: Release
 
 # Push a version tag that points at a commit on main -> signed builds for
-# macOS (Apple silicon and Intel), Windows and Linux, published to the
-# Releases page.
+# macOS (Apple silicon and Intel), Windows and Linux, attached to a DRAFT
+# release.
 #
 #   git tag -a v0.1.0-beta.1 -m "StepForge 0.1.0 beta 1" && git push origin v0.1.0-beta.1
 #
-# A tag with a hyphen (v0.2.0-beta.3) is published as a pre-release.
+# A draft is visible only to people who can push to this repository: nobody
+# else sees it or can download from it. Try the installers from the draft, then
+# publish those same files:
+#
+#   gh release edit v0.1.0-beta.1 --draft=false
+#
+# (or "Publish release" on the draft's page). To drop a candidate instead,
+# delete the draft and the tag. A tag with a hyphen (v0.2.0-beta.3) is marked
+# as a pre-release.
 #
 # Every build bundles its own Python runtime, the charting engine and the
 # StepForge Flow model (desktop/scripts/stage_runtime.py), so users install
 # nothing else.
+#
+# No draft is made until every installer has been installed on a fresh
+# machine and charted a song there (the smoke-* jobs).
 #
 # Signing (scripts/setup-ci.sh sets all of this up):
 #   macOS    secrets APPLE_CERT_P12, APPLE_CERT_PASSWORD (Developer ID Application
@@ -28,7 +39,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing tag to (re)build and publish, e.g. v0.1.0-beta.1"
+        description: "Existing tag to rebuild, e.g. v0.1.0-beta.1 (replaces the files of its release, draft or published)"
         required: true
 
 concurrency:
@@ -272,7 +283,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libssl-dev file xvfb
+            libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libssl-dev file xvfb \
+            gstreamer1.0-plugins-base gstreamer1.0-plugins-good
       - name: Set the version
         run: python3 desktop/scripts/set_version.py "${{ needs.meta.outputs.version }}"
       - name: Stage the bundled runtime
@@ -313,9 +325,90 @@ jobs:
       - uses: actions/upload-artifact@v4
         with: { name: linux, path: dist/*, if-no-files-found: error }
 
+  # ---------------------------------------------------------------------------
+  # Smoke tests: every installer is installed on a machine that did not build it
+  # and has to chart a song before anything is published. Each runs the app's
+  # own self-test (`--headless selftest`): import every engine dependency
+  # (onnxruntime among them), load both models, chart a 20-second clip, check
+  # that a valid .ssc was written — with a new, empty profile, once at a plain
+  # path and once at one with spaces and non-ASCII characters.
+  #
+  # `publish` needs all of them, so one failure blocks the release.
+  # ---------------------------------------------------------------------------
+  smoke-macos:
+    name: Smoke test · macOS (${{ matrix.label }})
+    needs: [meta, macos]
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: macos-15, arch: arm64, label: "Apple silicon, macOS 15" }
+          - { runner: macos-14, arch: arm64, label: "Apple silicon, macOS 14" }
+          - { runner: macos-15-intel, arch: x64, label: "Intel, macOS 15" }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.meta.outputs.sha }}
+          sparse-checkout: desktop/scripts
+      - uses: actions/download-artifact@v4
+        with: { name: "macos-${{ matrix.arch }}", path: dist }
+      - name: Install the app and chart a clip
+        run: python3 desktop/scripts/smoke_test.py dist/*.dmg
+
+  smoke-windows:
+    name: Smoke test · Windows (${{ matrix.runner }})
+    needs: [meta, windows]
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [windows-2022, windows-2025]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.meta.outputs.sha }}
+          sparse-checkout: desktop/scripts
+      - uses: actions/download-artifact@v4
+        with: { name: windows, path: dist }
+      - name: Install the app and chart a clip
+        # These runners have the Visual C++ redistributable; a new PC may not.
+        # On Windows the self-test therefore also fails if any VC++ runtime DLL
+        # was loaded from System32 instead of from the app (--self-contained,
+        # which smoke_test.py adds on Windows).
+        shell: bash
+        run: python desktop/scripts/smoke_test.py dist/*-setup.exe
+
+  smoke-linux:
+    name: Smoke test · Linux (${{ matrix.label }})
+    needs: [meta, linux]
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Other distributions than the build machine (Ubuntu 22.04) on purpose:
+          # what the AppImage must carry itself only shows up there.
+          - { image: "archlinux:latest", file: "*.AppImage", label: "AppImage on Arch" }
+          - { image: "ubuntu:24.04", file: "*.AppImage", label: "AppImage on Ubuntu 24.04" }
+          - { image: "ubuntu:24.04", file: "*.deb", label: ".deb on Ubuntu 24.04" }
+          - { image: "ubuntu:22.04", file: "*.deb", label: ".deb on Ubuntu 22.04" }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.meta.outputs.sha }}
+          sparse-checkout: desktop/scripts
+      - uses: actions/download-artifact@v4
+        with: { name: linux, path: dist }
+      - name: Install in a clean ${{ matrix.image }} container and chart a clip
+        # A stock distribution image: no Python, no compilers, nothing of ours.
+        run: |
+          docker run --rm -v "$PWD:/w" -w /w "${{ matrix.image }}" \
+            bash desktop/scripts/smoke_linux.sh dist/${{ matrix.file }}
+
   publish:
-    name: Publish
-    needs: [meta, macos, windows, linux]
+    name: Draft release
+    needs: [meta, macos, windows, linux, smoke-macos, smoke-windows, smoke-linux]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -343,12 +436,33 @@ jobs:
           PREV=$(git describe --abbrev=0 --tags "$TAG^" 2>/dev/null || true)
           CHANGES=$(git log ${PREV:+$PREV..}"$TAG" --no-merges --pretty='- %s' | awk 'NR<=40')
           python3 .github/release_notes.py "$VERSION" "$PRE" "$PREV" > notes.md <<< "$CHANGES"
-          FLAGS=(--title "StepForge $VERSION" --notes-file notes.md --verify-tag)
+          # A new release starts as a draft: the installers exist, signed and
+          # smoke-tested, but only people with push access can see them.
+          # Publishing is a person's decision, made after trying them.
+          FLAGS=(--draft --title "StepForge $VERSION" --notes-file notes.md --verify-tag)
           [ "$PRE" = true ] && FLAGS+=(--prerelease)
           if gh release view "$TAG" >/dev/null 2>&1; then
+            # A rebuild of an existing tag: replace its files, leave it as it
+            # is (a draft stays a draft, a published release stays published).
             gh release upload "$TAG" dist/* --clobber
             gh release edit "$TAG" --notes-file notes.md
           else
             gh release create "$TAG" dist/* "${FLAGS[@]}"
           fi
           gh release view "$TAG"
+          DRAFT=$(gh release view "$TAG" --json isDraft --jq .isDraft)
+          URL=$(gh release view "$TAG" --json url --jq .url)
+          {
+            if [ "$DRAFT" = true ]; then
+              echo "### $TAG is a draft: not public yet"
+              echo
+              echo "Installers: $URL (visible only with push access)."
+              echo
+              echo "Publish these files with \`gh release edit $TAG --draft=false\`,"
+              echo "or drop the candidate with \`gh release delete $TAG --cleanup-tag\`."
+            else
+              echo "### $TAG was already published: its files were replaced"
+              echo
+              echo "$URL"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

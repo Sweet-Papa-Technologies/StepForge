@@ -57,6 +57,11 @@
     },
     "publisher": "Sweet Papa Technologies",
     "copyright": "\u00a9 2026 Sweet Papa Technologies",
-    "homepage": "https://github.com/Sweet-Papa-Technologies/StepForge"
+    "homepage": "https://github.com/Sweet-Papa-Technologies/StepForge",
+    "linux": {
+      "appimage": {
+        "bundleMediaFramework": true
+      }
+    }
   }
 }

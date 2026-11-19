@@ -1,4 +1,5 @@
 mod commands;
+mod diagnostics;
 mod engine;
 mod headless;
 mod install;
@@ -48,10 +49,9 @@ pub fn run() {
                 install::set_resource_dir(dir);
             }
             // An update may ship a newer engine or model than the existing
-            // workspace has. Off the main thread: it can be ~150 MB to copy.
-            std::thread::spawn(|| {
-                let _ = install::refresh_workspace();
-            });
+            // workspace has. Off the main thread (it can be ~150 MB to copy);
+            // engine calls wait for it (`install::wait_for_startup_refresh`).
+            install::begin_startup_refresh();
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -83,6 +83,7 @@ pub fn run() {
             commands::generate_song_asset,
             commands::attach_generated_asset,
             commands::engine_status,
+            commands::engine_diagnostics,
             commands::get_settings,
             commands::save_settings,
             commands::inkling_check,

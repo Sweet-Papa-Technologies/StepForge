@@ -5,6 +5,7 @@ import { useLibrary } from "../stores/library";
 import { useEngine, GEN_STAGES } from "../stores/engine";
 import { useSettings } from "../stores/settings";
 import { useNeural } from "../stores/neural";
+import { neuralProblem } from "../lib/engineProblems";
 import { api } from "../lib/api";
 import type { ChartEngine, NeuralStyleField, Target } from "../lib/types";
 import StagePipeline from "../components/StagePipeline.vue";
@@ -176,21 +177,14 @@ function deleteUserPreset(name: string) {
   void settings.save();
 }
 
-/** Why a neural run cannot start, if it cannot. Names the model folder, since
- *  "put the weights there" is the whole fix. */
+/** Why a neural run cannot start, if it cannot — with the real cause, so an
+ *  engine that failed to start is never described as an old one. */
+const neuralIssue = computed(() => (isNeural.value ? neuralProblem(neural.status) : null));
 const neuralBlocker = computed(() => {
   if (!isNeural.value) return null;
-  const st = neural.status;
-  if (!st) return "Checking for the neural model…";
-  if (neural.legacy)
-    return "The installed engine is too old for the neural model — update or reinstall the engine. See Settings → Neural engine.";
-  if (!st.installed)
-    return st.model_dir
-      ? `The neural model is not installed — the engine looked in ${st.model_dir}. See Settings → Neural engine.`
-      : "The neural model is not installed. See Settings → Neural engine.";
-  if (!st.onnxruntime)
-    return "The neural model needs the onnxruntime Python package, which did not import. See Settings → Neural engine.";
-  return null;
+  if (!neural.status) return "Checking for the StepForge Flow model…";
+  const p = neuralIssue.value;
+  return p ? `${p.title}. See Settings for details.` : null;
 });
 
 /** A run of any kind already in flight for this track (e.g. an Analyze started
@@ -385,23 +379,9 @@ onMounted(async () => {
           <!-- Neural style. Nothing here is required: with no preset and every
                slider on auto the model reads the style off the audio. -->
           <div v-if="isNeural" class="space-y-3" :class="ENGINES.length > 1 ? 'pt-4 border-t border-outline-variant mt-4' : ''">
-            <div v-if="neural.status && !neural.ready" class="p-3 rounded-lg border border-error/40 bg-error-container/20">
-              <p class="font-label-mono text-label-mono text-error mb-1">
-                {{
-                  neural.legacy
-                    ? "The installed engine is too old for the neural model"
-                    : neural.status.installed
-                      ? "onnxruntime is missing"
-                      : "Neural model not installed"
-                }}
-              </p>
-              <p v-if="neural.legacy" class="text-[11px] text-on-surface-variant">
-                It predates the neural chart engine. Update or reinstall StepForge.
-              </p>
-              <p v-else-if="neural.status.error" class="text-[11px] text-on-surface-variant whitespace-pre-wrap">{{ neural.status.error }}</p>
-              <p v-if="neural.status.model_dir" class="text-[11px] text-on-surface-variant mt-1">
-                Model folder: <code class="font-label-mono break-all">{{ neural.status.model_dir }}</code>
-              </p>
+            <div v-if="neuralIssue" class="p-3 rounded-lg border border-error/40 bg-error-container/20">
+              <p class="font-label-mono text-label-mono text-error mb-1">{{ neuralIssue.title }}</p>
+              <p v-if="neuralIssue.detail" class="text-[11px] text-on-surface-variant whitespace-pre-wrap break-words">{{ neuralIssue.detail }}</p>
               <p class="text-[11px] text-on-surface-variant mt-2">
                 <router-link :to="{ name: 'settings' }" class="underline hover:text-on-surface">Open Settings</router-link>
                 ·

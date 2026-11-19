@@ -30,6 +30,12 @@ function normalize(raw: Partial<NeuralStatus> | null | undefined, error?: string
         !!f && typeof f.key === "string" && [f.min, f.max, f.step].every((n) => Number.isFinite(n)),
     ),
     onnxruntime: r.onnxruntime === true,
+    onnxruntime_error:
+      typeof r.onnxruntime_error === "string" && r.onnxruntime_error ? r.onnxruntime_error : null,
+    // An engine that does not report it: installed implies the files are there.
+    weights_present: r.weights_present === true || r.installed === true,
+    legacy: r.legacy === true,
+    probe_failed: r.probe_failed === true || error !== undefined,
     error: error ?? (typeof r.error === "string" && r.error ? r.error : null),
   };
 }
@@ -47,11 +53,11 @@ export const useNeural = defineStore("neural", {
   state: () => ({
     status: null as NeuralStatus | null,
     loading: false,
-    /** The probe got no answer at all: the installed engine predates the
-     *  neural chart engine (an app update does not replace the engine code of a
-     *  workspace that already exists). Rust reads the same probe the same way
-     *  and then speaks to that engine in its old argv, so the AI Designer and
-     *  Deterministic engines keep working; only neural is out of reach. */
+    /** The engine ran and said `neural-status` is not a command it has: it
+     *  predates the neural chart engine. ONLY that. A status check that failed
+     *  any other way (Python did not start, a library is broken) is
+     *  `status.probe_failed` with the real reason in `status.error` — those
+     *  used to be shown as "too old" as well. */
     legacy: false,
   }),
   getters: {
@@ -71,10 +77,11 @@ export const useNeural = defineStore("neural", {
       inflight = (async () => {
         try {
           this.status = normalize(await api.neuralStatus());
-          this.legacy = false;
+          this.legacy = this.status.legacy;
         } catch (e) {
+          // The call itself failed (the app could not find its engine at all).
           this.status = normalize(null, String(e));
-          this.legacy = true;
+          this.legacy = false;
         } finally {
           this.loading = false;
           inflight = null;

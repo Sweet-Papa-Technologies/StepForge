@@ -83,15 +83,93 @@ inside the (signed) app bundle.
 - `.github/workflows/release.yml` runs when a `v*` tag on `main` is pushed. It
   builds macOS (Apple silicon and Intel `.dmg`s, on `macos-15` and
   `macos-15-intel`), Windows (`-setup.exe`) and Linux (`.AppImage`, `.deb`) in
-  parallel and publishes them, with `SHA256SUMS.txt`, to
-  the Releases page. Tags with a hyphen (`v0.2.0-beta.1`) become pre-releases.
+  parallel and attaches them, with `SHA256SUMS.txt`, to a **draft** release.
+  Tags with a hyphen (`v0.2.0-beta.1`) are marked as pre-releases.
 - `.github/workflows/linux-appimage.yml` builds the AppImage on pull requests
-  that touch the app or its packaging, and keeps it as an artifact for testing
-  on other distributions.
+  that touch the app or its packaging, checks it, smoke-tests it in clean Arch
+  and Ubuntu 24.04 containers, and keeps it as an artifact for a week.
+- `.github/workflows/installer-smoke.yml` does the same for the Windows
+  installer and the macOS disk image (unsigned), so a packaging mistake is found
+  on the pull request. Its artifacts are for testing by hand on machines CI does
+  not have, such as a clean Windows 10 or 11 PC.
 
-The AppImage is built on Ubuntu 22.04. Two rules keep it working on newer
-distributions, and `scripts/check_appimage.py` enforces both before a release
+### From tag to public release
+
+Three stages, no long-lived branches:
+
+1. **Pull request.** Unsigned installers for all three platforms are built and
+   smoke-tested on clean machines (`installer-smoke.yml`,
+   `linux-appimage.yml`). Nothing is published. The artifacts stay on the
+   workflow run for a week; this repository is public, so anyone signed in to
+   GitHub who opens that run can download them, but nothing links to them.
+2. **Draft release.** Pushing a `v*` tag on `main` builds, signs, notarizes and
+   smoke-tests the real installers and attaches them to a draft. A draft is
+   visible only to people who can push here. Install from it and try it,
+   especially on machines CI does not have (a clean Windows 10 or 11 PC, a
+   Linux desktop with a real GPU). To let someone without push access try a
+   candidate, send them the file.
+3. **Published.** `gh release edit v0.2.0-beta.1 --draft=false`, or "Publish
+   release" on the draft's page. The files users get are the ones that were
+   tested. To drop a candidate instead:
+   `gh release delete v0.2.0-beta.1 --cleanup-tag`, fix it, and tag the next
+   number.
+
+Signed Windows builds exist only at stage 2: the `release` environment that
+code signing trusts accepts `v*` tags and nothing else.
+
+### Release smoke tests
+
+Nothing is published until every installer has been installed on a machine that
+did not build it and has charted a song there. The `smoke-*` jobs in
+`release.yml` do that, and `publish` needs all of them:
+
+| Installer | Where it is tested | Script |
+|---|---|---|
+| macOS `.dmg` (Apple silicon) | fresh `macos-15` and `macos-14` runners | `scripts/smoke_test.py` |
+| macOS `.dmg` (Intel) | fresh `macos-15-intel` runner | `scripts/smoke_test.py` |
+| Windows `-setup.exe` | fresh `windows-2022` and `windows-2025` runners | `scripts/smoke_test.py` |
+| Linux `.AppImage` | clean `archlinux` and `ubuntu:24.04` containers | `scripts/smoke_linux.sh` |
+| Linux `.deb` | clean `ubuntu:24.04` and `ubuntu:22.04` containers | `scripts/smoke_linux.sh` |
+
+Each one runs the app's own self-test, `StepForge --headless selftest`, with a
+new, empty profile — once at a plain path and once at one with spaces and
+non-ASCII characters. The self-test (`python -m beatforge.selftest` underneath)
+imports every engine dependency, onnxruntime among them, loads both models,
+charts a 20-second synthesized clip through the real command line and reads the
+`.ssc` back. On Linux it also checks that the GStreamer elements the Results
+screen plays audio with can be created. It exits 0 only if all of that passed.
+
+Three things the build checks before the smoke tests ever run
+(`scripts/stage_runtime.py`):
+
+- **Every native library the bundled runtime loads is in the bundle or part of
+  the OS** (`scripts/native_audit.py`, which reads PE, ELF and Mach-O dependency
+  tables). Beta 6 for Windows shipped onnxruntime without the Visual C++ runtime
+  it imports (`msvcp140.dll`, `msvcp140_1.dll`); it only failed on PCs without
+  the VC++ redistributable, which no build or test machine was.
+- **On Windows the missing VC++ runtime DLLs are copied next to `python.exe`**
+  (`bundle_vc_runtime`), from Visual Studio's redist folder on the build machine.
+- **The engine's self-test passes with the staged interpreter**, and on Windows
+  with `--self-contained`: it fails if any VC++ runtime DLL was loaded from
+  System32 rather than from the app. CI runners have the redistributable
+  installed, so "it imported" proves nothing there; where it was loaded from does.
+
+What CI cannot cover, and still needs a person before a release that changes
+packaging: a clean desktop Windows 10 and 11, real GPU sessions on Linux
+(Wayland and X11, NVIDIA and Mesa), and audible playback.
+
+The AppImage is built on Ubuntu 22.04. Three rules keep it working on newer
+distributions, and `scripts/check_appimage.py` enforces them before a release
 is published:
+
+- GStreamer's plugins are bundled with it
+  (`bundle.linux.appimage.bundleMediaFramework`). WebKitGTK links GStreamer, so
+  the library is always in the AppImage; without its plugins the web view's
+  process died as soon as the Results screen created its audio player, and the
+  window stopped taking clicks and went black. On the build distribution the
+  system's plugins are found instead, so this only shows on other distributions.
+  The system's GStreamer cannot be used in its place: it needs a newer GLib than
+  the one in the AppImage.
 
 - Host-owned libraries (systemd, udev, D-Bus, Wayland, epoxy, nghttp2) are left
   out of the bundle (`LINUXDEPLOY_EXCLUDED_LIBRARIES`). An old bundled
@@ -121,6 +199,28 @@ git push origin v0.1.0-beta.2
 `scripts/setup-ci.sh` (repo root) sets the secrets, variables, the `release`
 environment and the branch protection. A missing credential makes that
 platform's build unsigned with a warning rather than failing the release.
+
+## When the engine does not start
+
+The "Engine not ready" banner and Settings show the real cause, from
+`src-tauri/src/diagnostics.rs`: the exception a module raised when imported, or
+how Python ended if it never got that far (an exit code, a Windows crash status
+such as `0xC0000135` for a missing DLL, a Unix signal). "The engine is older
+than the model" is reported only when the engine ran and its argument parser
+rejected `neural-status`; a failure to start is never described that way.
+
+**Copy diagnostics** (the banner and Settings) runs the self-test and copies a
+report: app version, OS, CPU and its instruction sets, the self-test result and
+the last engine error. Folder names from the user's machine, the user name and
+the names of songs in the library are replaced before anything is copied
+(`Redaction`), and no audio is ever read. The same text is printed by
+`StepForge --headless diagnostics`; `--headless status` prints what the GUI's
+status checks return.
+
+After an update the app replaces the workspace's engine code at startup.
+Engine calls wait for that to finish (`install::wait_for_startup_refresh`): a
+status check that started Python while `tools/` was being rewritten used to find
+half an engine.
 
 ## The workflow the GUI implements
 
