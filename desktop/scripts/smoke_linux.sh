@@ -66,17 +66,21 @@ case "$ARTIFACT" in
     *.AppImage)
         cp "$ARTIFACT" "$WORK/StepForge.AppImage"
         chmod +x "$WORK/StepForge.AppImage"
-        # Containers have no FUSE; --appimage-extract runs the same AppRun.
-        (cd "$WORK" && ./StepForge.AppImage --appimage-extract >/dev/null)
-        APP="$WORK/squashfs-root/AppRun"
+        # Containers have no FUSE to mount the image with.
+        # --appimage-extract-and-run is the AppImage's own way around that: it
+        # unpacks to a temporary folder and starts the app with the variables a
+        # mounted run has (APPDIR, APPIMAGE). Running an unpacked AppRun by hand
+        # leaves APPDIR unset, and the launcher then points GStreamer's plugin
+        # scanner at a path that does not exist.
+        APP=("$WORK/StepForge.AppImage" --appimage-extract-and-run)
         ;;
     *.deb)
         apt-get install -y -qq --no-install-recommends "$ARTIFACT" >/dev/null
-        APP="$(command -v stepforge-desktop)"
+        APP=("$(command -v stepforge-desktop)")
         ;;
     *) echo "do not know how to install $ARTIFACT" >&2; exit 2 ;;
 esac
-say "program: $APP"
+say "program: ${APP[*]}"
 
 # ---- run the self-test with new, empty profiles -----------------------------
 # Twice: a plain profile path, then one with spaces and non-ASCII characters.
@@ -90,7 +94,7 @@ run_profile() {
             LANG=C.UTF-8 HOME="$home" XDG_DATA_HOME="$home/.local/share" \
             XDG_CONFIG_HOME="$home/.config" XDG_CACHE_HOME="$home/.cache" \
             BEATFORGE_WORKSPACE="$home/workspace" \
-            xvfb-run -a "$APP" --headless selftest > "$out"; then
+            xvfb-run -a "${APP[@]}" --headless selftest > "$out"; then
         # A first launch provisions the engine into the new profile; if it is
         # not there, some other engine was tested.
         if [ -f "$home/workspace/tools/beatforge/__main__.py" ]; then

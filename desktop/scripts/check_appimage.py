@@ -89,6 +89,9 @@ def selftest_through_apprun(root: Path, tmp: Path) -> None:
     env = clean_env(BEATFORGE_WORKSPACE=str(home / "workspace"), HOME=str(home),
                     XDG_DATA_HOME=str(home / ".local/share"),
                     XDG_CONFIG_HOME=str(home / ".config"), XDG_CACHE_HOME=str(home / ".cache"))
+    # APPDIR as a mounted AppImage has it: the launcher's GStreamer paths are
+    # built from it before anything else sets it.
+    env["APPDIR"] = str(root)
     r = subprocess.run([str(root / "AppRun"), "--headless", "selftest"], env=env, cwd=tmp,
                        capture_output=True, text=True, timeout=1200)
     result = {}
