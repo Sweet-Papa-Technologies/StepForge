@@ -123,6 +123,7 @@ fn generate(app: &AppHandle, kv: &HashMap<String, String>, flags: &[String]) -> 
             deterministic,
             style_preset: kv.get("style-preset").map(String::as_str),
             style_json: kv.get("style-json").map(String::as_str),
+            options_json: kv.get("options-json").map(String::as_str),
             reanalyze,
             backend: kv.get("backend").map(String::as_str),
             // The same probe-and-decide the GUI makes (cached, so a batch asks
@@ -260,7 +261,7 @@ fn batch(app: &AppHandle, kv: &HashMap<String, String>, flags: &[String]) -> boo
         kv2.insert("difficulties".to_string(), diffs.join(","));
         kv2.insert("target".to_string(), target.clone());
         // The engine choice applies to the whole mix.
-        for key in ["engine", "style-preset", "style-json"] {
+        for key in ["engine", "style-preset", "style-json", "options-json"] {
             if let Some(v) = kv.get(key) {
                 kv2.insert(key.to_string(), v.clone());
             }

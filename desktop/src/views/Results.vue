@@ -15,6 +15,8 @@ import NotePlayer from "../components/NotePlayer.vue";
 import ContextMenu, { type MenuItem } from "../components/ContextMenu.vue";
 import Spinner from "../components/Spinner.vue";
 import SendFeedback from "../components/SendFeedback.vue";
+import RhythmOptions from "../components/RhythmOptions.vue";
+import { optionsJson, type DecodeOptions } from "../lib/decodeOptions";
 import type { Chart } from "../lib/types";
 
 const props = defineProps<{ base?: string }>();
@@ -81,11 +83,49 @@ const previewUrl = computed(() =>
     : "",
 );
 
-// --- Section re-roll (neural StepMania charts only) ------------------------ //
-// `stepforge-inpaint` re-generates a range of bars and keeps the rest of the
-// chart. Only the neural engine can do that, so the control exists only for a
-// result whose report says `mode: "neural"`.
+// --- Edit a section (neural StepMania charts only) ------------------------- //
+// `stepforge-inpaint` re-does a range of bars and keeps the rest of the chart:
+// either only which arrows its notes are ("arrows"), or the notes themselves,
+// written again from the audio with settings of their own ("notes"). Only the
+// neural engine can do that, so the control exists only for a result whose
+// report says `mode: "neural"`.
 const canReroll = computed(() => target.value === "stepforge" && detail.value?.mode === "neural");
+const rerollWhat = ref<"arrows" | "notes">("arrows");
+/** Settings for the range alone; the rest of the chart keeps its own. */
+const rangeOptions = ref<DecodeOptions>({});
+const rangeJumps = ref<"" | "none" | "more">("");
+const rangeStyleJson = computed(() => {
+  if (rerollWhat.value !== "notes" || !rangeJumps.value) return null;
+  // "more" asks for the most the difficulty allows; the engine clamps it there
+  return JSON.stringify({ jump_share: rangeJumps.value === "none" ? 0 : 0.35 });
+});
+const rangeOptionsJson = computed(() => {
+  const o = rangeOptions.value;
+  if (rerollWhat.value === "arrows") return optionsJson({ crossovers: o.crossovers });
+  // a stream asked for a range fills the range
+  return optionsJson(o.stream ? { ...o, stream_coverage: 1, min_break_bars: 1, density: undefined } : o);
+});
+const sectionPanel = ref<HTMLElement | null>(null);
+const sectionFlash = ref(false);
+/** Bring the section editor into view — it lives in the Inspector, where it
+ *  was easy to miss. */
+function showSectionEditor() {
+  sectionPanel.value?.scrollIntoView({ behavior: "smooth", block: "start" });
+  sectionFlash.value = true;
+  window.setTimeout(() => (sectionFlash.value = false), 1600);
+}
+function markStart(bar: number) {
+  rerollStart.value = bar;
+  const e = wholeNumber(rerollEnd.value);
+  if (e !== null && e <= bar) rerollEnd.value = "";
+  showSectionEditor();
+}
+function markEnd(bar: number) {
+  rerollEnd.value = bar;
+  const s = wholeNumber(rerollStart.value);
+  if (s !== null && s >= bar) rerollStart.value = "";
+  showSectionEditor();
+}
 /** Number inputs hand back a number, or "" when blank. */
 const rerollStart = ref<number | string>("");
 const rerollEnd = ref<number | string>("");
@@ -139,7 +179,7 @@ const rerollProblem = computed(() => {
   if ((!isBlank(rerollStart.value) && s === null) || (!isBlank(rerollEnd.value) && e === null))
     return "Bars are whole numbers, counted from 0.";
   if (s !== null && e !== null && s >= e)
-    return "The end bar must be greater than the start bar (the end bar itself is not re-rolled).";
+    return "The end bar must be greater than the start bar (the end bar itself is not included).";
   // Enforced only against the engine's own count, never the estimate from notes.
   const bars = reportBars.value;
   if (bars !== null && ((e !== null && e > bars) || (s !== null && s > bars - 1)))
@@ -167,6 +207,9 @@ async function reroll() {
     startBar: wholeNumber(rerollStart.value)!,
     endBar: wholeNumber(rerollEnd.value)!,
     seed: wholeNumber(rerollSeed.value),
+    regenerate: rerollWhat.value === "notes",
+    styleJson: rangeStyleJson.value,
+    optionsJson: rangeOptionsJson.value,
   });
   rerollJobId.value = j.id;
 }
@@ -179,7 +222,7 @@ watch(
   async (isRunning, was) => {
     if (!was || isRunning || !rerollJob.value?.success) return;
     const summary = [...rerollJob.value.lines].reverse().find((l) => l.line.includes("[inpaint]"));
-    message.value = summary?.line.trim() ?? "Section re-rolled.";
+    message.value = summary?.line.trim() ?? "Section updated.";
     artifactRev.value++;
     await loadDetail();
   },
@@ -200,6 +243,13 @@ const metricRows = computed(() => {
     rows.push({ label: "Repaired", value: `${(m.repaired_fraction * 100).toFixed(1)}%` });
   const e = d.extra ?? {};
   if (e.meter != null) rows.push({ label: "Meter", value: String(e.meter) });
+  if (e.options?.max_subdivision) rows.push({ label: "Max subdivision", value: `${e.options.max_subdivision}ths` });
+  if (e.stream)
+    rows.push({
+      label: "Stream",
+      value: `${e.stream.subdivision}ths · ${e.stream.stream_bars}/${e.stream.playable_bars} bars · ${Number(e.stream.nps).toFixed(1)}/s`,
+    });
+  if (e.options?.crossovers === false) rows.push({ label: "Crossovers", value: "off" });
   if (e.jumps != null) rows.push({ label: "Jumps", value: String(e.jumps) });
   if (e.holds != null) rows.push({ label: "Holds", value: String(e.holds) });
   if (e.njs != null) rows.push({ label: "NJS", value: String(e.njs) });
@@ -372,6 +422,16 @@ onMounted(async () => {
             </span>
             {{ m }}
           </button>
+          <button
+            v-if="canReroll"
+            type="button"
+            class="ml-auto px-3 py-1 rounded font-label-mono text-label-mono border border-outline-variant text-on-surface hover:bg-surface-variant transition-colors flex items-center gap-1"
+            title="Re-do a range of bars — new arrows, or new notes with their own settings — and keep the rest of the chart"
+            @click="showSectionEditor"
+          >
+            <span class="material-symbols-outlined text-[14px]">autorenew</span>
+            Edit a section
+          </button>
         </div>
 
         <div class="flex-1 min-h-0">
@@ -391,6 +451,11 @@ onMounted(async () => {
               :chart="chart"
               :autoplay="true"
               :rev="artifactRev"
+              :selectable="canReroll"
+              :range-start="wholeNumber(rerollStart)"
+              :range-end="wholeNumber(rerollEnd)"
+              @mark-start="markStart"
+              @mark-end="markEnd"
             />
           </template>
 
@@ -456,24 +521,13 @@ onMounted(async () => {
       </div>
 
       <div v-if="detail" class="p-gutter space-y-7">
-        <section class="flex flex-col items-center text-center">
-          <template v-if="detail.score != null">
-            <!-- The engine's critic scores 0–10 (ship threshold 7). -->
-            <ScoreRing :score="detail.score" :max="10" class="mb-3" />
-            <p class="font-label-mono text-[10px] uppercase tracking-widest" :class="detail.score >= 7 ? 'text-green-400' : 'text-tertiary-fixed-dim'">
-              {{ detail.score >= 7 ? "Above ship threshold (7)" : "Below ship threshold (7)" }}
-            </p>
-          </template>
-
-          <blockquote v-if="detail.criticSummary" class="text-on-surface-variant font-body-md italic border-l-2 border-primary pl-3 text-left mt-3">
-            "{{ detail.criticSummary }}"
-          </blockquote>
-        </section>
-
-        <!-- Section re-roll: neural charts only (see `canReroll`). -->
-        <section v-if="canReroll">
-          <h3 class="font-label-mono text-label-mono text-on-surface-variant uppercase tracking-wider mb-2">Re-roll section</h3>
-          <div class="bg-surface-container-low border border-outline-variant/50 rounded p-3 space-y-3">
+        <!-- Edit a section: neural charts only (see `canReroll`). -->
+        <section v-if="canReroll" ref="sectionPanel" class="scroll-mt-4">
+          <h3 class="font-label-mono text-label-mono text-on-surface-variant uppercase tracking-wider mb-2">Edit a section</h3>
+          <div
+            class="bg-surface-container-low border rounded p-3 space-y-3 transition-colors duration-500"
+            :class="sectionFlash ? 'border-primary shadow-[0_0_12px_rgba(188,19,254,0.35)]' : 'border-outline-variant/50'"
+          >
             <div class="grid grid-cols-3 gap-2">
               <label class="block">
                 <span class="block text-[11px] text-on-surface-variant mb-1">Start bar</span>
@@ -515,11 +569,67 @@ onMounted(async () => {
               </label>
             </div>
             <p class="text-[11px] text-on-surface-variant">
-              Bars count from 0 and the end bar is not included, so 16 to 24 re-rolls eight bars.
+              Bars count from 0 and the end bar is not included, so 16 to 24 is eight bars.
+              <template v-if="canPlay">
+                Or play the chart and press <span class="font-label-mono">Start here</span> and
+                <span class="font-label-mono">End here</span> under the player.
+              </template>
+              {{ " " }}
               <template v-if="reportBars != null">This chart has {{ reportBars }} bars (0 to {{ reportBars - 1 }}).</template>
               <template v-else-if="notedBars != null">This chart's notes run to bar {{ notedBars - 1 }}.</template>
-              The rest of the chart is kept, and the new bars use the style the chart was generated with.
             </p>
+
+            <div class="flex items-center gap-1 bg-surface p-1 rounded-lg border border-outline-variant">
+              <button
+                v-for="w in ([['arrows', 'New arrows'], ['notes', 'New notes']] as const)"
+                :key="w[0]"
+                type="button"
+                class="flex-1 py-1.5 rounded-md font-label-mono text-[11px] transition-colors disabled:opacity-40"
+                :class="rerollWhat === w[0] ? 'bg-surface-container-high text-on-surface border border-outline-variant' : 'text-on-surface-variant hover:text-on-surface'"
+                :disabled="rerolling"
+                :aria-pressed="rerollWhat === w[0]"
+                @click="rerollWhat = w[0]"
+              >
+                {{ w[1] }}
+              </button>
+            </div>
+            <p class="text-[11px] text-on-surface-variant">
+              <template v-if="rerollWhat === 'arrows'">
+                Keeps every note where it is and chooses which arrows they are again. The rest of the chart is untouched.
+              </template>
+              <template v-else>
+                Writes these bars again from the music — where the notes fall as well as which arrows they are — with the
+                settings below, on top of the ones the chart was generated with. The rest of the chart is untouched.
+              </template>
+            </p>
+
+            <template v-if="rerollWhat === 'notes'">
+              <RhythmOptions v-model="rangeOptions" scope="range" :disabled="rerolling" :bpm="chart?.bpm ?? null" />
+              <div class="flex items-center gap-3">
+                <span class="w-16 shrink-0 text-[12px] text-on-surface-variant">Jumps</span>
+                <select
+                  v-model="rangeJumps"
+                  :disabled="rerolling || rangeOptions.stream === true"
+                  aria-label="Jumps"
+                  class="flex-1 min-w-0 bg-surface-container-lowest border border-outline-variant text-on-surface rounded p-1.5 text-[12px] focus:border-secondary outline-none disabled:opacity-40"
+                >
+                  <option value="">As the chart has</option>
+                  <option value="none">None</option>
+                  <option value="more">The most allowed</option>
+                </select>
+              </div>
+            </template>
+            <label v-else class="flex items-center gap-2 cursor-pointer" :class="{ 'opacity-50': rerolling }">
+              <input
+                type="checkbox"
+                class="accent-[#bc13fe] cursor-pointer"
+                :checked="rangeOptions.crossovers === false"
+                :disabled="rerolling"
+                @change="rangeOptions = { ...rangeOptions, crossovers: ($event.target as HTMLInputElement).checked ? false : undefined }"
+              />
+              <span class="font-body-md text-[13px] text-on-surface">No crossovers</span>
+            </label>
+
             <p v-if="rerollProblem" class="text-[11px] text-error">{{ rerollProblem }}</p>
             <p v-else-if="trackBusy" class="text-[11px] text-tertiary-fixed-dim">
               Another run is in progress for this track — wait for it to finish.
@@ -533,12 +643,26 @@ onMounted(async () => {
               <span class="material-symbols-outlined text-[18px]" :class="{ spinner: rerolling }">
                 {{ rerolling ? "progress_activity" : "autorenew" }}
               </span>
-              {{ rerolling ? "Re-rolling…" : "Re-roll these bars" }}
+              {{ rerolling ? "Working…" : rerollWhat === "notes" ? "Rewrite these bars" : "Re-roll the arrows" }}
             </button>
             <div v-if="rerollFailure" class="rounded-lg border border-error/40 bg-error-container/20 p-2 text-error text-[11px] font-label-mono whitespace-pre-wrap">
               {{ rerollFailure }}
             </div>
           </div>
+        </section>
+
+        <section class="flex flex-col items-center text-center">
+          <template v-if="detail.score != null">
+            <!-- The engine's critic scores 0–10 (ship threshold 7). -->
+            <ScoreRing :score="detail.score" :max="10" class="mb-3" />
+            <p class="font-label-mono text-[10px] uppercase tracking-widest" :class="detail.score >= 7 ? 'text-green-400' : 'text-tertiary-fixed-dim'">
+              {{ detail.score >= 7 ? "Above ship threshold (7)" : "Below ship threshold (7)" }}
+            </p>
+          </template>
+
+          <blockquote v-if="detail.criticSummary" class="text-on-surface-variant font-body-md italic border-l-2 border-primary pl-3 text-left mt-3">
+            "{{ detail.criticSummary }}"
+          </blockquote>
         </section>
 
         <section v-if="detail.criticIssues?.length">
@@ -561,6 +685,13 @@ onMounted(async () => {
               :state="g.pass ? 'pass' : 'fail'"
             />
           </div>
+          <p
+            v-if="detail.extra?.stream && detail.gates.some((g) => g.name === 'onset_alignment' && !g.pass)"
+            class="text-[11px] text-on-surface-variant mt-2"
+          >
+            Onset alignment asks for a sound under nearly every note. A stream plays every slot of its bars whether or not
+            there is one, so in Stream mode this check is expected to fail.
+          </p>
         </section>
 
         <section v-if="metricRows.length">

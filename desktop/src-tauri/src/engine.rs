@@ -164,6 +164,11 @@ pub struct Settings {
     /// the resolved preset and sliders.
     #[serde(deserialize_with = "lenient_object_map")]
     pub neural_user_presets: BTreeMap<String, Value>,
+    /// Decoder options set on the Generate screen (`--options-json`): a cap on
+    /// the subdivision, Stream mode, no crossovers. Keyed by the engine's own
+    /// option names; an ABSENT key is the engine's default, as with the style.
+    #[serde(deserialize_with = "lenient_scalar_map")]
+    pub neural_options: BTreeMap<String, Value>,
     /// The pack name last filed under in the Library, offered again for the
     /// next song and used by a batch run.
     pub last_pack: String,
@@ -180,6 +185,23 @@ where
         .map(|m| {
             m.iter()
                 .filter(|(_, v)| v.is_object())
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
+/// Read a map of numbers and booleans, dropping anything else (see
+/// `lenient_style_map` for why nothing here may fail the whole file).
+fn lenient_scalar_map<'de, D>(d: D) -> Result<BTreeMap<String, Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v = Value::deserialize(d)?;
+    Ok(v.as_object()
+        .map(|m| {
+            m.iter()
+                .filter(|(_, v)| v.is_number() || v.is_boolean())
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect()
         })

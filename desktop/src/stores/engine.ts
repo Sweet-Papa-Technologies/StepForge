@@ -212,6 +212,7 @@ export const useEngine = defineStore("engine", {
       engine?: string;
       stylePreset?: string | null;
       styleJson?: string | null;
+      optionsJson?: string | null;
     }): Promise<Job> {
       const job = this._make("generate", opts.trackId);
       try {
@@ -230,6 +231,9 @@ export const useEngine = defineStore("engine", {
       startBar: number;
       endBar: number;
       seed?: number | null;
+      regenerate?: boolean;
+      styleJson?: string | null;
+      optionsJson?: string | null;
     }): Promise<Job> {
       const job = this._make("inpaint", opts.trackId);
       try {

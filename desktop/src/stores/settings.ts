@@ -1,6 +1,7 @@
 import { defineStore } from "pinia";
 import { api } from "../lib/api";
 import type { Settings } from "../lib/types";
+import { cleanOptions } from "../lib/decodeOptions";
 
 const DEFAULTS: Settings = {
   engineRoot: "",
@@ -52,6 +53,7 @@ const DEFAULTS: Settings = {
   neuralStylePreset: "",
   neuralStyle: {},
   neuralUserPresets: {},
+  neuralOptions: {},
   lastPack: "",
 };
 
@@ -59,7 +61,7 @@ const DEFAULTS: Settings = {
  *  (neuralStyle), so a shallow spread would share them between every reset and
  *  the edits would leak backwards. */
 function defaults(): Settings {
-  return { ...DEFAULTS, openaiHeaders: [], neuralStyle: {}, neuralUserPresets: {} };
+  return { ...DEFAULTS, openaiHeaders: [], neuralStyle: {}, neuralUserPresets: {}, neuralOptions: {} };
 }
 
 /** Saved presets, keeping only well-formed ones. */
@@ -69,6 +71,8 @@ function cleanPresets(raw: unknown): Settings["neuralUserPresets"] {
     for (const [name, v] of Object.entries(raw as Record<string, any>)) {
       if (!name.trim() || !v || typeof v !== "object") continue;
       out[name] = { preset: typeof v.preset === "string" ? v.preset : "", style: cleanStyle(v.style) };
+      // presets saved before the rhythm options existed have none
+      if (v.options && typeof v.options === "object") out[name].options = cleanOptions(v.options);
     }
   }
   return out;
@@ -109,6 +113,7 @@ export const useSettings = defineStore("settings", {
         if (!s.chunkMode) s.chunkMode = "auto";
         s.neuralStyle = cleanStyle(s.neuralStyle);
         s.neuralUserPresets = cleanPresets(s.neuralUserPresets);
+        s.neuralOptions = cleanOptions(s.neuralOptions);
         if (typeof s.lastPack !== "string") s.lastPack = "";
         // Rust sends null for "never set", which is the default: ON.
         s.checkForUpdates = s.checkForUpdates !== false;

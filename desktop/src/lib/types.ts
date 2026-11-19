@@ -1,3 +1,4 @@
+import type { DecodeOptions } from "./decodeOptions";
 export type TrackStatus = "unconverted" | "draft" | "analyzed" | "charted";
 export type Target = "stepforge" | "saberforge" | "native";
 
@@ -144,6 +145,9 @@ export interface Settings {
   neuralStyle: Record<string, number>;
   /** Style presets saved on the Generate screen, by name. */
   neuralUserPresets: Record<string, NeuralUserPreset>;
+  /** Decoder options set on the Generate screen (lib/decodeOptions): a cap on
+   *  the subdivision, Stream mode, no crossovers. Absent key = the default. */
+  neuralOptions: DecodeOptions;
   /** The pack last filed under in the Library; offered for the next song. */
   lastPack: string;
 }
@@ -387,4 +391,6 @@ export interface ExitEvent {
 export interface NeuralUserPreset {
   preset: string;
   style: Record<string, number>;
+  /** The rhythm options saved with it; absent in presets from before them. */
+  options?: DecodeOptions;
 }

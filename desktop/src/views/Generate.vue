@@ -8,7 +8,9 @@ import { useNeural } from "../stores/neural";
 import { neuralProblem } from "../lib/engineProblems";
 import { api } from "../lib/api";
 import type { ChartEngine, NeuralStyleField, Target } from "../lib/types";
+import { cleanOptions, optionsJson } from "../lib/decodeOptions";
 import StagePipeline from "../components/StagePipeline.vue";
+import RhythmOptions from "../components/RhythmOptions.vue";
 import EngineBanner from "../components/EngineBanner.vue";
 
 const props = defineProps<{ base?: string }>();
@@ -129,6 +131,10 @@ const styleJson = computed(() => {
   return Object.keys(out).length ? JSON.stringify(out) : null;
 });
 
+// --- Rhythm: decoder options (subdivision cap, Stream mode, crossovers) ---- //
+/** What is sent as `--options-json`: only what differs from the defaults. */
+const decodeJson = computed(() => optionsJson(settings.value.neuralOptions));
+
 // --- Saved style presets --------------------------------------------------- //
 const namingPreset = ref(false);
 const presetName = ref("");
@@ -149,14 +155,18 @@ function isActiveUserPreset(name: string) {
   const now = currentStyle();
   const keys = new Set([...Object.keys(now), ...Object.keys(p.style)]);
   for (const k of keys) if (now[k] !== p.style[k]) return false;
-  return true;
+  return optionsJson(p.options ?? {}) === decodeJson.value;
 }
 function saveUserPreset() {
   const name = presetName.value.trim();
   if (!name) return;
   settings.value.neuralUserPresets = {
     ...settings.value.neuralUserPresets,
-    [name]: { preset: settings.value.neuralStylePreset || "", style: currentStyle() },
+    [name]: {
+      preset: settings.value.neuralStylePreset || "",
+      style: currentStyle(),
+      options: cleanOptions(settings.value.neuralOptions),
+    },
   };
   namingPreset.value = false;
   presetName.value = "";
@@ -168,6 +178,8 @@ function applyUserPreset(name: string) {
   // A built-in preset this engine no longer lists falls back to "let the model decide".
   settings.value.neuralStylePreset = neural.presets.includes(p.preset) ? p.preset : "";
   settings.value.neuralStyle = { ...p.style };
+  // a preset from before the rhythm options carries none: back to the defaults
+  settings.value.neuralOptions = cleanOptions(p.options ?? {});
   void settings.save();
 }
 function deleteUserPreset(name: string) {
@@ -245,6 +257,7 @@ async function generate() {
     engine: target.value === "stepforge" ? chartEngine.value : undefined,
     stylePreset: isNeural.value ? activePreset.value : undefined,
     styleJson: isNeural.value ? styleJson.value : undefined,
+    optionsJson: isNeural.value ? decodeJson.value : undefined,
   });
   jobId.value = j.id;
 }
@@ -403,7 +416,18 @@ onMounted(async () => {
               </select>
             </div>
 
-            <!-- Your own presets: the preset above plus whichever sliders are set -->
+            <!-- Rhythm: enforced by the decoder, like the difficulty's own limits -->
+            <div>
+              <label class="font-label-mono text-label-mono text-on-surface-variant uppercase block mb-2">Rhythm</label>
+              <RhythmOptions
+                v-model="settings.value.neuralOptions"
+                scope="chart"
+                :bpm="track?.bpm ?? null"
+                @commit="settings.save()"
+              />
+            </div>
+
+            <!-- Your own presets: the preset above plus the rhythm and whichever sliders are set -->
             <div>
               <label class="font-label-mono text-label-mono text-on-surface-variant uppercase block mb-2">Your presets</label>
               <div class="flex flex-wrap items-center gap-2">
@@ -450,7 +474,7 @@ onMounted(async () => {
                   v-else
                   type="button"
                   class="px-3 py-1 rounded-full border border-dashed border-outline-variant text-on-surface-variant text-[12px] hover:text-on-surface hover:border-outline flex items-center gap-1"
-                  title="Save the preset and sliders as they are now"
+                  title="Save the preset, rhythm and sliders as they are now"
                   @click="namingPreset = true"
                 >
                   <span class="material-symbols-outlined text-[14px]">add</span> Save preset…

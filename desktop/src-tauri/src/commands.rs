@@ -650,6 +650,55 @@ pub fn normalize_style_json(raw: Option<&str>) -> Result<Option<String>, String>
     Ok(Some(v.to_string()))
 }
 
+/// Decoder options `--options-json` accepts (the engine's `DecodeOptions`):
+/// what the user asks of the chart beyond the style sliders.
+pub const NEURAL_OPTION_KEYS: [&str; 6] = [
+    "max_subdivision",
+    "stream",
+    "stream_coverage",
+    "min_break_bars",
+    "crossovers",
+    "density",
+];
+
+/// Check an `--options-json` payload before a process is spawned for it: a
+/// JSON object, only known keys, each of the type and range the engine takes.
+/// Returns it re-serialized (None when there is nothing to send). The engine
+/// checks again; this is so a bad request fails here, with a message, instead
+/// of as a traceback at the end of a job's log.
+pub fn normalize_options_json(raw: Option<&str>) -> Result<Option<String>, String> {
+    let Some(raw) = raw.map(str::trim).filter(|r| !r.is_empty()) else {
+        return Ok(None);
+    };
+    let v: Value = serde_json::from_str(raw)
+        .map_err(|e| format!("decoder options are not valid JSON: {e}"))?;
+    let Some(obj) = v.as_object() else {
+        return Err("decoder options must be a JSON object of option -> value".into());
+    };
+    for (k, val) in obj {
+        let ok = match k.as_str() {
+            "max_subdivision" => matches!(val.as_u64(), Some(4 | 8 | 16)),
+            "stream" | "crossovers" => val.is_boolean(),
+            "stream_coverage" => val.as_f64().is_some_and(|x| x > 0.0 && x <= 1.0),
+            "min_break_bars" => val.as_u64().is_some_and(|n| (1..=64).contains(&n)),
+            "density" => val.as_f64().is_some_and(|x| (0.25..=2.0).contains(&x)),
+            _ => {
+                return Err(format!(
+                    "'{k}' is not a decoder option (expected one of {})",
+                    NEURAL_OPTION_KEYS.join(", ")
+                ))
+            }
+        };
+        if !ok {
+            return Err(format!("decoder option '{k}' cannot be {val}"));
+        }
+    }
+    if obj.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(v.to_string()))
+}
+
 /// Whether the installed engine CLI knows the neural-era interface.
 ///
 /// An app update does not refresh the `tools/` of a workspace that already
@@ -711,6 +760,8 @@ pub struct StepforgeRun<'a> {
     pub deterministic: bool,
     pub style_preset: Option<&'a str>,
     pub style_json: Option<&'a str>,
+    /// Decoder options (`--options-json`): subdivision cap, Stream mode, ….
+    pub options_json: Option<&'a str>,
     /// Re-run the DSP analysis (`--force`). Headless `--reanalyze` only.
     pub reanalyze: bool,
     pub backend: Option<&'a str>,
@@ -738,6 +789,7 @@ pub fn stepforge_args(run: &StepforgeRun) -> Result<Vec<String>, String> {
     let engine = resolve_chart_engine(run.engine, run.deterministic)?;
     let preset = clean_style_preset(run.style_preset)?;
     let style = normalize_style_json(run.style_json)?;
+    let options = normalize_options_json(run.options_json)?;
     let legacy = run.cli == CliSupport::Legacy;
     if legacy && engine == "neural" {
         return Err(
@@ -776,6 +828,10 @@ pub fn stepforge_args(run: &StepforgeRun) -> Result<Vec<String>, String> {
             args.push("--style-json".into());
             args.push(j);
         }
+        if let Some(j) = options {
+            args.push("--options-json".into());
+            args.push(j);
+        }
     }
     if run.reanalyze {
         args.push("--force".into());
@@ -785,19 +841,34 @@ pub fn stepforge_args(run: &StepforgeRun) -> Result<Vec<String>, String> {
     Ok(args)
 }
 
+/// What to do to a bar range beyond re-rolling its arrows.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RangeEdit<'a> {
+    /// Write the range again from the audio (`--regenerate`): its notes, not
+    /// only which panels they are on.
+    pub regenerate: bool,
+    /// Sliders for the range alone, on top of the chart's own.
+    pub style_json: Option<&'a str>,
+    /// Decoder options for the range alone.
+    pub options_json: Option<&'a str>,
+}
+
 /// The argv for `stepforge-inpaint`: re-roll bars `start_bar..end_bar` (0-based,
 /// end exclusive) of an existing neural chart in place.
 ///
-/// No style flags, on purpose. The CLI records the preset and sliders a chart
-/// was generated with in `report.json` and re-rolls with exactly those when the
-/// flags are absent — so the new section matches the chart it is spliced into,
-/// rather than whatever the Generate screen happens to be set to now.
+/// No preset flag, on purpose. The CLI records the preset and sliders a chart
+/// was generated with in `report.json` and starts from exactly those — so the
+/// new section matches the chart it is spliced into, rather than whatever the
+/// Generate screen happens to be set to now. `edit` carries what the user set
+/// for this range: sliders and decoder options that go on top of the chart's
+/// own, and whether the notes themselves are written again.
 pub fn inpaint_args(
     track_id: &str,
     difficulty: &str,
     start_bar: u32,
     end_bar: u32,
     seed: Option<u64>,
+    edit: &RangeEdit,
 ) -> Result<Vec<String>, String> {
     if track_id.trim().is_empty() {
         return Err("no track to re-roll".into());
@@ -823,6 +894,31 @@ pub fn inpaint_args(
         args.push("--seed".into());
         args.push(n.to_string());
     }
+    let style = normalize_style_json(edit.style_json)?;
+    let options = normalize_options_json(edit.options_json)?;
+    if !edit.regenerate {
+        // Without new notes there is nothing for the sliders to act on, and
+        // only "no crossovers" among the options is about arrows alone.
+        if style.is_some() {
+            return Err("sliders for a bar range need the range to be re-generated".into());
+        }
+        if let Some(o) = &options {
+            let v: Value = serde_json::from_str(o).map_err(|e| e.to_string())?;
+            if v.as_object().is_some_and(|m| m.keys().any(|k| k != "crossovers")) {
+                return Err("these options need the range to be re-generated".into());
+            }
+        }
+    } else {
+        args.push("--regenerate".into());
+    }
+    if let Some(j) = style {
+        args.push("--style-json".into());
+        args.push(j);
+    }
+    if let Some(j) = options {
+        args.push("--options-json".into());
+        args.push(j);
+    }
     Ok(args)
 }
 
@@ -839,6 +935,7 @@ pub struct GenerateRequest<'a> {
     pub engine: Option<&'a str>,
     pub style_preset: Option<&'a str>,
     pub style_json: Option<&'a str>,
+    pub options_json: Option<&'a str>,
     /// What the installed CLI understands. Only the stepforge argv depends on it.
     pub cli: CliSupport,
 }
@@ -873,6 +970,7 @@ pub fn generate_args(req: &GenerateRequest) -> Result<Vec<String>, String> {
                 deterministic: req.deterministic,
                 style_preset: req.style_preset,
                 style_json: req.style_json,
+                options_json: req.options_json,
                 reanalyze: false,
                 backend: req.backend,
                 cli: req.cli,
@@ -935,6 +1033,7 @@ pub fn generate_charts(
     engine: Option<String>,
     style_preset: Option<String>,
     style_json: Option<String>,
+    options_json: Option<String>,
 ) -> Result<(), String> {
     // Only the stepforge argv differs between CLI generations, so only that
     // target pays for the probe (once; it is cached).
@@ -953,6 +1052,7 @@ pub fn generate_charts(
         engine: engine.as_deref(),
         style_preset: style_preset.as_deref(),
         style_json: style_json.as_deref(),
+        options_json: options_json.as_deref(),
         cli,
     })?;
     // `engine` the parameter shadows `engine` the module here.
@@ -961,8 +1061,10 @@ pub fn generate_charts(
 
 /// Re-roll bars `start_bar..end_bar` (0-based, end exclusive) of an existing
 /// neural chart, keeping the rest of it. Streams like any other job. The style
-/// is the one the chart was generated with (see `inpaint_args`).
+/// is the one the chart was generated with; `regenerate`, `style_json` and
+/// `options_json` are what the user set for this range (see `inpaint_args`).
 #[tauri::command(async)]
+#[allow(clippy::too_many_arguments)]
 pub fn inpaint_chart(
     app: AppHandle,
     job_id: String,
@@ -971,8 +1073,16 @@ pub fn inpaint_chart(
     start_bar: u32,
     end_bar: u32,
     seed: Option<u64>,
+    regenerate: Option<bool>,
+    style_json: Option<String>,
+    options_json: Option<String>,
 ) -> Result<(), String> {
-    let args = inpaint_args(&track_id, &difficulty, start_bar, end_bar, seed)?;
+    let edit = RangeEdit {
+        regenerate: regenerate.unwrap_or(false),
+        style_json: style_json.as_deref(),
+        options_json: options_json.as_deref(),
+    };
+    let args = inpaint_args(&track_id, &difficulty, start_bar, end_bar, seed, &edit)?;
     engine::spawn_streaming(&app, job_id, args)
 }
 
@@ -1116,6 +1226,10 @@ pub fn get_result(
             "density": chart.get("density"), "meterMonotonic": report.get("meter_monotonic"),
             // Bars the chart spans (neural-era reports): bounds the re-roll range.
             "bars": chart.get("bars"),
+            // Decoder options the chart was generated with (subdivision cap,
+            // Stream mode, …) and what Stream mode laid out, when it was on.
+            "options": chart.pointer("/engine/options"),
+            "stream": chart.pointer("/engine/rhythm/stream"),
         })
     };
 
@@ -2634,18 +2748,18 @@ mod tests {
     /// 0-based with END exclusive, and the seed is optional.
     #[test]
     fn inpaint_argv_matches_the_cli() {
-        let bare = inpaint_args("overdrive", "hard", 16, 24, None).unwrap();
+        let bare = inpaint_args("overdrive", "hard", 16, 24, None, &RangeEdit::default()).unwrap();
         assert_eq!(
             line(&bare),
             "stepforge-inpaint --track overdrive --difficulty hard --bars 16:24"
         );
-        let seeded = inpaint_args("overdrive", "challenge", 0, 1, Some(42)).unwrap();
+        let seeded = inpaint_args("overdrive", "challenge", 0, 1, Some(42), &RangeEdit::default()).unwrap();
         assert_eq!(
             line(&seeded),
             "stepforge-inpaint --track overdrive --difficulty challenge --bars 0:1 --seed 42"
         );
         // Seed 0 is a seed, not "no seed".
-        let zero = inpaint_args("t", "easy", 2, 3, Some(0)).unwrap();
+        let zero = inpaint_args("t", "easy", 2, 3, Some(0), &RangeEdit::default()).unwrap();
         assert_eq!(flag(&zero, "--seed"), Some("0"));
     }
 
@@ -2655,24 +2769,141 @@ mod tests {
     #[test]
     fn inpaint_leaves_the_style_to_the_chart() {
         for args in [
-            inpaint_args("overdrive", "hard", 16, 24, None).unwrap(),
-            inpaint_args("overdrive", "hard", 16, 24, Some(7)).unwrap(),
+            inpaint_args("overdrive", "hard", 16, 24, None, &RangeEdit::default()).unwrap(),
+            inpaint_args("overdrive", "hard", 16, 24, Some(7), &RangeEdit::default()).unwrap(),
         ] {
             assert!(!args.iter().any(|a| a.starts_with("--style")), "{args:?}");
         }
     }
 
+    /// The contract with `--options-json`: only the engine's own option names,
+    /// each of a type and range it accepts, re-serialized.
+    #[test]
+    fn options_json_is_validated() {
+        let ok = normalize_options_json(Some(
+            r#"{ "max_subdivision": 8, "stream": true, "stream_coverage": 0.8,
+                 "min_break_bars": 4, "crossovers": false, "density": 1.2 }"#,
+        ))
+        .unwrap()
+        .unwrap();
+        let v: Value = serde_json::from_str(&ok).unwrap();
+        assert_eq!(v["max_subdivision"], 8);
+        assert_eq!(v["stream"], true);
+        assert_eq!(v["crossovers"], false);
+        assert_eq!(normalize_options_json(None).unwrap(), None);
+        assert_eq!(normalize_options_json(Some(" ")).unwrap(), None);
+        assert_eq!(normalize_options_json(Some("{}")).unwrap(), None);
+        for bad in [
+            r#"{"max_subdivision": 12}"#,
+            r#"{"max_subdivision": "8"}"#,
+            r#"{"stream": 1}"#,
+            r#"{"stream_coverage": 0}"#,
+            r#"{"stream_coverage": 1.5}"#,
+            r#"{"min_break_bars": 0}"#,
+            r#"{"min_break_bars": 2.5}"#,
+            r#"{"density": 9}"#,
+            r#"{"crossovers": "no"}"#,
+        ] {
+            let err = normalize_options_json(Some(bad)).unwrap_err();
+            assert!(err.contains("cannot be"), "{bad}: {err}");
+        }
+        let unknown = normalize_options_json(Some(r#"{"streem": true}"#)).unwrap_err();
+        assert!(unknown.contains("'streem'") && unknown.contains("max_subdivision"), "{unknown}");
+        assert!(normalize_options_json(Some("[1]")).unwrap_err().contains("JSON object"));
+        assert!(normalize_options_json(Some("{")).unwrap_err().contains("not valid JSON"));
+    }
+
+    #[test]
+    fn stepforge_argv_carries_decoder_options_to_the_neural_engine_only() {
+        let diffs = vec!["hard".to_string()];
+        let run = |engine: &'static str, cli: CliSupport| {
+            stepforge_args(&StepforgeRun {
+                track_id: "overdrive",
+                difficulties: &diffs,
+                engine: Some(engine),
+                options_json: Some(r#"{"stream":true,"max_subdivision":8}"#),
+                cli,
+                ..Default::default()
+            })
+        };
+        let neural = run("neural", CliSupport::Current).unwrap();
+        let sent: Value = serde_json::from_str(flag(&neural, "--options-json").unwrap()).unwrap();
+        assert_eq!(sent, json!({"stream": true, "max_subdivision": 8}));
+        assert!(flag(&run("deterministic", CliSupport::Current).unwrap(), "--options-json").is_none());
+        assert!(flag(&run("llm", CliSupport::Legacy).unwrap(), "--options-json").is_none());
+        // validated for every engine, as the style is
+        let bad = stepforge_args(&StepforgeRun {
+            track_id: "overdrive",
+            difficulties: &diffs,
+            engine: Some("deterministic"),
+            options_json: Some(r#"{"swagger":1}"#),
+            ..Default::default()
+        });
+        assert!(bad.unwrap_err().contains("'swagger'"));
+    }
+
+    /// Re-generating a range: `--regenerate` plus what was set for that range.
+    #[test]
+    fn range_regeneration_argv_matches_the_cli() {
+        let edit = RangeEdit {
+            regenerate: true,
+            style_json: Some(r#"{"jump_share":0}"#),
+            options_json: Some(r#"{"max_subdivision":8,"crossovers":false,"density":0.8}"#),
+        };
+        let args = inpaint_args("overdrive", "hard", 16, 24, Some(7), &edit).unwrap();
+        assert_eq!(
+            args[..10].join(" "),
+            "stepforge-inpaint --track overdrive --difficulty hard --bars 16:24 --seed 7 --regenerate"
+        );
+        let style: Value = serde_json::from_str(flag(&args, "--style-json").unwrap()).unwrap();
+        assert_eq!(style, json!({"jump_share": 0}));
+        let opts: Value = serde_json::from_str(flag(&args, "--options-json").unwrap()).unwrap();
+        assert_eq!(opts, json!({"max_subdivision": 8, "crossovers": false, "density": 0.8}));
+        // nothing set: still a re-generation, with the chart's own style
+        let bare = inpaint_args(
+            "overdrive", "hard", 16, 24, None,
+            &RangeEdit { regenerate: true, ..Default::default() },
+        )
+        .unwrap();
+        assert_eq!(
+            bare.join(" "),
+            "stepforge-inpaint --track overdrive --difficulty hard --bars 16:24 --regenerate"
+        );
+    }
+
+    /// A plain re-roll keeps the notes, so only "no crossovers" can apply to it.
+    #[test]
+    fn a_plain_reroll_refuses_settings_that_need_new_notes() {
+        let only_cross = RangeEdit {
+            options_json: Some(r#"{"crossovers":false}"#),
+            ..Default::default()
+        };
+        let args = inpaint_args("t", "hard", 0, 4, None, &only_cross).unwrap();
+        assert!(!args.contains(&"--regenerate".to_string()));
+        assert_eq!(flag(&args, "--options-json"), Some(r#"{"crossovers":false}"#));
+        for edit in [
+            RangeEdit { options_json: Some(r#"{"max_subdivision":8}"#), ..Default::default() },
+            RangeEdit { options_json: Some(r#"{"density":1.5}"#), ..Default::default() },
+            RangeEdit { style_json: Some(r#"{"jump_share":0.1}"#), ..Default::default() },
+        ] {
+            let err = inpaint_args("t", "hard", 0, 4, None, &edit).unwrap_err();
+            assert!(err.contains("re-generated"), "{err}");
+        }
+        let bad = RangeEdit { regenerate: true, options_json: Some(r#"{"x":1}"#), ..Default::default() };
+        assert!(inpaint_args("t", "hard", 0, 4, None, &bad).is_err());
+    }
+
     #[test]
     fn inpaint_rejects_requests_the_cli_could_not_run() {
         // An empty or backwards range.
-        assert!(inpaint_args("t", "hard", 8, 8, None)
+        assert!(inpaint_args("t", "hard", 8, 8, None, &RangeEdit::default())
             .unwrap_err()
             .contains("end bar is exclusive"));
-        assert!(inpaint_args("t", "hard", 9, 8, None).is_err());
+        assert!(inpaint_args("t", "hard", 9, 8, None, &RangeEdit::default()).is_err());
         // A difficulty from another target, and no track at all.
-        assert!(inpaint_args("t", "expertplus", 0, 4, None)
+        assert!(inpaint_args("t", "expertplus", 0, 4, None, &RangeEdit::default())
             .unwrap_err()
             .contains("not a stepforge difficulty"));
-        assert!(inpaint_args("  ", "hard", 0, 4, None).is_err());
+        assert!(inpaint_args("  ", "hard", 0, 4, None, &RangeEdit::default()).is_err());
     }
 }
