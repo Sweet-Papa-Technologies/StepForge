@@ -25,6 +25,7 @@ import importlib
 import json
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -51,7 +52,9 @@ CLIP_DIFFICULTIES = ("easy", "hard")
 #: Microsoft Visual C++ runtime libraries. The app ships its own copies next to
 #: python.exe; one loaded from anywhere else means the install only works on
 #: machines that happen to have the VC++ redistributable.
-VC_RUNTIME_PREFIXES = ("msvcp", "vcruntime", "concrt", "vcomp", "vccorlib")
+#: msvcp140.dll, vcruntime140_1.dll, ... The digits matter: msvcp_win.dll is part
+#: of Windows itself and every process loads it from System32.
+VC_RUNTIME = re.compile(r"^(msvcp|vcruntime|concrt|vcomp|vccorlib)\d+[\w-]*\.dll$")
 
 
 def describe(e: BaseException) -> str:
@@ -215,7 +218,7 @@ def vc_runtime_outside(paths: list[str], runtime_root: str) -> list[str]:
     out = []
     for p in paths:
         name = ntpath.basename(p).lower()
-        if not name.startswith(VC_RUNTIME_PREFIXES) or not name.endswith(".dll"):
+        if not VC_RUNTIME.match(name):
             continue
         if not norm(p).startswith(root):
             out.append(name)

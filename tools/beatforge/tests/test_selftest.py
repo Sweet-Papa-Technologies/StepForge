@@ -68,6 +68,7 @@ def test_vc_runtime_loaded_from_windows_is_found_and_bundled_copies_are_not():
         root + r"\Lib\site-packages\numpy.libs\msvcp140-a4c2229b.dll",  # numpy's private copy
         r"C:\Windows\System32\MSVCP140.dll",                           # the machine's
         r"C:\WINDOWS\SYSTEM32\msvcp140_1.dll",
+        r"C:\Windows\System32\msvcp_win.dll",                         # part of Windows, not of VC++
         r"C:\Windows\System32\kernel32.dll",
     ]
     assert selftest.vc_runtime_outside(loaded, root) == ["msvcp140.dll", "msvcp140_1.dll"]
