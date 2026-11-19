@@ -16,3 +16,7 @@ labels: chart-quality
 - [ ] Other:
 
 **Details** (timestamps help: "0:42–0:50, three crossovers in a row")
+
+**Chart and setup** ("Report this chart" on the app's Results screen fills this in for you)
+- StepForge version (bottom-left of the app):
+- Preset and sliders, if you changed them:

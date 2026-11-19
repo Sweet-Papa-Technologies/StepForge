@@ -44,6 +44,8 @@ const DEFAULTS: Settings = {
   songsDir: "",
   assetforgePath: "",
   theme: "dark",
+  checkForUpdates: true,
+  dismissedUpdateVersion: "",
   // Blank = never picked: Generate defaults to neural when the model is
   // installed. No sliders are set until the user sets one.
   chartEngine: "",
@@ -108,6 +110,9 @@ export const useSettings = defineStore("settings", {
         s.neuralStyle = cleanStyle(s.neuralStyle);
         s.neuralUserPresets = cleanPresets(s.neuralUserPresets);
         if (typeof s.lastPack !== "string") s.lastPack = "";
+        // Rust sends null for "never set", which is the default: ON.
+        s.checkForUpdates = s.checkForUpdates !== false;
+        if (typeof s.dismissedUpdateVersion !== "string") s.dismissedUpdateVersion = "";
         this.value = s;
       } catch {
         this.value = defaults();

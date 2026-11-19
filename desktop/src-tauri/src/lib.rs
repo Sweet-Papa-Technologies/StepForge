@@ -1,10 +1,12 @@
 mod commands;
 mod diagnostics;
 mod engine;
+mod feedback;
 mod headless;
 mod install;
 mod library;
 mod simfile;
+mod update;
 
 use engine::JobRegistry;
 use tauri::Manager;
@@ -92,6 +94,8 @@ pub fn run() {
             commands::neural_status,
             commands::register_track_meta,
             commands::export_song_folder,
+            feedback::feedback_issue,
+            update::update_from_releases,
         ])
         .run(ctx)
         .expect("error while running tauri application");

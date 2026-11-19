@@ -14,6 +14,7 @@ import TransportBar from "../components/TransportBar.vue";
 import NotePlayer from "../components/NotePlayer.vue";
 import ContextMenu, { type MenuItem } from "../components/ContextMenu.vue";
 import Spinner from "../components/Spinner.vue";
+import SendFeedback from "../components/SendFeedback.vue";
 import type { Chart } from "../lib/types";
 
 const props = defineProps<{ base?: string }>();
@@ -308,6 +309,18 @@ onMounted(async () => {
           <span v-if="detail?.humanReview" class="bg-tertiary-container/20 text-tertiary-fixed-dim border border-tertiary-container/40 px-2 py-1 rounded-sm font-label-mono text-[10px] uppercase">
             needs human review
           </span>
+          <!-- Feedback: the text is shown before anything opens (SendFeedback). -->
+          <div class="ml-auto shrink-0 flex items-center gap-2">
+            <SendFeedback
+              v-if="detail"
+              kind="chart"
+              :base="baseId"
+              :target="target"
+              :difficulty="difficulty"
+              :song-title="track?.title ?? baseId"
+            />
+            <SendFeedback />
+          </div>
         </div>
 
         <div v-if="sets.length" class="flex flex-wrap items-center gap-4">

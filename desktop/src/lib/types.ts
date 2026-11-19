@@ -125,6 +125,12 @@ export interface Settings {
   songsDir: string;
   assetforgePath: string;
   theme: string;
+  /** Ask GitHub at startup whether a newer release exists (lib/updateCheck).
+   *  On unless the user turned it off. */
+  checkForUpdates: boolean;
+  /** The release the update notice was dismissed for ("0.1.0-beta.7"); blank =
+   *  none. That one is not offered again; a later one is. */
+  dismissedUpdateVersion: string;
   /** Chart engine for the StepMania target: neural | llm | deterministic.
    *  Blank = never picked; Generate then defaults to neural when the model is
    *  installed, else the LLM designer. Not the same thing as `llmBackend`, which

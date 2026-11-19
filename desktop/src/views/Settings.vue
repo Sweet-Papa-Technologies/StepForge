@@ -8,6 +8,7 @@ import { api } from "../lib/api";
 import type { PackInfo } from "../lib/types";
 import { engineAdvice, engineProblems, neuralProblem } from "../lib/engineProblems";
 import CopyDiagnostics from "../components/CopyDiagnostics.vue";
+import SettingsUpdatesFeedback from "../components/SettingsUpdatesFeedback.vue";
 
 const settings = useSettings();
 const lib = useLibrary();
@@ -314,6 +315,8 @@ onMounted(async () => {
           </select>
         </div>
       </section>
+
+      <SettingsUpdatesFeedback />
 
       <!-- Advanced: the engine's location and tools. Release builds bundle all of
            this, so it only matters when running from source. -->

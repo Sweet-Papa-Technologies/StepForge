@@ -75,7 +75,7 @@ const AUDIO_EXTS: [&str; 6] = ["ogg", "wav", "mp3", "flac", "m4a", "aac"];
 fn analysis_dir(root: &Path) -> PathBuf {
     root.join("build/analysis")
 }
-fn target_dir(root: &Path, target: &str) -> PathBuf {
+pub(crate) fn target_dir(root: &Path, target: &str) -> PathBuf {
     match target {
         "stepforge" => root.join("build/stepmania"),
         "saberforge" => root.join("build/saberforge"),
@@ -1017,7 +1017,7 @@ pub fn list_results(app: AppHandle, base: String) -> Result<Vec<Value>, String> 
     Ok(out)
 }
 
-fn read_json(p: &Path) -> Option<Value> {
+pub(crate) fn read_json(p: &Path) -> Option<Value> {
     std::fs::read_to_string(p)
         .ok()
         .and_then(|t| serde_json::from_str(&t).ok())

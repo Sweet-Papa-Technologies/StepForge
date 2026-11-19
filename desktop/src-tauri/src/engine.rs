@@ -133,6 +133,14 @@ pub struct Settings {
     pub assetforge_path: String,
     /// UI theme: dark | light.
     pub theme: String,
+    /// Ask GitHub, when the app starts, whether a newer release exists (the
+    /// request and what it carries: `update.rs`). `Option` for the same reason
+    /// as `hybrid_cascade`: the default is ON, and a plain `bool` would read as
+    /// `false` from every settings.json written before this field existed.
+    pub check_for_updates: Option<bool>,
+    /// The release the user dismissed the update notice for ("0.1.0-beta.7");
+    /// blank = none. That version is not offered again; a later one is.
+    pub dismissed_update_version: String,
     /// Chart engine for the StepMania target: neural | llm | deterministic,
     /// passed as `stepforge --engine`. Blank means the user never picked one;
     /// the Generate screen then defaults to neural when the model is installed
