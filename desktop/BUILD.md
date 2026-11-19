@@ -125,7 +125,7 @@ did not build it and has charted a song there. The `smoke-*` jobs in
 
 | Installer | Where it is tested | Script |
 |---|---|---|
-| macOS `.dmg` (Apple silicon) | fresh `macos-15` and `macos-14` runners | `scripts/smoke_test.py` |
+| macOS `.dmg` (Apple silicon) | fresh `macos-15` and `macos-26` runners | `scripts/smoke_test.py` |
 | macOS `.dmg` (Intel) | fresh `macos-15-intel` runner | `scripts/smoke_test.py` |
 | Windows `-setup.exe` | fresh `windows-2022` and `windows-2025` runners | `scripts/smoke_test.py` |
 | Linux `.AppImage` | clean `archlinux` and `ubuntu:24.04` containers | `scripts/smoke_linux.sh` |

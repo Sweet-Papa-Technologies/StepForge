@@ -344,7 +344,7 @@ jobs:
       matrix:
         include:
           - { runner: macos-15, arch: arm64, label: "Apple silicon, macOS 15" }
-          - { runner: macos-14, arch: arm64, label: "Apple silicon, macOS 14" }
+          - { runner: macos-26, arch: arm64, label: "Apple silicon, macOS 26" }
           - { runner: macos-15-intel, arch: x64, label: "Intel, macOS 15" }
     steps:
       - uses: actions/checkout@v4
