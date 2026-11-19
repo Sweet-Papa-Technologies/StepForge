@@ -50,21 +50,23 @@ charter's chart of the same song matches the first.
 
 | 180 held-out songs | StepForge Flow v1.4 | smlab | human |
 |---|---:|---:|---:|
-| Step-placement F1 (±20 ms) | 0.656 | 0.674 | ≈ 0.75 |
-| … Beginner / Easy | 0.519 / 0.657 | 0.587 / 0.687 | |
-| … Medium | 0.689 | 0.689 | |
-| … Hard / Challenge | 0.714 / 0.726 | 0.703 / 0.712 | |
-| … on the 120 songs never used for tuning | 0.645 | 0.671 | |
+| Step-placement F1 (±20 ms) | 0.671 | 0.674 | ≈ 0.75 |
+| … Beginner / Easy | 0.562 / 0.667 | 0.587 / 0.687 | |
+| … Medium | 0.705 | 0.689 | |
+| … Hard / Challenge | 0.714 / 0.732 | 0.703 / 0.712 | |
+| … on the 120 songs never used for tuning | 0.663 | 0.671 | |
+| Notes written, relative to the human chart | 1.06× | 1.34× | |
 | Looks like a human chart (12 statistics) | 98% | 90% | 94% |
 | Unforced double-steps, share of notes | 0.01% | 1.04% | 0.35% |
-| Charts with no step the foot model rates forbidden | 100% | 84% | 78% |
-| Density follows song energy (Spearman ρ) | 0.674 | 0.446 | 0.417 |
+| Charts with no step the foot model rates forbidden | 99% | 84% | 78% |
+| Density follows song energy (Spearman ρ) | 0.713 | 0.446 | 0.417 |
 
-On placement v1.4 is level with smlab overall (−0.017, not significant) and
-slightly ahead on Hard (+0.011) and Challenge (+0.014), neither significant;
-it is significantly behind on Beginner (−0.069). (Paired bootstrap over songs,
-95% intervals.) The decoder's settings were tuned on 60 of the 180 songs; on
-the other 120 it scores 0.645 against smlab's 0.671 (−0.026, not significant). Playability does not depend on
+On placement v1.4 is level with smlab overall (−0.002, 95% interval −0.023 to
++0.020). No difficulty differs significantly: it is behind on Beginner (−0.026)
+and Easy (−0.021) and ahead on Medium (+0.016), Hard (+0.011) and Challenge
+(+0.019). (Paired bootstrap over songs, 95% intervals.) The decoder's settings
+were tuned on 60 of the 180 songs; on the other 120 it scores 0.663 against
+smlab's 0.671 (−0.007, not significant). Playability does not depend on
 the training data: those guarantees come from the decoder and foot model. We
 could not check whether the 180 test songs appear in smlab's training data.
 
@@ -72,6 +74,49 @@ Validation (27 songs): Stage A precision at matched density 0.780, AP 0.793
 (best epoch 44 of 100, regularized variant: dropout 0.3, weight decay 0.05);
 Stage B cross-entropy 1.418, 48% accuracy with half the notes masked (epoch 120
 of 140).
+
+### Decoder calibration (0.1.0-beta.9)
+
+The numbers above are for the decoder shipped from 0.1.0-beta.9. The weights
+did not change; three decoder settings did, and two of them are now stored with
+the model in `model_meta.json` (`decoder`), because they describe these weights
+and not the engine:
+
+| 180 held-out songs | before (through beta 8) | from beta 9 |
+|---|---:|---:|
+| Step-placement F1 (±20 ms) | 0.656 | 0.671 |
+| … Beginner / Easy / Medium | 0.519 / 0.657 / 0.689 | 0.562 / 0.667 / 0.705 |
+| … Hard / Challenge | 0.714 / 0.726 | 0.714 / 0.732 |
+| … on the 120 songs never used for tuning | 0.645 | 0.663 |
+| Precision / recall | 0.621 / 0.728 | 0.680 / 0.685 |
+| Notes relative to the human chart | 1.27× | 1.06× |
+| … Beginner / Easy | 1.65× / 1.40× | 1.13× / 1.04× |
+| Beat grid half a beat from the human chart's | 18 of 147 songs | 5 of 147 |
+| Longest run of 8ths or faster, median Hard chart (human: 15) | 7 notes | 15 |
+| Easy: intervals inside runs of 16+ equal intervals (human: 19%) | 65% | 23% |
+
+- **Which half of the beat the grid sits on** (`decoder.phase_rule: "vote"`).
+  The engine used to move the grid half a beat only when the rhythm model was
+  sure by a margin, and this small model is rarely that sure. Now three views
+  vote: the model's onset probability, its jump probability, and the audio's
+  own mid-band percussion. The rule was chosen with all 147 songs in view, from
+  a family of such votes whose error counts ranged from 5 to 17 (median 8), so
+  expect 5 to 8 wrong grids per 147 on new songs, not exactly 5.
+- **How many notes** (`decoder.density_scale`). Fitted on the 60 tuning songs
+  so the median chart has as many notes as the human chart of the same song.
+- **How long a run may be.** Runs of 8ths or faster were cut at 4 / 8 / 16
+  notes (Medium / Hard / Challenge), which put half of a Hard chart's intervals
+  in runs of exactly that shape. The limits are now 6 / 16 / 24, the human
+  median. Runs still tend to end at the limit, just at a human-typical one.
+
+Against the previous decoder the overall gain is +0.015 (95% interval −0.004 to
++0.034, not significant on its own); the Beginner gain is +0.043 (+0.007 to
++0.080). One number moved the other way: the charts in which the benchmark's
+foot model finds a forbidden step went from 2 to 6 of 900, all at Medium, each
+an arrow repeated a beat later (twice as part of a jump). In all six, another
+way of standing on the same steps has no forbidden step: the benchmark reports
+the footing with the lowest total cost, not the one with the mildest worst
+step.
 
 ## Memorization check
 
@@ -106,11 +151,21 @@ about 2.3 s for a 3-minute Challenge chart. Re-rolling 8 bars: ~0.2 s.
 
 ## Known limits
 
-- **Beginner and Easy are the weak tiers.** The engine checks whether the beat
-  grid sits half a beat off by asking the model, and this model answers less
-  reliably than one trained on more data would: the grid is wrong on about 1 song in 8, and
-  those songs' Beginner and Easy charts land between the beats. It also writes
-  more notes than human charts at those two tiers (1.65× and 1.40×).
+- **Beginner and Easy are the weak tiers.** On about 1 song in 30 the beat grid
+  still sits half a beat off (it was 1 in 8 before 0.1.0-beta.9), and those
+  songs' Beginner and Easy charts land between the beats. Where the grid is
+  right, a Beginner chart still shares only a little over half its notes with
+  the human one.
+- **Few 16th-note figures at Hard.** The median Hard chart has no 16ths at all
+  (the human chart of the same song: 20 of them), so Hard reads as an 8th-note
+  chart. That is the weights, not the decoder: the model rarely gives a 16th
+  enough probability to be chosen.
+- **Stream mode is laid out by rule, not learned.** Of the 1,066 training
+  charts only 38 contain two unbroken bars of 16ths and none has as many as 32
+  full bars of them, so the model has almost never seen stamina charts. Stream mode
+  decides which bars are stream from the model's sense of where the music is
+  busy, fills them by rule, and lets the model choose the arrows. A stream
+  fails the on-the-music check by design: it plays every slot, sound or not.
 - Stage A's validation precision plateaus near 0.78: about a fifth of a human
   chart's notes are choices another charter would have made differently.
 - Trained on dance-single 4/4 charts without gimmick timing; constant-BPM
