@@ -1,3 +1,4 @@
+import type { DecodeOptions } from "./decodeOptions";
 export type TrackStatus = "unconverted" | "draft" | "analyzed" | "charted";
 export type Target = "stepforge" | "saberforge" | "native";
 
@@ -125,6 +126,12 @@ export interface Settings {
   songsDir: string;
   assetforgePath: string;
   theme: string;
+  /** Ask GitHub at startup whether a newer release exists (lib/updateCheck).
+   *  On unless the user turned it off. */
+  checkForUpdates: boolean;
+  /** The release the update notice was dismissed for ("0.1.0-beta.7"); blank =
+   *  none. That one is not offered again; a later one is. */
+  dismissedUpdateVersion: string;
   /** Chart engine for the StepMania target: neural | llm | deterministic.
    *  Blank = never picked; Generate then defaults to neural when the model is
    *  installed, else the LLM designer. Not the same thing as `llmBackend`, which
@@ -138,6 +145,9 @@ export interface Settings {
   neuralStyle: Record<string, number>;
   /** Style presets saved on the Generate screen, by name. */
   neuralUserPresets: Record<string, NeuralUserPreset>;
+  /** Decoder options set on the Generate screen (lib/decodeOptions): a cap on
+   *  the subdivision, Stream mode, no crossovers. Absent key = the default. */
+  neuralOptions: DecodeOptions;
   /** The pack last filed under in the Library; offered for the next song. */
   lastPack: string;
 }
@@ -381,4 +391,6 @@ export interface ExitEvent {
 export interface NeuralUserPreset {
   preset: string;
   style: Record<string, number>;
+  /** The rhythm options saved with it; absent in presets from before them. */
+  options?: DecodeOptions;
 }

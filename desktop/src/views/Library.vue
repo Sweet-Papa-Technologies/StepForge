@@ -5,6 +5,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { useLibrary } from "../stores/library";
 import { api } from "../lib/api";
 import { fmtBpm, fmtDuration, fmtSize } from "../lib/format";
+import { optionsJson } from "../lib/decodeOptions";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { useEngine } from "../stores/engine";
 import { useSettings } from "../stores/settings";
@@ -370,6 +371,7 @@ async function startBatch() {
     difficulties: await api.difficultiesFor("stepforge"),
     stylePreset: preset && neural.presets.includes(preset) ? preset : null,
     styleJson: Object.keys(style).length ? JSON.stringify(style) : null,
+    optionsJson: optionsJson(settings.value.neuralOptions),
     pack: pack || undefined,
     install: batchInstall.value && !!packInfo.value?.songsDirExists,
   });

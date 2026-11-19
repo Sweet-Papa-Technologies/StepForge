@@ -259,6 +259,23 @@ def _style_overrides(text: str | None) -> dict | None:
     return data
 
 
+def _decode_options(text: str | None):
+    """--options-json -> DecodeOptions (None when not given)."""
+    if not text:
+        return None
+    from .adapters.stepmania.neural import infer
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as e:
+        raise SystemExit(f"--options-json is not valid JSON: {e}") from None
+    if not isinstance(data, dict):
+        raise SystemExit("--options-json must be an object of option name -> value")
+    try:
+        return infer.DecodeOptions.from_dict(data)
+    except (ValueError, TypeError) as e:
+        raise SystemExit(f"--options-json: {e}") from None
+
+
 def _stepforge_neural(a, tracks, diffs):
     from .adapters.stepmania.neural import infer, pipeline
     try:
@@ -266,12 +283,13 @@ def _stepforge_neural(a, tracks, diffs):
     except infer.ModelNotInstalled as e:
         raise SystemExit(f"[stepforge] {e}") from None
     overrides = _style_overrides(a.style_json)
+    decode = _decode_options(a.options_json)
     opts = _opts(a)
     for tid in tracks:
         try:
             r = pipeline.build_song(tid, opts, difficulties=diffs, engine=engine,
                                     style_preset=a.style_preset, style_overrides=overrides,
-                                    seed=a.seed, style_rag=a.style_rag)
+                                    seed=a.seed, style_rag=a.style_rag, options=decode)
         except ValueError as e:                       # bad preset / slider name
             raise SystemExit(f"[stepforge] {e}") from None
         cs = " ".join(f"{s}:{i['notes']}n/m{i['meter']}/gates{all(i['metrics']['gates'].values())}"
@@ -309,16 +327,25 @@ def cmd_stepforge(a):
 
 
 def cmd_stepforge_inpaint(a):
-    """Re-roll a bar range of one neural chart in place (spec §6.5.4)."""
+    """Re-roll a bar range of one neural chart in place (spec §6.5.4): the
+    panels of its notes, or with --regenerate the notes themselves, under
+    settings given for that range alone."""
     from .adapters.stepmania.neural import infer, pipeline
     try:
         bars = pipeline.parse_bars(a.bars)
         r = pipeline.inpaint_song(a.difficulty, bars, track_id=a.track, ssc=a.ssc,
                                   seed=a.seed, model_dir=a.model_dir, int8=a.int8,
                                   style_preset=a.style_preset,
-                                  style_overrides=_style_overrides(a.style_json))
+                                  style_overrides=_style_overrides(a.style_json),
+                                  regenerate=a.regenerate,
+                                  options=_decode_options(a.options_json))
     except (infer.ModelNotInstalled, FileNotFoundError, ValueError) as e:
         raise SystemExit(f"[inpaint] {e}") from None
+    if r["regenerated"]:
+        print(f"[inpaint] {r['track_id']}/{r['difficulty']} bars {bars[0]}:{bars[1]} "
+              f"re-generated: {r['notes_before']} -> {r['notes_in_section']} notes "
+              f"(seed {r['seed']}) -> {r['out']}")
+        return
     print(f"[inpaint] {r['track_id']}/{r['difficulty']} bars {bars[0]}:{bars[1]} -> "
           f"{r['changed']} notes changed (of {r['notes_in_section']} in the section, "
           f"seed {r['seed']}) -> {r['out']}")
@@ -495,6 +522,10 @@ def build_parser():
         sp.add_argument("--model-dir", dest="model_dir",
                         help="neural: exported model directory (default: "
                              "$BEATFORGE_NEURAL_MODEL_DIR or models/stepforge_flow)")
+        sp.add_argument("--options-json", dest="options_json",
+                        help="neural: decoder options as JSON — max_subdivision (4, 8 "
+                             "or 16), stream (true), stream_coverage (0-1), "
+                             "min_break_bars, crossovers (false), density (0.25-2)")
         sp.add_argument("--seed", type=int, help="neural: sampling seed")
         sp.add_argument("--int8", action="store_true",
                         help="neural: use the int8-quantized graphs if exported")
@@ -514,6 +545,10 @@ def build_parser():
     ip.add_argument("--difficulty", required=True,
                     choices=["beginner", "easy", "medium", "hard", "challenge"])
     ip.add_argument("--bars", required=True, help="START:END, 0-based, END exclusive")
+    ip.add_argument("--regenerate", action="store_true",
+                    help="write the range again from the audio (its notes, not only "
+                         "their panels) with --style-json / --options-json applied to "
+                         "that range alone")
     neural_flags(ip)
 
     to = sub.add_parser("to-ogg", help="transcode audio to .ogg without ffmpeg (json)")

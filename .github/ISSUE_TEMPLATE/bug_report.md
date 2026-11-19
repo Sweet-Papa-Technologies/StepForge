@@ -12,7 +12,7 @@ labels: bug
 1.
 2.
 
-**Your setup**
+**Your setup** ("Send feedback" in the app's Settings fills this in for you)
 - StepForge version (bottom-left of the app):
 - OS and version:
 - Game (ITGmania / StepMania version):

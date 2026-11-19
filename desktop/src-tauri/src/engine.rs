@@ -133,6 +133,14 @@ pub struct Settings {
     pub assetforge_path: String,
     /// UI theme: dark | light.
     pub theme: String,
+    /// Ask GitHub, when the app starts, whether a newer release exists (the
+    /// request and what it carries: `update.rs`). `Option` for the same reason
+    /// as `hybrid_cascade`: the default is ON, and a plain `bool` would read as
+    /// `false` from every settings.json written before this field existed.
+    pub check_for_updates: Option<bool>,
+    /// The release the user dismissed the update notice for ("0.1.0-beta.7");
+    /// blank = none. That version is not offered again; a later one is.
+    pub dismissed_update_version: String,
     /// Chart engine for the StepMania target: neural | llm | deterministic,
     /// passed as `stepforge --engine`. Blank means the user never picked one;
     /// the Generate screen then defaults to neural when the model is installed
@@ -156,6 +164,11 @@ pub struct Settings {
     /// the resolved preset and sliders.
     #[serde(deserialize_with = "lenient_object_map")]
     pub neural_user_presets: BTreeMap<String, Value>,
+    /// Decoder options set on the Generate screen (`--options-json`): a cap on
+    /// the subdivision, Stream mode, no crossovers. Keyed by the engine's own
+    /// option names; an ABSENT key is the engine's default, as with the style.
+    #[serde(deserialize_with = "lenient_scalar_map")]
+    pub neural_options: BTreeMap<String, Value>,
     /// The pack name last filed under in the Library, offered again for the
     /// next song and used by a batch run.
     pub last_pack: String,
@@ -172,6 +185,23 @@ where
         .map(|m| {
             m.iter()
                 .filter(|(_, v)| v.is_object())
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
+/// Read a map of numbers and booleans, dropping anything else (see
+/// `lenient_style_map` for why nothing here may fail the whole file).
+fn lenient_scalar_map<'de, D>(d: D) -> Result<BTreeMap<String, Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v = Value::deserialize(d)?;
+    Ok(v.as_object()
+        .map(|m| {
+            m.iter()
+                .filter(|(_, v)| v.is_number() || v.is_boolean())
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect()
         })

@@ -175,10 +175,13 @@ def test_footswitch_slider_lifts_the_penalty_and_slow_ones_are_free():
 # --------------------------------------------------------------------------- #
 # 4. energy following
 # --------------------------------------------------------------------------- #
-def test_every_tier_has_an_energy_tilt_and_low_tiers_lean_harder():
+def test_every_tier_has_an_energy_tilt():
     assert set(infer.ENERGY_TILT) == set(BUDGETS)
-    assert infer.ENERGY_TILT["beginner"][0][0] > infer.ENERGY_TILT["challenge"][0][0]
+    # Medium leans harder than Challenge; Beginner and Easy lean least, having
+    # too few notes to spend them all on the loud bars
+    assert infer.ENERGY_TILT["medium"][0][0] > infer.ENERGY_TILT["challenge"][0][0]
     assert infer.ENERGY_TILT["medium"][1] > infer.ENERGY_TILT["challenge"][1]
+    assert infer.ENERGY_TILT["beginner"][0][0] < infer.ENERGY_TILT["challenge"][0][0]
     t = 48 * 64
     tt = tick_times(t)
     energy = np.concatenate([np.full(32, 0.2), np.full(32, 0.9)])
@@ -449,7 +452,7 @@ def test_too_short_a_song_is_left_alone():
     core = np.zeros((4 * C.G, 31), np.float32)
     out = pipeline.verify_phase(LoudnessEngine(), core, np.full(len(core), 40.0))
     assert out == {"half_beat": False, "gain": 0.0, "bar_shift_beats": 0,
-                   "bar_share": None}
+                   "bar_share": None, "rule": "margin", "votes": None}
 
 
 def test_rebar_follows_a_moved_bar_line():

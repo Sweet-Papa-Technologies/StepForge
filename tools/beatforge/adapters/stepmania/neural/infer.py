@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import dataclasses
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -231,6 +232,15 @@ class FlowModel:
                                            opts, providers=prov)
         self.trained_with_stems = bool(self.meta.get("trained_with_stems"))
 
+    def density_scale(self, difficulty: str) -> float:
+        """The tier's density scale for THESE weights. DENSITY_SCALE was fitted
+        with the first full-corpus model; a model trained on other data is
+        calibrated differently and carries its own as `decoder.density_scale`
+        in model_meta.json (as it may carry `decoder.phase_margin`)."""
+        own = (self.meta.get("decoder") or {}).get("density_scale") or {}
+        v = own.get(difficulty)
+        return float(v) if isinstance(v, (int, float)) else DENSITY_SCALE.get(difficulty, 1.0)
+
     # -- Stage A ---------------------------------------------------------- #
     def rhythm(self, x: np.ndarray, cond19: np.ndarray) -> dict:
         """X (T, 64) -> per-tick logits, run in overlapping 32-measure windows
@@ -308,6 +318,93 @@ _SUBDIVISIONS = {
 #: 16ths they read as tight 32nd-like bursts in play.
 SUBDIVISIONS_24THS = (0, 2, 3, 4, 6, 8, 9, 10)
 ALLOW_24THS = False
+#: "Max subdivision": the ticks a chart may use when the user caps it at 4ths,
+#: 8ths or 16ths. A cap is strict about what it names: 8ths means no triplets
+#: either (a triplet 8th is closer to its neighbour than an 8th is), and 16ths
+#: means the duple grid only. It can only coarsen a tier, never refine it.
+SUBDIVISION_RESIDUES = {4: (0,), 8: (0, 6), 16: (0, 3, 6, 9)}
+SUBDIVISION_TICKS = {4: 12, 8: 6, 16: 3}
+#: The finest duple subdivision each tier writes.
+_FINEST = {"beginner": 4, "easy": 8, "medium": 8, "hard": 16, "challenge": 16}
+#: Longest run of notes an 8th apart or closer, per tier. grammar.BUDGETS has
+#: its own (4 / 8 / 16 at Medium / Hard / Challenge), drafted for the LLM
+#: designer. Applied here it cut every stream at that length: on the 180-song
+#: benchmark the longest run on the median chart was 3 / 7 / 15 notes where the
+#: human chart of the same song has 5 / 15 / 18 (and 9 / 26 / 33 at the 75th
+#: percentile), and half of a Hard chart's intervals sat in runs of exactly
+#: that shape. These sit at the human median. Longer still (8 / 32 / 48) scored
+#: the same on placement but put a quarter of a Hard chart in runs of 16+
+#: intervals, where human charts have 8%. Unbroken streams are Stream mode's
+#: job (`DecodeOptions.stream`), not the default chart's.
+RUN_LIMIT = {"beginner": 1, "easy": 2, "medium": 6, "hard": 16, "challenge": 24}
+
+
+@dataclass(frozen=True)
+class DecodeOptions:
+    """What the user asked of the decoder beyond the style sliders. Everything
+    here is enforced by construction, like the tier rules.
+
+    max_subdivision  4, 8 or 16: no note finer than that (None: the tier's own)
+    stream           Stream mode: unbroken runs at one subdivision with real
+                     breaks between them, instead of note-by-note selection
+    stream_coverage  share of the playable bars that are stream (Stream mode)
+    min_break_bars   a break is never shorter than this many bars (Stream mode)
+    crossovers       False: no step may end with the feet crossed
+    density          multiplier on the note count the model itself expects
+                     (used when the NPS slider is left to the model)
+    """
+    max_subdivision: int | None = None
+    stream: bool = False
+    stream_coverage: float = 0.75
+    min_break_bars: int = 2
+    crossovers: bool = True
+    density: float = 1.0
+
+    def __post_init__(self):
+        if self.max_subdivision not in (None, 4, 8, 16):
+            raise ValueError(f"max_subdivision must be 4, 8 or 16, not {self.max_subdivision!r}")
+        if not 0.0 < float(self.stream_coverage) <= 1.0:
+            raise ValueError("stream_coverage must be in (0, 1]")
+        if int(self.min_break_bars) < 1:
+            raise ValueError("min_break_bars must be at least 1")
+        if not 0.25 <= float(self.density) <= 2.0:
+            raise ValueError("density must be between 0.25 and 2.0")
+
+    @classmethod
+    def from_dict(cls, d: dict | None) -> "DecodeOptions":
+        """From the plain mapping the CLI and the app pass (and report.json
+        records). Unknown keys are an error: a typo must not silently do
+        nothing."""
+        d = dict(d or {})
+        known = {f for f in cls.__dataclass_fields__}
+        bad = sorted(set(d) - known)
+        if bad:
+            raise ValueError(f"unknown decoder option(s): {', '.join(bad)} "
+                             f"(choose from {', '.join(sorted(known))})")
+        return cls(**d)
+
+    def to_dict(self) -> dict:
+        """Only what differs from the defaults (plus the Stream settings when
+        Stream mode is on), for report.json."""
+        base = DecodeOptions()
+        out = {k: getattr(self, k) for k in self.__dataclass_fields__
+               if getattr(self, k) != getattr(base, k)}
+        if self.stream:
+            out.update(stream_coverage=self.stream_coverage,
+                       min_break_bars=self.min_break_bars)
+        else:
+            out.pop("stream_coverage", None)
+            out.pop("min_break_bars", None)
+        return out
+
+
+def subdivision_residues(difficulty: str, max_subdivision: int | None = None) -> tuple:
+    """`tick % 12` residues a chart of `difficulty` may use under the cap."""
+    tier = SUBDIVISIONS_24THS if (difficulty == "challenge" and ALLOW_24THS) \
+        else _SUBDIVISIONS[difficulty]
+    if max_subdivision is None:
+        return tier
+    return tuple(r for r in SUBDIVISION_RESIDUES[max_subdivision] if r in tier)
 _MAX_NOTES_IN_HOLD = {"beginner": 0, "easy": 1, "medium": 2, "hard": 4, "challenge": 8}
 _JUMP_TICKS = {"downbeats": 48, "accents": 24, "free": 12}
 _JUMP_MIN_SPACING_BEATS = {"downbeats": 4.0, "accents": 2.0, "free": 1.0}
@@ -355,14 +452,15 @@ class TierRules:
     slow_repeats_only: bool = False   # no jack budget: an arrow may repeat only slowly
 
     @classmethod
-    def for_difficulty(cls, difficulty: str) -> "TierRules":
+    def for_difficulty(cls, difficulty: str, crossovers: bool = True) -> "TierRules":
+        """`crossovers=False` forbids them at tiers that would allow them."""
         b = BUDGETS[difficulty]
         # No tier gets an unforced double-step. Human Hard/Challenge charts do
         # contain them (~0.5% of steps) and the model will sample them, but they
         # are what chart reviewers flag first, and on the benchmark they were the
         # one playability measure where the neural engine trailed DDC.
         slow = b.jack_limit <= 0
-        return cls(difficulty, b.crossover == "none", not b.footswitch,
+        return cls(difficulty, b.crossover == "none" or not crossovers, not b.footswitch,
                    True, SLOW_REPEAT_RUN if slow else max(1, b.jack_limit),
                    difficulty in ("hard", "challenge"),
                    {"none": 1.0, "light": 3.0, "moderate": 1.0}.get(b.crossover, 1.0),
@@ -555,6 +653,132 @@ def _commit_streams(ticks: np.ndarray, p: np.ndarray, allowed: np.ndarray,
     return np.nonzero(have)[0], filled
 
 
+#: Stream mode. A stream shorter than this many bars is not worth breaking the
+#: song up for and is given back to the break around it.
+STREAM_MIN_BARS = 2
+#: How much a bar's energy rank counts beside the model's own onset probability
+#: when deciding which bars are stream and which are break.
+STREAM_ENERGY_WEIGHT = 0.25
+
+
+def stream_subdivision(difficulty: str, max_subdivision: int | None,
+                       beat_s: float) -> int:
+    """The subdivision (4, 8 or 16) a Stream-mode chart runs at.
+
+    A subdivision the user chose is taken as given, up to the finest the tier
+    writes at all — they asked for 16ths, they get 16ths, whatever rate that
+    is at this tempo. Left open, it is the finest one whose rate stays inside
+    the tier's peak notes-per-second."""
+    finest = _FINEST[difficulty]
+    if max_subdivision is not None:
+        return min(int(max_subdivision), finest)
+    limit = BUDGETS[difficulty].max_nps_4s
+    for sub in (16, 8, 4):
+        if sub <= finest and (sub / 4.0) / beat_s <= limit + 1e-6:
+            return sub
+    return 4
+
+
+def _stream_layout(p: np.ndarray, allowed: np.ndarray, tick_times: np.ndarray,
+                   difficulty: str, opts: DecodeOptions,
+                   rank: np.ndarray | None) -> dict:
+    """Which bars are stream and which are break, and the notes of the streams.
+
+    Every playable bar is scored by how much the model wants notes on the
+    stream's own grid there (plus a little of the bar's energy rank). The
+    weakest bars become breaks until `1 - stream_coverage` of the playable bars
+    are break — never in pieces shorter than `min_break_bars`, so a break is a
+    real rest and not a dropped note. A stream fills every slot of its bars at
+    the one subdivision and lands on the downbeat that follows it.
+
+    Returns {'ticks': stream note ticks, 'break_allowed': the ticks the breaks
+    may still use (quarter notes at most, so nothing in a break is as fast as
+    the stream), 'info': for the report}.
+    """
+    t = len(p)
+    n_bars = t // C.G
+    beat_s = float(np.median(np.diff(tick_times))) * C.TICKS_PER_BEAT if t > 1 else 0.5
+    sub = stream_subdivision(difficulty, opts.max_subdivision, beat_s)
+    step = SUBDIVISION_TICKS[sub]
+    per_bar = C.G // step
+    slots = (np.arange(n_bars)[:, None] * C.G + step * np.arange(per_bar)[None, :])
+    # a bar can be stream only if the chart may use every one of its slots (the
+    # stream's grid is never finer than what `allowed` already admits)
+    playable = allowed[slots].all(axis=1) if n_bars else np.zeros(0, bool)
+    act = p[slots].mean(axis=1) if n_bars else np.zeros(0)
+    if rank is not None and n_bars:
+        r = np.zeros(n_bars)
+        m = min(n_bars, len(rank))
+        r[:m] = rank[:m]
+        act = act + STREAM_ENERGY_WEIGHT * r
+    brk = ~playable
+    n_play = int(playable.sum())
+    need = int(round((1.0 - float(opts.stream_coverage)) * n_play))
+    mb = int(opts.min_break_bars)
+    while need > 0:
+        best = None                                   # (mean score, bars)
+        free = playable & ~brk
+        for m in np.nonzero(free)[0]:
+            # lengthen a break that is already there by one bar...
+            if (m > 0 and brk[m - 1]) or (m + 1 < n_bars and brk[m + 1]):
+                if best is None or act[m] < best[0]:
+                    best = (float(act[m]), [int(m)])
+        for m in range(0, n_bars - mb + 1):
+            # ...or open a new one at its minimum length
+            if free[m:m + mb].all():
+                c = float(act[m:m + mb].mean())
+                if best is None or c < best[0]:
+                    best = (c, list(range(m, m + mb)))
+        if best is None:
+            break
+        brk[best[1]] = True
+        need -= len(best[1])
+    # a sliver of stream between two breaks belongs to the break
+    m = 0
+    while m < n_bars:
+        if brk[m]:
+            m += 1
+            continue
+        e = m
+        while e < n_bars and not brk[e]:
+            e += 1
+        if e - m < STREAM_MIN_BARS:
+            brk[m:e] = True
+        m = e
+    ticks, segments = [], []
+    m = 0
+    while m < n_bars:
+        if brk[m]:
+            m += 1
+            continue
+        e = m
+        while e < n_bars and not brk[e]:
+            e += 1
+        ticks.append(np.arange(m * C.G, e * C.G, step))
+        if e * C.G < t and allowed[e * C.G]:
+            ticks.append(np.array([e * C.G]))         # land on the next downbeat
+        segments.append([int(m), int(e)])
+        m = e
+    ticks = np.concatenate(ticks).astype(np.int64) if ticks else np.zeros(0, np.int64)
+    # breaks: quarter notes at most (half notes under a stream of 4ths), so
+    # nothing in a break is as fast as the stream, and nothing on top of it
+    break_step = max(C.TICKS_PER_BEAT, 2 * step)
+    kk = np.arange(t)
+    break_allowed = allowed & (kk % break_step == 0)
+    in_break_bar = np.zeros(t, bool)
+    for m in np.nonzero(brk)[0]:
+        in_break_bar[m * C.G:(m + 1) * C.G] = True
+    in_break_bar[n_bars * C.G:] = True
+    break_allowed &= in_break_bar
+    break_allowed[ticks] = False
+    nps = (sub / 4.0) / beat_s
+    info = {"subdivision": sub, "segments": segments,
+            "stream_bars": int(sum(e - s for s, e in segments)),
+            "playable_bars": n_play, "nps": round(nps, 2),
+            "over_tier_rate": bool(nps > BUDGETS[difficulty].max_nps_4s + 1e-6)}
+    return {"ticks": ticks, "break_allowed": break_allowed, "info": info}
+
+
 #: How hard the onset score leans toward the song's louder bars: per tier, the
 #: tilt strengths tried in order (multipliers on the odds are exp(w * (rank -
 #: 1/2)), rank being the bar's energy rank in the song) and the Spearman (notes
@@ -562,9 +786,16 @@ def _commit_streams(ticks: np.ndarray, p: np.ndarray, allowed: np.ndarray,
 #: dev songs these raised the correlation from 0.60 to 0.71 for 0.002 of
 #: placement F1; pushing further (every tier at 3-6) reached 0.73 but began to
 #: cost Hard and Challenge half a point of agreement with the human chart.
+#:
+#: Beginner and Easy lean much less. Those charts have few notes to place, and
+#: a strong tilt spends them all on the loud bars: with the note count brought
+#: down to a human chart's (see `FlowModel.density_scale`), the old 4-6 tilt
+#: cost Beginner 0.03 of placement F1 on the 60 tuning songs and the gentle one
+#: none, at a correlation (0.67) still far above the gate and above human
+#: charts' own (0.42).
 ENERGY_TILT = {
-    "beginner": ((4.0, 5.0, 6.0), 0.75),
-    "easy": ((4.0, 5.0, 6.0), 0.75),
+    "beginner": ((1.5, 3.0), 0.50),
+    "easy": ((1.5, 3.0), 0.50),
     "medium": ((4.0, 5.0, 6.0), 0.75),
     "hard": ((3.0, 4.0, 5.0), 0.70),
     "challenge": ((2.2, 3.0, 4.0), 0.65),
@@ -630,7 +861,11 @@ def _metric_weight(n_ticks: int, difficulty: str) -> np.ndarray | None:
 def decode_rhythm(logits: dict, tick_times: np.ndarray, difficulty: str,
                   style: np.ndarray, duration_s: float,
                   energy_per_bar: np.ndarray | None = None,
-                  on_transient: np.ndarray | None = None) -> RhythmPlan:
+                  on_transient: np.ndarray | None = None, *,
+                  options: DecodeOptions | None = None,
+                  density_scale: float | None = None,
+                  window: tuple | None = None,
+                  blocked: np.ndarray | None = None) -> RhythmPlan:
     """RhythmNet logits -> the notes of the chart (spec §6.3).
 
     1. mask ticks the tier may not use, and anything outside the playable window
@@ -645,32 +880,58 @@ def decode_rhythm(logits: dict, tick_times: np.ndarray, difficulty: str,
     `on_transient`, a bool per tick, marks ticks with a detected onset under
     them; given it, notes on other ticks are held to MAX_OFF_TRANSIENT of the
     chart, so the result is on the music rather than on the grid.
+
+    `options` carries the user's decoder settings (see `DecodeOptions`): a cap
+    on the subdivision, Stream mode, a density multiplier. `density_scale`
+    replaces the tier's DENSITY_SCALE (a model may carry its own).
+
+    `window`, (first tick, end tick), decodes only that part of the song — for
+    re-generating a bar range of an existing chart — and `blocked`, a bool per
+    tick, removes individual ticks from it (a freeze of the surrounding chart
+    is being held there). In a window the density target is always the model's
+    own expectation for those ticks times `options.density`: the NPS slider
+    describes a whole chart, not eight bars of one.
     """
     b = BUDGETS[difficulty]
+    opts = options or DecodeOptions()
     t = len(tick_times)
     k = np.arange(t)
     p = sigmoid(logits["onset"].astype(np.float64))
-    subdiv = SUBDIVISIONS_24THS if (difficulty == "challenge" and ALLOW_24THS) \
-        else _SUBDIVISIONS[difficulty]
+    subdiv = subdivision_residues(difficulty, opts.max_subdivision)
     allowed = np.isin(k % C.TICKS_PER_BEAT, subdiv)
     allowed &= k >= int(FIRST_PLAYABLE_BEAT * C.TICKS_PER_BEAT)
     allowed &= tick_times <= duration_s - PLAYABLE_TAIL_S
     allowed &= tick_times >= 0.0
+    if window is not None:
+        allowed &= (k >= int(window[0])) & (k < int(window[1]))
+    if blocked is not None:
+        allowed &= ~np.asarray(blocked, bool)
+
+    rank = bar = None
+    if energy_per_bar is not None and len(energy_per_bar) > 2:
+        e_ = np.asarray(energy_per_bar, np.float64)
+        rank = np.argsort(np.argsort(e_)) / max(1, len(e_) - 1)             # 0..1
+        bar = np.minimum(k // C.G, len(e_) - 1)
+
+    # Stream mode lays the streams out first; what is selected note by note
+    # below is then only the breaks between them.
+    stream = None
+    if opts.stream:
+        stream = _stream_layout(p, allowed, tick_times, difficulty, opts, rank)
+        allowed = stream["break_allowed"]
 
     lo0, hi0 = THETA_RANGE
-    want_nps = float(style[1]) * 16.0 if style[1] >= 0 else None
-    expected = float(p[allowed].sum()) * DENSITY_SCALE.get(difficulty, 1.0)
+    local = window is not None or stream is not None
+    want_nps = float(style[1]) * 16.0 if (style[1] >= 0 and not local) else None
+    scale = DENSITY_SCALE.get(difficulty, 1.0) if density_scale is None else float(density_scale)
+    expected = float(p[allowed].sum()) * scale * float(opts.density)
     metric = _metric_weight(t, difficulty)
     if want_nps is not None:
         want_nps = min(want_nps, b.max_nps_4s)
     playable_s = max(0.0, duration_s - PLAYABLE_TAIL_S
                      - float(tick_times[min(t - 1, int(FIRST_PLAYABLE_BEAT * 12))]))
     cand = np.nonzero(allowed)[0]
-    energy = None
-    if energy_per_bar is not None and len(energy_per_bar) > 2:
-        energy = np.asarray(energy_per_bar, np.float64)
-        rank = np.argsort(np.argsort(energy)) / max(1, len(energy) - 1)     # 0..1
-        bar = np.minimum(k // C.G, len(energy) - 1)
+    energy = None if rank is None else np.asarray(energy_per_bar, np.float64)
 
     def select(weight: float):
         """Peak-pick and calibrate with the onset probability tilted toward
@@ -704,7 +965,7 @@ def decode_rhythm(logits: dict, tick_times: np.ndarray, difficulty: str,
             keep = _thin_to_peak_nps(tk, score[tk], tick_times, b.max_nps_4s)
             keep = _one_grid_per_beat(tk, score[tk], keep)
             keep, met = _cap_fine_share(tk, score[tk], keep, b.fine_frac)
-            keep = _cap_runs(tk, score[tk], keep, b.max_run)
+            keep = _cap_runs(tk, score[tk], keep, RUN_LIMIT.get(difficulty, b.max_run))
             if on_transient is not None:
                 keep, on_met = _cap_off_transient(tk, score[tk], keep, on_transient)
                 met = met and on_met
@@ -738,7 +999,7 @@ def decode_rhythm(logits: dict, tick_times: np.ndarray, difficulty: str,
         # failed one: if even the bottom of the threshold range selects almost
         # no notes (weights that barely fire on this audio), take the strongest
         # peaks down to a quarter of a note per second and say so in the stats.
-        floor = min(len(picked), max(8, int(0.25 * playable_s)))
+        floor = 0 if local else min(len(picked), max(8, int(0.25 * playable_s)))
         below = len(tk) < floor
         if below:
             tk = np.sort(picked[:floor])
@@ -757,9 +1018,13 @@ def decode_rhythm(logits: dict, tick_times: np.ndarray, difficulty: str,
     # follow the song's energy (the project's density-vs-energy gate).
     best = None
     weights, enough = ENERGY_TILT.get(difficulty, (ENERGY_WEIGHTS, MIN_ENERGY_CORR))
+    if local:
+        # the correlation is a whole-chart statistic; a part of the song takes
+        # the gentlest tilt and is not searched
+        weights = weights[:1]
     for weight in weights if energy is not None else (0.0,):
         tk, theta, met, below = select(weight)
-        corr = energy_corr(tk) if energy is not None and len(tk) else None
+        corr = energy_corr(tk) if energy is not None and len(tk) and not local else None
         if best is None or (corr is not None and corr > best[4]):
             best = (tk, theta, met, below, corr if corr is not None else 1.0, weight)
         if corr is None or corr >= enough:
@@ -768,19 +1033,29 @@ def decode_rhythm(logits: dict, tick_times: np.ndarray, difficulty: str,
     n_calibrated = len(ticks)
     stream_bars = 0
     meter = float(style[0]) * 15.0
-    if energy is not None and len(ticks) and (
+    if energy is not None and len(ticks) and not local and (
             difficulty == "challenge"
             or (difficulty == "hard" and meter >= STREAM_COMMIT_HARD_METER - 1e-6)):
         bar_rank = np.zeros(t // C.G + 2)
         bar_rank[:len(rank)] = rank
         ticks, stream_bars = _commit_streams(ticks, p, allowed, bar_rank, tick_times,
                                              b.max_nps_4s, min_gap_s(difficulty))
+    in_stream = np.zeros(0, bool)
+    if stream is not None:
+        ticks = np.union1d(ticks, stream["ticks"]).astype(np.int64)
+        in_stream = np.isin(ticks, stream["ticks"])
+    else:
+        in_stream = np.zeros(len(ticks), bool)
     n = len(ticks)
     stats = {"theta": round(float(theta), 4), "calibrated": n_calibrated, "notes": n,
              "below_threshold_range": bool(below_range), "fine_share_met": bool(fine_met),
              "target_nps": want_nps, "expected_count": round(expected, 1),
              "energy_weight": weight, "stream_bars": stream_bars,
-             "energy_corr": None if energy is None else round(corr, 3)}
+             "energy_corr": None if (energy is None or local) else round(corr, 3)}
+    if stream is not None:
+        stats["stream"] = stream["info"]
+    if opts.to_dict():
+        stats["options"] = opts.to_dict()
     if n == 0:
         z = np.zeros(0, np.int64)
         return RhythmPlan(z, z.astype(bool), z, z, z, stats)
@@ -789,10 +1064,14 @@ def decode_rhythm(logits: dict, tick_times: np.ndarray, difficulty: str,
     pj = sigmoid(logits["jump"][ticks].astype(np.float64))
     share = float(style[3]) if style[3] >= 0 else JUMP_SHARE_BOOST * float(pj.mean())
     stats["jump_share_model"] = round(float(pj.mean()), 4)
-    n_jump = int(math.floor(min(share, _JUMP_MAX_FRAC[b.jumps]) * n + 1e-9))
+    # shares are of the notes that can carry a jump or a freeze at all: in
+    # Stream mode that is the breaks, and the whole chart's share spent there
+    # would turn every break note into a jump
+    n_open = int((~in_stream).sum())
+    n_jump = int(math.floor(min(share, _JUMP_MAX_FRAC[b.jumps]) * n_open + 1e-9))
     is_jump = np.zeros(n, bool)
     if n_jump > 0:
-        ok = ticks % _JUMP_TICKS[b.jumps] == 0
+        ok = (ticks % _JUMP_TICKS[b.jumps] == 0) & ~in_stream
         spacing = _JUMP_MIN_SPACING_BEATS[b.jumps] * C.TICKS_PER_BEAT
         taken = []
         for i in np.argsort(-pj, kind="stable"):
@@ -810,7 +1089,7 @@ def decode_rhythm(logits: dict, tick_times: np.ndarray, difficulty: str,
     # floor, not round: 8 freezes in 95 notes is 8.4%, over an 8% ceiling. The
     # tier's share is the only limit: its fixed count (max_holds, written for
     # the LLM designer) held a 400-note Hard chart to 3% freezes.
-    n_hold = int(math.floor(min(share, b.hold_share[1]) * n + 1e-9))
+    n_hold = int(math.floor(min(share, b.hold_share[1]) * n_open + 1e-9))
     flavor = np.zeros(n, np.int64)
     dur = np.zeros(n, np.int64)
     if n_hold > 0:
@@ -827,6 +1106,8 @@ def decode_rhythm(logits: dict, tick_times: np.ndarray, difficulty: str,
             if placed >= n_hold or p_hold[i] < 0.02:
                 break
             kind = int(kinds[i])
+            if in_stream[i]:
+                continue
             if is_jump[i] and not TierRules.for_difficulty(difficulty).jump_holds:
                 continue
             start = int(ticks[i])
@@ -846,7 +1127,8 @@ def decode_rhythm(logits: dict, tick_times: np.ndarray, difficulty: str,
                 # note too soon after the first would be a one-footed jack
                 rushed = (last_inside is not None and
                           tick_times[ticks[j]] - tick_times[last_inside] < PINNED_MIN_GAP_S)
-                stop = (is_jump[j] or flavor[j] > 0 or inside >= limit or rushed)
+                stop = (is_jump[j] or flavor[j] > 0 or inside >= limit or rushed
+                        or in_stream[j])
                 if stop:
                     end = int(ticks[j]) - HOLD_RELEASE_TICKS
                     break
@@ -877,7 +1159,7 @@ def decode_rhythm(logits: dict, tick_times: np.ndarray, difficulty: str,
         # ...and not within a beat of a 16th run: a mine beside a burst is a
         # trap for a foot that is already committed
         gap = np.diff(ticks)
-        fast = np.zeros(n, bool)
+        fast = in_stream.copy()
         fast[:-1] |= gap <= 3
         fast[1:] |= gap <= 3
         for s in ticks[fast]:
@@ -1018,7 +1300,7 @@ def constrained_viterbi(unary: np.ndarray, dtb: np.ndarray, is_jump: np.ndarray,
     `clamp`, (N, 32, 20) bool, restricts individual notes to given tokens per
     state — used by inpainting to hold everything outside the section to its
     existing panels. Clamped notes are scored on discomfort alone and keep
-    only the physical rules.
+    the physical rules plus the ban on unforced double-steps.
 
     `ban`, (N, 20) bool, removes individual tokens at individual notes (the
     QA veto loop); `panel_bias`, (4,), adds that many nats per press of each
@@ -1064,6 +1346,12 @@ def constrained_viterbi(unary: np.ndarray, dtb: np.ndarray, is_jump: np.ndarray,
             clamped = clamp is not None and clamp[j].any()
             if clamped:
                 ok = clamp[j][sq_s] & ~bad
+                if rules.no_double_step and not soft[j]:
+                    # the one tier rule that is about feet and not panels: the
+                    # kept part of a chart was written without an unforced
+                    # double-step, and stays readable without one
+                    free_other = ((lb >> (1 - sq_fl)) & 1) == 0
+                    ok &= ~(g["dstep"][sq_s] & free_other[:, None])
                 gain = -lam * cost
             else:
                 ok = (g["jump_tok"][None, :] == bool(is_jump[j])) & ~bad
@@ -1217,6 +1505,25 @@ def token_rows(tokens: np.ndarray, f_init: int) -> list:
 # --------------------------------------------------------------------------- #
 # Stage B decode
 # --------------------------------------------------------------------------- #
+#: Most crossover steps a Stream-mode chart may have, as a share of its single
+#: steps, unless the crossover slider asks for more. Left alone, one stream of
+#: a real song came out at 15% (Challenge, 8ths); the human charts the model
+#: was trained on that are mostly long runs have 4% at the median and 9-11% at
+#: the 90th percentile. Over the cap, the path is solved again with crossovers
+#: costing more — by these steps, gently first, so the chart lands under the
+#: cap rather than at none at all.
+STREAM_MAX_CROSS = 0.10
+STREAM_CROSS_STEPS = (0.5, 1.0, 2.0, 4.0, 8.0)
+
+
+def _cross_share(tokens: np.ndarray) -> float:
+    """Share of single steps that are crossover steps (the style vector's
+    `crossover_share`)."""
+    tok = np.asarray(tokens, np.int64)
+    single = tok < 8
+    return float((single & ((tok & 3) == C.CROSS)).sum() / max(1, int(single.sum())))
+
+
 def committed_unary(logp: np.ndarray, sampled: np.ndarray) -> np.ndarray:
     """Unaries for the Viterbi from a finished unmasking pass: 0 for the
     committed token, log p - COMMIT_BONUS for every other. Alternatives are
@@ -1347,7 +1654,8 @@ class StepManiaNeuralEngine:
                  tau: float = DEFAULT_TAU, energy_per_bar=None,
                  f_init: int | None = None, has_stems: bool = False,
                  progress=None, veto=None, balance: bool = True,
-                 on_transient: np.ndarray | None = None) -> NeuralChart:
+                 on_transient: np.ndarray | None = None,
+                 options: DecodeOptions | None = None) -> NeuralChart:
         """One chart for one difficulty. `style` is the 10-D vector from
         conditioning.resolve_style (masked fields = let the model decide).
 
@@ -1355,16 +1663,21 @@ class StepManiaNeuralEngine:
         individual notes; each is banned at that note and the foot path
         re-solved (the StepMania pipeline passes the project's flow-ceiling
         gate). `balance` nudges the path until every panel carries 15-35% of
-        the arrows, the project's panel-balance gate."""
-        rules = TierRules.for_difficulty(difficulty)
+        the arrows, the project's panel-balance gate. `options` are the
+        user's decoder settings (subdivision cap, Stream mode, no crossovers)."""
+        opts = options or DecodeOptions()
+        rules = TierRules.for_difficulty(difficulty, crossovers=opts.crossovers)
         cv = self.cond_for(style, has_stems)
         if progress:
             progress("rhythm")
         plan = decode_rhythm(self.model.rhythm(x, cv), tick_times, difficulty, style,
-                             duration_s, energy_per_bar, on_transient)
+                             duration_s, energy_per_bar, on_transient, options=opts,
+                             density_scale=self.model.density_scale(difficulty))
         n = len(plan.tick)
         stats = {"rhythm": plan.stats, "difficulty": difficulty, "seed": seed,
                  "tau": tau, "quantization": self.model.quantization}
+        if opts.to_dict():
+            stats["options"] = opts.to_dict()
         if n == 0:
             enc = _encoded_from(plan, np.zeros(0, np.uint8), C.LEFT,
                                 np.zeros((0, 2), np.int32))
@@ -1382,58 +1695,80 @@ class StepManiaNeuralEngine:
         dt = np.concatenate([[1e9], np.diff(times_ms)])
         dt_s = dt / 1000.0
         slots, hold_kind = lock_schedule(plan.tick, plan.is_jump, plan.flavor, plan.dur)
-        args = dict(unary=unary, dtb=C.dt_bucket(dt), is_jump=plan.is_jump, slots=slots,
-                    hold_kind=hold_kind, rules=rules, f_init=f_init)
-        extra, base_no_repeat = timing_penalties(rules, style, dt_s)
-        args.update(extra)
-        ban = np.zeros((n, C.N_TOKENS), bool)
-        bias = np.zeros(4)
-        rounds, best = 0, None
-        want_balance = balance and n >= MIN_NOTES_FOR_BALANCE
-        for _ in range(MAX_BALANCE_ROUNDS + 1):
-            # inner loop: re-solve until the caller's referee has no objection
-            clean = True
-            for _ in range(MAX_VETO_ROUNDS):
-                res = enforce_run_limit(dict(args, ban=ban, panel_bias=bias),
-                                        plan.tick, rules, no_repeat=base_no_repeat)
-                enc = _encoded_from(plan, res.token, res.f_init,
-                                    np.zeros((0, 2), np.int32))
-                chart = NeuralChart(C.decode(enc), enc, stats)
-                rounds += 1
-                bad = [i for i in (veto(chart) if veto else ())
-                       if not ban[i, res.token[i]]]
-                clean = not bad
-                if clean:
+        def attempt(rules: TierRules):
+            """Solve the foot path under `rules`: re-solve until the caller's
+            referee has no objection, and nudge until the panels balance."""
+            args = dict(unary=unary, dtb=C.dt_bucket(dt), is_jump=plan.is_jump, slots=slots,
+                        hold_kind=hold_kind, rules=rules, f_init=f_init)
+            extra, base_no_repeat = timing_penalties(rules, style, dt_s)
+            args.update(extra)
+            ban = np.zeros((n, C.N_TOKENS), bool)
+            bias = np.zeros(4)
+            rounds, best = 0, None
+            want_balance = balance and n >= MIN_NOTES_FOR_BALANCE
+            for _ in range(MAX_BALANCE_ROUNDS + 1):
+                # inner loop: re-solve until the caller's referee has no objection
+                clean = True
+                for _ in range(MAX_VETO_ROUNDS):
+                    res = enforce_run_limit(dict(args, ban=ban, panel_bias=bias),
+                                            plan.tick, rules, no_repeat=base_no_repeat)
+                    enc = _encoded_from(plan, res.token, res.f_init,
+                                        np.zeros((0, 2), np.int32))
+                    chart = NeuralChart(C.decode(enc), enc, stats)
+                    rounds += 1
+                    bad = [i for i in (veto(chart) if veto else ())
+                           if not ban[i, res.token[i]]]
+                    clean = not bad
+                    if clean:
+                        break
+                    for i in bad:
+                        ban[i, res.token[i]] = True
+                share = panel_shares(chart.events)
+                excess = max(0.0, BALANCE_BAND[0] - share.min(), share.max() - BALANCE_BAND[1])
+                key = (not clean, excess if want_balance else 0.0)
+                if best is None or key < best[0]:
+                    best = (key, res, enc, chart, bias.copy())
+                if not want_balance or excess == 0.0:
                     break
-                for i in bad:
-                    ban[i, res.token[i]] = True
-            share = panel_shares(chart.events)
-            excess = max(0.0, BALANCE_BAND[0] - share.min(), share.max() - BALANCE_BAND[1])
-            key = (not clean, excess if want_balance else 0.0)
-            if best is None or key < best[0]:
-                best = (key, res, enc, chart, bias.copy())
-            if not want_balance or excess == 0.0:
-                break
-            # nudge only the panels that are out of band, and keep the starting
-            # foot fixed: the bias is in absolute panels, and a free parity lets
-            # the path dodge it by mirroring itself instead of rebalancing
-            out = (share < BALANCE_BAND[0]) | (share > BALANCE_BAND[1])
-            bias += BALANCE_STEP * np.where(out, (0.25 - share) / 0.25, 0.0)
-            args["f_init"] = res.f_init
-        _, res, enc, chart, bias = best
+                # nudge only the panels that are out of band, and keep the starting
+                # foot fixed: the bias is in absolute panels, and a free parity lets
+                # the path dodge it by mirroring itself instead of rebalancing
+                out = (share < BALANCE_BAND[0]) | (share > BALANCE_BAND[1])
+                bias += BALANCE_STEP * np.where(out, (0.25 - share) / 0.25, 0.0)
+                args["f_init"] = res.f_init
+            _, res, enc, chart, bias = best
+            return res, enc, chart, bias, rounds, int(ban.sum())
+
+        res, enc, chart, bias, rounds, vetoed = attempt(rules)
+        cross_scale = rules.cross_scale
+        if opts.stream and not rules.no_cross:
+            # A stream is one long run at one speed, and the sampler's taste for
+            # crossovers compounds over it: see STREAM_MAX_CROSS.
+            asked = float(style[5]) if style[5] >= 0 else 0.0
+            cap = max(STREAM_MAX_CROSS, asked)
+            for step in STREAM_CROSS_STEPS:
+                if _cross_share(res.token) <= cap:
+                    break
+                cross_scale = rules.cross_scale + step
+                r2 = attempt(dataclasses.replace(rules, cross_scale=cross_scale))
+                rounds += r2[4]
+                if _cross_share(r2[0].token) < _cross_share(res.token):
+                    res, enc, chart, bias, vetoed = r2[0], r2[1], r2[2], r2[3], r2[5]
         enc.mines = place_mines(plan.mine_tick, enc, seed)
         stats["choreo"] = {"viterbi_score": round(res.score, 2), "relaxed": res.relaxed,
                            "changed_by_viterbi": int((res.token != sampled).sum()),
                            "f_init": res.f_init, "refine_rounds": rounds,
-                           "vetoed": int(ban.sum()),
+                           "vetoed": vetoed,
                            "panel_bias": [round(float(v), 2) for v in bias]}
+        if cross_scale != rules.cross_scale:
+            stats["choreo"]["cross_scale"] = cross_scale
         return NeuralChart(C.decode(enc), enc, stats)
 
     def inpaint_section(self, events: C.ChartEvents, x: np.ndarray,
                         tick_times: np.ndarray, difficulty: str, style: np.ndarray,
                         start_bar: int, end_bar: int, *, seed: int = 0,
                         tau: float = DEFAULT_TAU, has_stems: bool = False,
-                        veto=None) -> NeuralChart:
+                        veto=None, crossovers: bool = True) -> NeuralChart:
         """Re-roll the choreography of bars [start_bar, end_bar) of an existing
         chart (spec §6.5 step 4). The rhythm — which ticks carry notes, and
         every freeze — is kept. Every note outside the section keeps its exact
@@ -1441,15 +1776,113 @@ class StepManiaNeuralEngine:
         identical there bit for bit even though its foot annotation is free to
         re-settle around the new section.
         """
-        rules = TierRules.for_difficulty(difficulty)
-        n = len(events)
-        times_ms = tick_times[np.minimum(events.tick, len(tick_times) - 1)] * 1000.0
-        base, _ = C.encode(events, times_ms)
         inside = (events.tick >= start_bar * C.G) & (events.tick < end_bar * C.G)
         stats = {"difficulty": difficulty, "seed": seed, "bars": [start_bar, end_bar],
                  "notes_in_section": int(inside.sum())}
+        chart = self._solve_inside(events, inside, x, tick_times, difficulty, style,
+                                   TierRules.for_difficulty(difficulty, crossovers=crossovers),
+                                   seed=seed, tau=tau,
+                                   has_stems=has_stems, veto=veto)
+        changed = int(sum(a != b for a, b in zip(chart.events.rows(), events.rows())))
+        chart.stats = {**stats, "changed": changed, **chart.stats}
+        return chart
+
+    def regenerate_section(self, events: C.ChartEvents, x: np.ndarray,
+                           tick_times: np.ndarray, difficulty: str, style: np.ndarray,
+                           start_bar: int, end_bar: int, duration_s: float, *,
+                           options: DecodeOptions | None = None, seed: int = 0,
+                           tau: float = DEFAULT_TAU, has_stems: bool = False,
+                           energy_per_bar=None, on_transient: np.ndarray | None = None,
+                           veto=None) -> NeuralChart:
+        """Write bars [start_bar, end_bar) of an existing chart again — rhythm
+        and arrows — with their own settings, and leave the rest alone.
+
+        Where `inpaint_section` keeps the notes and re-rolls only which panels
+        they are on, this decodes the range from the audio as `generate` would
+        a whole chart, under `style` and `options` (a subdivision cap, Stream
+        mode, more or fewer notes, no crossovers, a jump share). Every note
+        outside the range keeps its tick, panels and freezes bit for bit; the
+        foot path is solved across both boundaries, so the chart is as legal
+        going into and out of the range as anywhere else.
+
+        Freezes are the one place the two parts touch. A freeze of the outside
+        chart that is still held inside the range keeps its ticks clear of new
+        notes; a new freeze is released before the first note after the range.
+        """
+        opts = options or DecodeOptions()
+        rules = TierRules.for_difficulty(difficulty, crossovers=opts.crossovers)
+        lo_t, hi_t = int(start_bar) * C.G, int(end_bar) * C.G
+        n_ticks = len(tick_times)
+        old_inside = (events.tick >= lo_t) & (events.tick < hi_t)
+        keep = ~old_inside
+        gap_ticks = _min_gap_ticks(tick_times, difficulty)
+
+        # ticks the range may not use: under an outside freeze, or too close to
+        # the notes on either side of it
+        blocked = np.zeros(n_ticks, bool)
+        for p_, k_, d_ in ((events.p0, events.k0, events.d0), (events.p1, events.k1, events.d1)):
+            for i in np.nonzero(keep & (k_ > 0) & (d_ > 0))[0]:
+                a, b = int(events.tick[i]), int(events.tick[i] + d_[i]) + HOLD_RELEASE_TICKS
+                blocked[max(0, a):min(n_ticks, b + 1)] = True
+        for tk in events.tick[keep]:
+            a, b = int(tk) - gap_ticks + 1, int(tk) + gap_ticks
+            blocked[max(0, a):min(n_ticks, max(a, b))] = True
+
+        cv = self.cond_for(style, has_stems)
+        plan = decode_rhythm(self.model.rhythm(x, cv), tick_times, difficulty, style,
+                             duration_s, energy_per_bar, on_transient, options=opts,
+                             density_scale=self.model.density_scale(difficulty),
+                             window=(lo_t, hi_t), blocked=blocked)
+
+        # a new freeze ends before the chart that follows the range resumes
+        after = events.tick[keep & (events.tick >= hi_t)]
+        limit = (int(after[0]) if len(after) else n_ticks) - HOLD_RELEASE_TICKS
+        min_hold = int(round(BUDGETS[difficulty].hold_len_beats[0] * C.TICKS_PER_BEAT))
+        rows = [r for r, kp in zip(events.rows(), keep) if kp]
+        for i in range(len(plan.tick)):
+            tick, f, d = int(plan.tick[i]), int(plan.flavor[i]), int(plan.dur[i])
+            if f and tick + d > limit:
+                d = limit - tick
+                if d < min_hold:
+                    f, d = 0, 0
+            # placeholder panels: the solver below chooses the real ones
+            if plan.is_jump[i]:
+                ka, ks = C.FLAVOR_KINDS[f]
+                rows.append((tick, [(C.L, ka, d if ka else 0), (C.R, ks, d if ks else 0)]))
+            else:
+                kind = 0 if not f else (C.ROLL if f in (C.ROLL_ALT, C.ROLL_SAME) else C.HOLD)
+                rows.append((tick, [(C.L if i % 2 == 0 else C.R, kind, d if kind else 0)]))
+        mines = [tuple(m) for m in events.mines.tolist() if not lo_t <= m[0] < hi_t]
+        draft = C.ChartEvents.from_rows(rows, mines)
+        inside = (draft.tick >= lo_t) & (draft.tick < hi_t)
+        chart = self._solve_inside(draft, inside, x, tick_times, difficulty, style, rules,
+                                   seed=seed, tau=tau, has_stems=has_stems, veto=veto)
+        if len(plan.mine_tick):
+            chart.encoded.mines = np.asarray(sorted(
+                mines + [tuple(m) for m in place_mines(plan.mine_tick, chart.encoded, seed).tolist()]),
+                np.int32).reshape(-1, 2)
+            chart.events = C.decode(chart.encoded)
+        untouched = [r for r, kp in zip(events.rows(), keep) if kp]
+        now_outside = [r for r, ins in zip(chart.events.rows(), inside) if not ins]
+        if untouched != now_outside:
+            raise RuntimeError("re-generating the range changed a note outside it")
+        chart.stats = {"difficulty": difficulty, "seed": seed, "bars": [start_bar, end_bar],
+                       "notes_before": int(old_inside.sum()), "notes_in_section": int(inside.sum()),
+                       "rhythm": plan.stats, "options": opts.to_dict(), **chart.stats}
+        return chart
+
+    def _solve_inside(self, events: C.ChartEvents, inside: np.ndarray, x: np.ndarray,
+                      tick_times: np.ndarray, difficulty: str, style: np.ndarray,
+                      rules: TierRules, *, seed: int = 0, tau: float = DEFAULT_TAU,
+                      has_stems: bool = False, veto=None) -> NeuralChart:
+        """Choose the panels of the notes marked `inside`, holding every other
+        note of `events` to the panels it has. Returns the chart with stats
+        {'relaxed', 'refine_rounds', 'vetoed'}."""
+        n = len(events)
+        times_ms = tick_times[np.minimum(events.tick, len(tick_times) - 1)] * 1000.0
+        base, _ = C.encode(events, times_ms)
         if not inside.any():
-            return NeuralChart(events, base, {**stats, "changed": 0})
+            return NeuralChart(events, base, {"relaxed": 0, "refine_rounds": 0, "vetoed": 0})
         is_jump = events.p1 >= 0
         cv = self.cond_for(style, has_stems)
         ctx = EF.event_context(x, events.tick)
@@ -1495,16 +1928,20 @@ class StepManiaNeuralEngine:
         hold_kind = np.where(one_held, 5 + np.where(events.k0 > 0, events.p0, events.p1),
                              hold_kind)
         dt = np.concatenate([[1e9], np.diff(times_ms)])
+        # the tier's time-dependent rules (no fast repeated arrow below Medium,
+        # the footswitch cost) hold inside the section as in a whole chart
+        extra, no_repeat = timing_penalties(rules, style, dt / 1000.0)
         ban = np.zeros((n, C.N_TOKENS), bool)
         rounds = 0
         while True:
             res = constrained_viterbi(unary, C.dt_bucket(dt), is_jump, slots, hold_kind,
-                                      rules, clamp=clamp, ban=ban)
+                                      rules, clamp=clamp, ban=ban, no_repeat=no_repeat,
+                                      **extra)
             new = _rebuild_events(events, base, res, inside)
             enc = encoded_from_path(new, res)
             if not C.decode(enc).equals(new):
                 raise RuntimeError("inpainting produced an inconsistent foot path")
-            chart = NeuralChart(new, enc, stats)
+            chart = NeuralChart(new, enc, {})
             rounds += 1
             again = False
             if veto and rounds <= MAX_REFINE_ROUNDS:
@@ -1513,10 +1950,15 @@ class StepManiaNeuralEngine:
                         ban[i, res.token[i]] = again = True
             if not again:
                 break
-        changed = int(sum(a != b for a, b in zip(new.rows(), events.rows())))
-        chart.stats = {**stats, "changed": changed, "relaxed": res.relaxed,
-                       "refine_rounds": rounds, "vetoed": int(ban.sum())}
+        chart.stats = {"relaxed": res.relaxed, "refine_rounds": rounds,
+                       "vetoed": int(ban.sum())}
         return chart
+
+
+def _min_gap_ticks(tick_times: np.ndarray, difficulty: str) -> int:
+    """The tier's shortest gap between two notes, in ticks at this tempo."""
+    tick_s = float(np.median(np.diff(tick_times))) if len(tick_times) > 1 else 0.04
+    return max(1, int(math.ceil(min_gap_s(difficulty) / max(tick_s, 1e-6) - 1e-6)))
 
 
 def encoded_from_path(ev: C.ChartEvents, res: ViterbiResult) -> C.EncodedChart:

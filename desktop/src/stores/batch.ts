@@ -37,6 +37,7 @@ export const useBatch = defineStore("batch", {
       difficulties: string[];
       stylePreset?: string | null;
       styleJson?: string | null;
+      optionsJson?: string | null;
       pack?: string;
       install?: boolean;
     }) {
@@ -62,6 +63,7 @@ export const useBatch = defineStore("batch", {
               engine: opts.engine,
               stylePreset: opts.engine === "neural" ? opts.stylePreset : undefined,
               styleJson: opts.engine === "neural" ? opts.styleJson : undefined,
+              optionsJson: opts.engine === "neural" ? opts.optionsJson : undefined,
             });
             await new Promise<void>((resolve) => {
               const tick = window.setInterval(() => {

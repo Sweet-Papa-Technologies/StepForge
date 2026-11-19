@@ -26,9 +26,18 @@ const props = withDefaults(
     /** Bumped when the assist track was re-rendered at the SAME path (a section
      *  re-roll), so the webview fetches it again instead of replaying its cache. */
     rev?: number;
+    /** Let the user mark a bar range from the playback position (the
+     *  "Edit a section" panel on Results): shows the bar now playing and the
+     *  two mark buttons. */
+    selectable?: boolean;
+    /** The marked range, in bars (0-based, end exclusive), drawn on the
+     *  notefield and the progress bar. */
+    rangeStart?: number | null;
+    rangeEnd?: number | null;
   }>(),
-  { autoplay: true, assistPath: null, rev: 0 },
+  { autoplay: true, assistPath: null, rev: 0, selectable: false, rangeStart: null, rangeEnd: null },
 );
+const emit = defineEmits<{ (e: "mark-start", bar: number): void; (e: "mark-end", bar: number): void }>();
 
 const canvas = ref<HTMLCanvasElement | null>(null);
 const wrap = ref<HTMLDivElement | null>(null);
@@ -60,6 +69,30 @@ const hasAssist = computed(() => !!assistUrl.value);
 const activeUrl = computed(() =>
   assist.value && assistUrl.value ? assistUrl.value : songUrl.value,
 );
+
+/* ------------------------------ bar range -------------------------------- */
+/** Seconds per bar (the emitted simfile is 4/4 at one tempo), or 0 if unknown. */
+const barSeconds = computed(() => {
+  const bpm = props.chart?.bpm ?? 0;
+  return bpm > 0 ? 240 / bpm : 0;
+});
+function barAt(t: number): number {
+  const s = barSeconds.value;
+  if (!s) return 0;
+  return Math.max(0, Math.floor((t - (props.chart?.beat0Time ?? 0)) / s + 1e-6));
+}
+function barTime(bar: number): number {
+  return (props.chart?.beat0Time ?? 0) + bar * barSeconds.value;
+}
+const currentBar = computed(() => barAt(current.value));
+/** The marked range as a band on the progress bar (percent of the song). */
+const rangeBand = computed(() => {
+  const s = props.rangeStart, e = props.rangeEnd;
+  if (s == null || e == null || e <= s || !duration.value || !barSeconds.value) return null;
+  const a = Math.max(0, Math.min(1, barTime(s) / duration.value));
+  const b = Math.max(0, Math.min(1, barTime(e) / duration.value));
+  return b > a ? { left: `${a * 100}%`, width: `${(b - a) * 100}%` } : null;
+});
 
 const COL_COLORS = ["#ff5d8f", "#00eefc", "#c084fc", "#7dd3a0"];
 const COL_ROT = [Math.PI, Math.PI / 2, -Math.PI / 2, 0]; // left, down, up, right
@@ -231,13 +264,31 @@ function frame() {
   const beat0 = props.chart?.beat0Time ?? 0;
   if (bpm > 0) {
     const spb = 60 / bpm;
+    // the marked bar range, as a tint behind the notes
+    const rs = props.rangeStart, re = props.rangeEnd;
+    if (rs != null && re != null && re > rs) {
+      const top = Math.max(RECEPTOR_Y, RECEPTOR_Y + (beat0 + rs * 4 * spb - t) * speed.value);
+      const bottom = Math.min(cssH, RECEPTOR_Y + (beat0 + re * 4 * spb - t) * speed.value);
+      if (bottom > top) {
+        ctx.fillStyle = "rgba(188,19,254,0.10)";
+        ctx.fillRect(x0, top, fieldW, bottom - top);
+      }
+    }
     const first = Math.floor((t - beat0) / spb);
     const span = Math.ceil((cssH - RECEPTOR_Y) / (spb * speed.value)) + 2;
+    ctx.font = "10px 'JetBrains Mono Variable', monospace";
+    ctx.textAlign = "right";
+    ctx.textBaseline = "middle";
     for (let b = first; b < first + span; b++) {
       const y = RECEPTOR_Y + (beat0 + b * spb - t) * speed.value;
       if (y < RECEPTOR_Y || y > cssH) continue;
       ctx.fillStyle = b % 4 === 0 ? "rgba(255,255,255,0.13)" : "rgba(255,255,255,0.05)";
       ctx.fillRect(x0, y, fieldW, 1);
+      // bar numbers, counted from 0 as the section editor counts them
+      if (props.selectable && b >= 0 && b % 4 === 0) {
+        ctx.fillStyle = "rgba(255,255,255,0.38)";
+        ctx.fillText(String(b / 4), x0 - 8, y);
+      }
     }
   }
 
@@ -377,8 +428,37 @@ onBeforeUnmount(() => {
           class="absolute left-0 top-0 h-full bg-primary-container rounded-full"
           :style="{ width: (duration ? (current / duration) * 100 : 0) + '%' }"
         ></div>
+        <div
+          v-if="rangeBand"
+          class="absolute top-0 h-full bg-secondary-container/70 pointer-events-none"
+          :style="rangeBand"
+          title="The marked section"
+        ></div>
       </div>
       <span class="font-label-mono text-label-mono text-on-surface-variant w-12">{{ fmtDuration(duration) }}</span>
+
+      <!-- Mark a section from where the song is now (Results: "Edit a section") -->
+      <div v-if="selectable && barSeconds" class="flex items-center gap-1 shrink-0">
+        <span class="font-label-mono text-[10px] uppercase tracking-wider text-on-surface-variant" title="The bar now playing, counted from 0">
+          Bar {{ currentBar }}
+        </span>
+        <button
+          type="button"
+          class="px-2 py-1 rounded border border-outline-variant text-on-surface-variant hover:text-on-surface hover:bg-surface-variant font-label-mono text-[10px] uppercase"
+          title="Start the section at the bar now playing"
+          @click="emit('mark-start', currentBar)"
+        >
+          Start here
+        </button>
+        <button
+          type="button"
+          class="px-2 py-1 rounded border border-outline-variant text-on-surface-variant hover:text-on-surface hover:bg-surface-variant font-label-mono text-[10px] uppercase"
+          title="End the section with the bar now playing"
+          @click="emit('mark-end', currentBar + 1)"
+        >
+          End here
+        </button>
+      </div>
 
       <!-- Assist ticks: on by default, seamless mid-song toggle -->
       <label

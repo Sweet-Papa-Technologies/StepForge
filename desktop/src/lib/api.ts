@@ -46,10 +46,14 @@ export const api = {
     stylePreset?: string | null;
     /** Neural engine only: a JSON object of just the sliders the user set. */
     styleJson?: string | null;
+    /** Neural engine only: decoder options (lib/decodeOptions.optionsJson). */
+    optionsJson?: string | null;
   }) => invoke<void>("generate_charts", opts),
   /** Re-roll bars `startBar..endBar` (0-based, end exclusive) of an existing
-   *  neural chart in place, in the style the chart was generated with (the
-   *  engine reads it back from report.json). */
+   *  neural chart in place, starting from the style the chart was generated
+   *  with (the engine reads it back from report.json). With `regenerate` the
+   *  notes of the range are written again, not only their arrows, under
+   *  `styleJson` / `optionsJson` given for that range alone. */
   inpaintChart: (opts: {
     jobId: string;
     trackId: string;
@@ -57,6 +61,9 @@ export const api = {
     startBar: number;
     endBar: number;
     seed?: number | null;
+    regenerate?: boolean;
+    styleJson?: string | null;
+    optionsJson?: string | null;
   }) => invoke<void>("inpaint_chart", opts),
   cancelJob: (jobId: string) => invoke<boolean>("cancel_job", { jobId }),
 

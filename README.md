@@ -17,11 +17,16 @@
 Drop in a song, and StepForge writes Beginner through Challenge charts for it in
 a few seconds, then installs them straight into ITGmania. The charting is done by
 **StepForge Flow**, a small neural model that ships inside the app and runs on
-your CPU: no account, no API key, no upload, no per-song cost.
+your CPU: no account, no API key, no upload, no per-song cost. (The one thing
+the app asks the network for is the list of StepForge releases when it starts,
+so it can tell you a newer version is out. Nothing about you or your songs is
+sent, and Settings has a switch to turn it off.)
 
 > **Beta.** StepForge is new. Expect rough edges, and tell us about them on
-> [Discord](https://discord.gg/kFHgCKr5E3) or in
-> [Issues](https://github.com/Sweet-Papa-Technologies/StepForge/issues).
+> [Discord](https://discord.gg/kFHgCKr5E3), in
+> [Issues](https://github.com/Sweet-Papa-Technologies/StepForge/issues), or
+> with **Send feedback** and **Report this chart** inside the app (they open a
+> prefilled issue in your browser for you to review; nothing is sent for you).
 
 <p align="center">
   <img src="docs/media/gameplay.gif" alt="A StepForge chart played in ITGmania" width="80%"><br>
@@ -64,8 +69,12 @@ the charts.
   on real 4th / 8th / 16th / triplet positions, and follows the song's energy:
   calm verses, busy choruses.
 - **Your style.** Sliders and presets for density, streams, jumps, freezes,
-  crossovers, jacks and mines, or leave them for the model to choose. Re-roll any
-  section you don't like.
+  crossovers, jacks and mines, or leave them for the model to choose.
+- **Your rhythm.** Cap a chart at 4ths, 8ths or 16ths, or switch on Stream mode
+  for unbroken runs at one subdivision with real breaks between them.
+- **Fix one part, keep the rest.** Mark a range of bars in the player and give
+  it new arrows, or write it again with its own settings (subdivision, density,
+  jumps, crossovers). Nothing outside the range changes.
 - **Preview before you play** in the built-in note player, then install the song
   into a pack in ITGmania with one click.
 - **Imports** WAV, MP3, FLAC and OGG out of the box (other formats with
@@ -78,19 +87,23 @@ human charts, and compared step by step.
 
 | 180 held-out songs | StepForge Flow v1.4 | Best open-source auto-charter tested | Two humans |
 |---|---:|---:|---:|
-| Steps placed where the human charter put one (F1, ±20 ms) | 0.656 | 0.674 | ≈ 0.75 |
-| … Beginner | 0.519 | 0.587 | |
-| … Hard / Challenge | 0.714 / 0.726 | 0.703 / 0.712 | |
-| … on the 120 songs never used for tuning | 0.645 | 0.671 | |
+| Steps placed where the human charter put one (F1, ±20 ms) | 0.671 | 0.674 | ≈ 0.75 |
+| … Beginner | 0.562 | 0.587 | |
+| … Hard / Challenge | 0.714 / 0.732 | 0.703 / 0.712 | |
+| … on the 120 songs never used for tuning | 0.663 | 0.671 | |
+| Notes written, relative to the human chart | 1.06× | 1.34× | |
 | Chart statistics inside the human range | **98%** | 90% | 94% |
 | Unforced double-steps | **0.01%** of steps | 1.04% | 0.35% |
 
 StepForge is level with the best open-source tool on step placement overall,
-slightly ahead at Hard and Challenge (not statistically significant), and
-clearly cleaner to play. Beginner is its weakest difficulty today, and the one
-where it is clearly behind. Some decoder settings were tuned on 60 of the 180
-songs; on the other 120 the picture is the same (0.645 vs 0.671, not
-significant). Details: [model card](models/stepforge_flow/MODEL_CARD.md).
+slightly ahead at Medium, Hard and Challenge (not statistically significant),
+and clearly cleaner to play. Beginner is still its weakest difficulty. Some
+decoder settings were tuned on 60 of the 180 songs; on the other 120 the picture
+is the same (0.663 vs 0.671, not significant). These are the numbers for
+0.1.0-beta.9 and later; earlier betas used the same model with an older decoder
+and scored 0.656, mostly because they wrote too many notes at Beginner and Easy
+and sat half a beat off the music on about one song in eight. Details:
+[model card](models/stepforge_flow/MODEL_CARD.md).
 
 We also checked for memorization. StepForge doesn't reproduce its training
 charts (its longest exact copy of one is 9 steps), and it carries fewer

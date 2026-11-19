@@ -116,5 +116,15 @@
     },
     "stage_a_epoch": 44,
     "stage_b_epoch": 120
+  },
+  "decoder": {
+    "phase_rule": "vote",
+    "density_scale": {
+      "beginner": 0.52,
+      "easy": 0.73,
+      "medium": 0.85,
+      "hard": 0.87,
+      "challenge": 0.9
+    }
   }
 }
