@@ -180,9 +180,9 @@ export interface NeuralStatus {
   style_rag_available: boolean;
   presets: string[];
   codec_version: string | null;
-  /** The model's release, from model_meta.json (e.g. "1.4"); null if unstated. */
+  /** The model's release, from model_meta.json (e.g. "1.5"); null if unstated. */
   version: string | null;
-  /** Its name for display (e.g. "StepForge Flow v1.4"); null if unstated. */
+  /** Its name for display (e.g. "StepForge Flow v1.5"); null if unstated. */
   display_name: string | null;
   trained_with_stems: boolean;
   params: { stage_a: number; stage_b: number } | null;

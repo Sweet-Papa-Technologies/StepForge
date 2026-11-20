@@ -71,6 +71,16 @@ def val_score(m: dict) -> float:
     return 0.50 * m["ap"] + 0.25 * m["f1_hard16"] + 0.25 * m["phase_acc"]
 
 
+def polish_score(m: dict) -> float:
+    """`val_score` with precision at the chart's own note count in place of
+    AP. AP peaks around epoch 20 and then falls while the charts the network
+    would actually write (same number of notes as the human chart) stay as
+    good and its 16ths get better, so `val_score` always chose a checkpoint
+    from before the low-learning-rate phase had begun. This one is only
+    consulted in that phase (`--select polish_score`)."""
+    return 0.50 * m["r_prec"] + 0.25 * m["f1_hard16"] + 0.25 * m["phase_acc"]
+
+
 @torch.no_grad()
 def phase_eval(model, songs: list, device, amp: str, crop: int = CROP_TICKS) -> dict:
     """The decoder's half-beat question, asked of every validation song with
@@ -261,8 +271,16 @@ def main(argv=None):
                          "off the grid (v1.5: 0.25)")
     ap.add_argument("--phase-shift-weight", type=float, default=0.5,
                     help="weight of the ordinary loss on those shifted crops")
-    ap.add_argument("--select", choices=["auto", "r_prec", "val_score"], default="auto",
-                    help="checkpoint metric (auto: val_score with --corpus-root)")
+    ap.add_argument("--select", choices=["auto", "r_prec", "val_score", "polish_score"],
+                    default="auto",
+                    help="checkpoint metric (auto: val_score with --corpus-root). "
+                         "polish_score only considers the epochs of phase 2 and also "
+                         "keeps the best val_score of any epoch as best_early.pt")
+    ap.add_argument("--mirror-dir",
+                    help="also copy checkpoints, log and config here (a mounted drive): "
+                         "best.pt whenever it improves, everything at the end of each "
+                         "phase, last.pt every --mirror-every epochs")
+    ap.add_argument("--mirror-every", type=int, default=10)
     ap.add_argument("--stems-val-every", type=int, default=5)
     ap.add_argument("--d-model", type=int, default=256)
     ap.add_argument("--layers", type=int, default=6)
@@ -285,7 +303,10 @@ def main(argv=None):
                        dropout=args.dropout)
     train_ds, val_songs, desc = build_training_set(args)
     run = tc.RunDir(args.out, {"stage": "a", "model": cfg.to_dict(), "args": vars(args),
-                               "data": desc, "select": select})
+                               "data": desc, "select": select}, mirror=args.mirror_dir)
+    # polish_score waits for the low-learning-rate phase (the last third of a
+    # one-phase run)
+    first_polish = args.phase1_epochs if mixed else (2 * epochs) // 3
     # validation the way the app runs: no stem channels
     val_ds = StageADataset(val_songs, args.crop, False, args.seed, stems="off")
     has_stems = any(s.stems is not None for s in val_songs)
@@ -302,12 +323,13 @@ def main(argv=None):
     steps_per_epoch = max(1, len(train_dl))
     total = epochs * steps_per_epoch
     steps1 = args.phase1_epochs * steps_per_epoch
-    step, start_epoch, best = 0, 0, -1.0
+    step, start_epoch, best, best_early = 0, 0, -1.0, -1.0
     state = run.load("last")
     if state:
         model.load_state_dict(state["model"])
         opt.load_state_dict(state["opt"])
         step, start_epoch, best = state["step"], state["epoch"] + 1, state["best"]
+        best_early = state.get("best_early", -1.0)
         print(f"[train] resumed at epoch {start_epoch}, step {step}", flush=True)
     print(f"[train] RhythmNet {model.n_params / 1e6:.2f}M params on {device}; "
           f"{len(train_ds)} train items / {len(val_ds)} val charts; "
@@ -373,6 +395,7 @@ def main(argv=None):
         val = evaluate(model, val_dl, device, args.amp, args)
         val.update(phase_eval(model, val_songs, device, args.amp, args.crop))
         val["val_score"] = val_score(val)
+        val["polish_score"] = polish_score(val)
         row = {"epoch": epoch, "step": step, "phase": 2 if mixed and epoch >= args.phase1_epochs
                else 1,
                **{f"train_{k}": v / max(1, n_acc) for k, v in acc.items()},
@@ -385,10 +408,22 @@ def main(argv=None):
         run.log(**row)
         ckpt = dict(model=model.state_dict(), config=cfg.to_dict(), epoch=epoch,
                     step=step, val=val, args=vars(args))
-        if val[select] > best:
+        if select == "polish_score":
+            if val["val_score"] > best_early:
+                best_early = val["val_score"]
+                run.save("best_early", **ckpt)
+            eligible = epoch >= first_polish or last_epoch
+        else:
+            eligible = True
+        if eligible and val[select] > best:
             best = val[select]
             run.save("best", **ckpt)
-        run.save("last", opt=opt.state_dict(), best=best, **ckpt)
+            run.sync("best")
+        run.save("last", opt=opt.state_dict(), best=best, best_early=best_early, **ckpt)
+        if last_epoch or (mixed and epoch == args.phase1_epochs - 1):
+            run.sync("best", "best_early", "last")       # end of a phase
+        elif args.mirror_every and (epoch + 1) % args.mirror_every == 0:
+            run.sync("last")                             # something to resume from
         if args.max_steps and step >= args.max_steps:
             break
     print(f"[train] done; best val {select} {best:.4f}", flush=True)

@@ -85,29 +85,35 @@ the charts.
 We charted 180 songs that have human-made charts, without showing StepForge the
 human charts, and compared step by step.
 
-| 180 held-out songs | StepForge Flow v1.4 | Best open-source auto-charter tested | Two humans |
+| 180 held-out songs | StepForge Flow v1.5 | Best open-source auto-charter tested | Two humans |
 |---|---:|---:|---:|
-| Steps placed where the human charter put one (F1, ±20 ms) | 0.671 | 0.674 | ≈ 0.75 |
-| … Beginner | 0.562 | 0.587 | |
-| … Hard / Challenge | 0.714 / 0.732 | 0.703 / 0.712 | |
-| … on the 120 songs never used for tuning | 0.663 | 0.671 | |
+| Steps placed where the human charter put one (F1, ±20 ms) | **0.689** | 0.674 | ≈ 0.75 |
+| … Beginner | 0.606 | 0.587 | |
+| … Hard / Challenge | 0.715 / 0.730 | 0.703 / 0.712 | |
+| … on the 120 songs never used for tuning | 0.685 | 0.671 | |
 | Notes written, relative to the human chart | 1.06× | 1.34× | |
-| Chart statistics inside the human range | **98%** | 90% | 94% |
-| Unforced double-steps | **0.01%** of steps | 1.04% | 0.35% |
+| Chart statistics inside the human range | **97%** | 90% | 94% |
+| Unforced double-steps | **none** | 1.04% of steps | 0.35% |
 
-StepForge is level with the best open-source tool on step placement overall,
-slightly ahead at Medium, Hard and Challenge (not statistically significant),
-and clearly cleaner to play. Beginner is still its weakest difficulty. Some
-decoder settings were tuned on 60 of the 180 songs; on the other 120 the picture
-is the same (0.663 vs 0.671, not significant). These are the numbers for
-0.1.0-beta.9 and later; earlier betas used the same model with an older decoder
-and scored 0.656, mostly because they wrote too many notes at Beginner and Easy
-and sat half a beat off the music on about one song in eight. Details:
+StepForge is ahead of the best open-source tool on step placement at every
+difficulty. Overall the lead (0.015) is too small for 180 songs to tell from
+level; at Medium it is real. It is also clearly cleaner to play. Beginner is
+still its weakest difficulty. Some decoder settings were tuned on 60 of the 180
+songs; on the other 120 the picture is the same (0.685 vs 0.671).
+
+These are the numbers for 0.1.0-beta.10 and later, which ship StepForge Flow
+v1.5. Earlier betas shipped v1.4, which scored 0.671 at its best (0.562 at
+Beginner); the gain is larger than chance on these songs. v1.5 is trained on the same songs as
+v1.4. What changed is how: the rhythm network learned to tell which half of the
+beat the grid sits on, and the step network learned to follow the crossover and
+jack sliders, which did nothing measurable before. Details:
 [model card](models/stepforge_flow/MODEL_CARD.md).
 
 We also checked for memorization. StepForge doesn't reproduce its training
-charts (its longest exact copy of one is 9 steps), and it carries fewer
-training patterns into new songs than human step artists do. See the
+charts (its longest exact copy of one is 8 steps), and it carries fewer
+training patterns into new songs than human step artists do. It does place
+steps a little better on the songs it trained on than on new ones, mostly at
+Beginner and Easy. See the
 [model card](models/stepforge_flow/MODEL_CARD.md#memorization-check).
 
 ## How it works
@@ -127,7 +133,7 @@ original design plan is in
 
 ### Training data and credits
 
-StepForge Flow v1.4 learned from 254 songs and their charts from the StepMix 1–5
+StepForge Flow v1.5 learned from 254 songs and their charts from the StepMix 1–5
 community contest packs, OutFox Serenity and the StepMania 5 default songs. Every
 song, its musicians and step artists, and its license are listed in
 [`CREDITS.csv`](models/stepforge_flow/CREDITS.csv). Thank you to all of them.

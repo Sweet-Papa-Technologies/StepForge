@@ -30,6 +30,23 @@ It also reports, without changing anything, how many 16th notes a Hard and a
 Challenge chart carry next to the human charts — the check that a model
 trained to use them does.
 
+**Energy tilt at Beginner and Easy** (`--fit-energy-tilt`, off by default). The
+decoder leans a chart's notes toward the song's louder bars, harder if the
+chart would otherwise not follow the song's energy (a QA gate). A rhythm
+network trained longer is surer of itself and the engine's steepest lean no
+longer moves it; if fewer than 98 % of the tuning songs' Beginner and Easy
+charts pass the gates, longer ladders are tried and the mildest that restores
+the pass rate without costing placement is stored as `decoder.energy_tilt`.
+
+**16th-note figures at Hard** (`--fit-sixteenths`, off by default). The
+decoder can promote 16ths between two notes a Hard chart already has
+(`infer._promote_sixteenths`); how hard is `decoder.hard_sixteenth_boost`, an
+odds multiplier. The smallest value is taken at which the median Hard chart
+has `--sixteenth-target` of the median human Hard chart's 16ths — but only if
+step placement against the human charts stays within `--sixteenth-f1-loss` of
+what it is without the boost and as many charts pass the QA gates. If no
+value does both, none is stored.
+
 Without `--write` nothing is changed: the fitted values are printed and saved
 beside the cache for inspection.
 """
@@ -45,6 +62,7 @@ from pathlib import Path
 import numpy as np
 
 from .... import dsp
+from .. import qa as sm_qa
 from ..grammar import ALL_DIFFICULTIES
 from . import codec as C
 from . import grid_features as GF
@@ -55,6 +73,17 @@ MARGINS = tuple(round(0.2 + 0.1 * i, 1) for i in range(19))        # 0.2 .. 2.0
 SCALE_RANGE = (0.30, 1.50)
 MAX_TEMPO_MISMATCH = 0.005
 HALF_BEAT_WINDOW = 0.15            # beats: how near 0 or 0.5 a phase must be to count
+#: Odds multipliers tried for `decoder.hard_sixteenth_boost`, smallest first.
+SIXTEENTH_BOOSTS = (1.5, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 16.0, 24.0, 32.0)
+SIXTEENTH_TARGET = 0.55            # share of the human median to reach
+SIXTEENTH_F1_LOSS = 0.005          # placement F1 it may cost at most
+PLACEMENT_TOL_S = 0.020
+#: Ladders of energy-tilt weights tried for the two lowest tiers
+#: (`decoder.energy_tilt`), mildest first; each only extends the engine's own.
+LOW_TIER_TILTS = ((1.5, 3.0, 5.0, 8.0), (1.5, 3.0, 6.0, 12.0))
+LOW_TIERS = ("beginner", "easy")
+GATE_PASS_TARGET = 0.98
+TILT_F1_LOSS = 0.005
 _ENGINE = None
 
 
@@ -116,6 +145,35 @@ def sixteenths(ticks: np.ndarray) -> int:
     return int(((t % 3 == 0) & (t % 6 != 0)).sum())
 
 
+def placement_f1(times: np.ndarray, truth: np.ndarray, tol: float = PLACEMENT_TOL_S
+                 ) -> float | None:
+    """Step-placement F1 against a human chart of the same song, +-`tol`
+    seconds, one note matched to one note, after removing the one constant
+    offset between the two charts (their beat 0 need not be the same instant).
+    None for charts too short to say."""
+    times, truth = np.sort(np.asarray(times, float)), np.sort(np.asarray(truth, float))
+    if len(times) < 5 or len(truth) < 5:
+        return None
+    j = np.clip(np.searchsorted(truth, times), 1, len(truth) - 1)
+    near = np.where(np.abs(times - truth[j - 1]) <= np.abs(times - truth[j]),
+                    truth[j - 1], truth[j])
+    err = times - near
+    ok = np.abs(err) <= 0.100
+    shift = float(np.median(err[ok])) if ok.sum() >= 10 else 0.0
+    t = times - shift
+    hits = i = k = 0
+    while i < len(t) and k < len(truth):
+        d = t[i] - truth[k]
+        if abs(d) <= tol:
+            hits, i, k = hits + 1, i + 1, k + 1
+        elif d < 0:
+            i += 1
+        else:
+            k += 1
+    p, r = hits / len(t), hits / len(truth)
+    return 2 * p * r / (p + r) if p + r else 0.0
+
+
 # --------------------------------------------------------------------------- #
 # Per-song work (runs in worker processes)
 # --------------------------------------------------------------------------- #
@@ -159,18 +217,29 @@ def _evidence(job: tuple) -> dict:
 def _chart(job: tuple) -> dict:
     """Note counts of the charts the model writes for one song, per difficulty,
     against the human charts' — under the decoder block given."""
-    name, audio, sim, model_dir, cache_dir, decoder = job
+    name, audio, sim, model_dir, cache_dir, decoder = job[:6]
+    only = job[6] if len(job) > 6 else None            # difficulties to chart
     engine = _engine(model_dir)
     engine.model.meta["decoder"] = decoder
     an = _analysis(name, audio, cache_dir)
     human = human_charts(sim)
     ctx = pipeline.prepare_song(audio, an, log=lambda *a, **k: None, engine=engine)
-    charts, _, _ = pipeline.chart_song(ctx, tuple(human["ticks"]), engine, track_id=name)
+    slots = tuple(d for d in human["ticks"] if only is None or d in only)
+    charts, _, _ = pipeline.chart_song(ctx, slots, engine, track_id=name)
     rows = {}
     for slot, chart in charts.items():
         rows[slot] = {"n": len(chart.events), "n_human": len(human["ticks"][slot]),
                       "sixteenths": sixteenths(chart.events.tick),
                       "sixteenths_human": sixteenths(human["ticks"][slot])}
+        if only is not None:
+            # the 16th fit also needs to know what a setting costs
+            rows[slot]["gates"] = bool(all(sm_qa.chart_metrics(
+                infer.to_placements(chart), ctx.analysis, slot)["gates"].values()))
+            if human["constant"] and len(chart.events):
+                truth = human["offset_s"] + human["ticks"][slot] * (
+                    60.0 / human["bpm"] / C.TICKS_PER_BEAT)
+                rows[slot]["f1"] = placement_f1(ctx.g.tick_times_sec[chart.events.tick],
+                                                truth)
     return {"name": name, "charts": rows,
             "half_beat_off": half_beat_off(ctx.align["bpm"], ctx.align["offset"], human)}
 
@@ -266,9 +335,120 @@ def fit_density(jobs: list, decoder: dict, start: dict, workers: int, tolerance:
     return scale, results, history
 
 
+def sixteenth_summary(results: list, slot: str = "hard") -> dict:
+    rows = [s["charts"][slot] for s in results if slot in s["charts"]]
+    f1 = [r["f1"] for r in rows if r.get("f1") is not None]
+    return {"charts": len(rows),
+            "median": statistics.median(r["sixteenths"] for r in rows) if rows else 0.0,
+            "mean": statistics.mean(r["sixteenths"] for r in rows) if rows else 0.0,
+            "human_median": statistics.median(r["sixteenths_human"] for r in rows)
+            if rows else 0.0,
+            "f1": statistics.mean(f1) if f1 else None,
+            "gates": statistics.mean(1.0 if r.get("gates") else 0.0 for r in rows)
+            if rows else None}
+
+
+def choose_sixteenth_boost(off: dict, tried: list, target: float,
+                           f1_loss: float) -> float | None:
+    """`off` is `sixteenth_summary` without a boost, `tried` [(boost, summary)]
+    in rising order. The smallest boost that brings the median to `target` of
+    the human median while placement and the QA gates hold; None if none."""
+    want = target * off["human_median"]
+    for boost, s in tried:
+        holds = ((off["f1"] is None or s["f1"] is None or s["f1"] >= off["f1"] - f1_loss)
+                 and (off["gates"] is None or s["gates"] >= off["gates"] - 1e-9))
+        if not holds:
+            return None                 # a stronger boost only costs more
+        if s["median"] >= want - 1e-9:
+            return float(boost)
+    return None
+
+
+def fit_sixteenths(jobs: list, decoder: dict, workers: int, target: float, f1_loss: float,
+                   log) -> dict:
+    """Try the boosts in rising order on the Hard charts of the tuning songs."""
+    block = {k: v for k, v in decoder.items() if k != "hard_sixteenth_boost"}
+    off = sixteenth_summary(_map(_chart, [(*j, block, ("hard",)) for j in jobs], workers,
+                                 "16th pass, no boost", log))
+    log(f"[calibrate]   no boost: median {off['median']:g} 16ths per Hard chart (human "
+        f"{off['human_median']:g}), F1 {off['f1']:.4f}, gates {off['gates']:.0%}")
+    tried, chosen = [], None
+    for boost in SIXTEENTH_BOOSTS:
+        s = sixteenth_summary(_map(
+            _chart, [(*j, dict(block, hard_sixteenth_boost=boost), ("hard",)) for j in jobs],
+            workers, f"16th pass, boost {boost:g}", log))
+        tried.append((boost, s))
+        log(f"[calibrate]   boost {boost:g}: median {s['median']:g} (mean {s['mean']:.1f}), "
+            f"F1 {s['f1']:.4f} ({s['f1'] - off['f1']:+.4f}), gates {s['gates']:.0%}")
+        chosen = choose_sixteenth_boost(off, tried, target, f1_loss)
+        last_holds = choose_sixteenth_boost(off, tried[-1:], 0.0, f1_loss) is not None
+        if chosen is not None or not last_holds:
+            break
+    return {"off": off, "tried": [{"boost": b, **s} for b, s in tried], "chosen": chosen,
+            "target": target, "f1_loss": f1_loss}
+
+
+def low_tier_summary(results: list) -> dict:
+    """QA gate pass rate and mean placement F1 of the Beginner and Easy charts."""
+    rows = [s["charts"][d] for s in results for d in LOW_TIERS if d in s["charts"]]
+    f1 = [r["f1"] for r in rows if "f1" in r]
+    return {"charts": len(rows),
+            "gates": statistics.mean(r["gates"] for r in rows) if rows else None,
+            "f1": statistics.mean(f1) if f1 else None}
+
+
+def choose_energy_tilt(off: dict, tried: list, target: float = GATE_PASS_TARGET,
+                       f1_loss: float = TILT_F1_LOSS) -> tuple | None:
+    """`off` is `low_tier_summary` with the engine's own ladder, `tried`
+    [(ladder, summary)] mildest first. None when the engine's ladder already
+    passes; else the mildest ladder that reaches `target` of the charts through
+    the QA gates, or failing that the one that passes most — never one that
+    costs more than `f1_loss` of placement F1 or passes fewer than before."""
+    if off["gates"] is None or off["gates"] >= target:
+        return None
+    ok = [(lad, s) for lad, s in tried
+          if s["gates"] > off["gates"]
+          and (off["f1"] is None or s["f1"] is None or s["f1"] >= off["f1"] - f1_loss)]
+    if not ok:
+        return None
+    for lad, s in ok:
+        if s["gates"] >= target:
+            return tuple(lad)
+    return tuple(max(ok, key=lambda t: t[1]["gates"])[0])
+
+
+def fit_energy_tilt(jobs: list, decoder: dict, workers: int, log) -> dict:
+    """Does a Beginner / Easy chart of this model still follow the song's
+    energy? If fewer than GATE_PASS_TARGET of them pass the QA gates on the
+    tuning songs, try longer tilt ladders."""
+    block = {k: v for k, v in decoder.items() if k != "energy_tilt"}
+    off = low_tier_summary(_map(_chart, [(*j, block, LOW_TIERS) for j in jobs], workers,
+                                "low-tier pass, the engine's tilt", log))
+    log(f"[calibrate]   engine's tilt: {off['gates']:.1%} of Beginner/Easy charts pass the "
+        f"QA gates, F1 {off['f1']:.4f}")
+    tried = []
+    if off["gates"] < GATE_PASS_TARGET:
+        for ladder in LOW_TIER_TILTS:
+            tilt = {d: list(ladder) for d in LOW_TIERS}
+            s = low_tier_summary(_map(
+                _chart, [(*j, dict(block, energy_tilt=tilt), LOW_TIERS) for j in jobs],
+                workers, f"low-tier pass, tilt up to {ladder[-1]:g}", log))
+            tried.append((ladder, s))
+            log(f"[calibrate]   tilt up to {ladder[-1]:g}: {s['gates']:.1%} pass, F1 "
+                f"{s['f1']:.4f} ({s['f1'] - off['f1']:+.4f})")
+            if s["gates"] >= GATE_PASS_TARGET:
+                break
+    chosen = choose_energy_tilt(off, tried)
+    return {"off": off, "tried": [{"ladder": list(lad), **s} for lad, s in tried],
+            "chosen": list(chosen) if chosen else None}
+
+
 def calibrate(model_dir, tuning_dir, cache_dir=None, workers: int = 6,
               tolerance: float = 0.05, rounds: int = 4, min_gain: int = 2,
-              write: bool = False, log=print) -> dict:
+              write: bool = False, log=print, fit_sixteenth: bool = False,
+              sixteenth_target: float = SIXTEENTH_TARGET,
+              sixteenth_f1_loss: float = SIXTEENTH_F1_LOSS,
+              fit_tilt: bool = False) -> dict:
     model_dir = infer.resolve_model_dir(model_dir)
     meta_path = model_dir / infer.META_FILE
     meta = json.loads(meta_path.read_text())
@@ -304,10 +484,32 @@ def calibrate(model_dir, tuning_dir, cache_dir=None, workers: int = 6,
             log(f"[calibrate] 16th notes per {slot} chart: median {six[slot]['median']:g} "
                 f"(human {six[slot]['human_median']:g})")
     still_off = sum(bool(s["half_beat_off"]) for s in results)
+    burst = None
+    if fit_sixteenth:
+        burst = fit_sixteenths(base, decoder, workers, sixteenth_target, sixteenth_f1_loss,
+                               log)
+        decoder.pop("hard_sixteenth_boost", None)
+        if burst["chosen"] is not None:
+            decoder["hard_sixteenth_boost"] = burst["chosen"]
+            log(f"[calibrate] 16th figures at Hard: boost {burst['chosen']:g}")
+        else:
+            log("[calibrate] 16th figures at Hard: no boost reaches "
+                f"{sixteenth_target:.0%} of the human median within {sixteenth_f1_loss} of "
+                "placement F1 and the QA gates — none stored")
+    tilt = None
+    if fit_tilt:
+        tilt = fit_energy_tilt(base, decoder, workers, log)
+        decoder.pop("energy_tilt", None)
+        if tilt["chosen"]:
+            decoder["energy_tilt"] = {d: tilt["chosen"] for d in LOW_TIERS}
+            log(f"[calibrate] Beginner/Easy energy tilt: ladder {tilt['chosen']}")
+        else:
+            log("[calibrate] Beginner/Easy energy tilt: the engine's own ladder is kept")
     report = {"model": str(model_dir), "tuning_songs": len(songs), "phase": phase,
               "density": {"scale": scale, "history": history,
                           "median_ratio": history[-1]["median_ratio"]},
-              "sixteenths": six, "grids_half_a_beat_off": still_off, "decoder": decoder}
+              "sixteenths": six, "sixteenth_boost": burst, "energy_tilt": tilt,
+              "grids_half_a_beat_off": still_off, "decoder": decoder}
     if cache_dir:
         Path(cache_dir).mkdir(parents=True, exist_ok=True)
         (Path(cache_dir) / "calibration.json").write_text(json.dumps(report, indent=1))
@@ -335,9 +537,20 @@ def main(argv=None):
     ap.add_argument("--rounds", type=int, default=4)
     ap.add_argument("--min-gain", type=int, default=2)
     ap.add_argument("--write", action="store_true")
+    ap.add_argument("--fit-sixteenths", action="store_true",
+                    help="also fit decoder.hard_sixteenth_boost (16th figures at Hard)")
+    ap.add_argument("--fit-energy-tilt", action="store_true",
+                    help="also fit decoder.energy_tilt: a longer tilt ladder for Beginner "
+                         "and Easy when their charts fail the density-follows-energy gate")
+    ap.add_argument("--sixteenth-target", type=float, default=SIXTEENTH_TARGET,
+                    help="share of the human median 16ths per Hard chart to reach")
+    ap.add_argument("--sixteenth-f1-loss", type=float, default=SIXTEENTH_F1_LOSS,
+                    help="placement F1 the boost may cost at most")
     a = ap.parse_args(argv)
     calibrate(a.model_dir, a.tuning_dir, a.cache_dir, a.jobs, a.tolerance, a.rounds,
-              a.min_gain, a.write)
+              a.min_gain, a.write, fit_sixteenth=a.fit_sixteenths,
+              sixteenth_target=a.sixteenth_target, sixteenth_f1_loss=a.sixteenth_f1_loss,
+              fit_tilt=a.fit_energy_tilt)
 
 
 if __name__ == "__main__":

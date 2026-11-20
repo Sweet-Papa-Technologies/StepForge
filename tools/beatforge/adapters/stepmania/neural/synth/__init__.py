@@ -14,15 +14,18 @@ per source, each with its own `manifest.json`:
     <corpus-root>/synth_thin/      Beginner / Easy charts thinned from human ones
     <corpus-root>/synth_style/     step patterns with no audio
     <corpus-root>/synth_style_grounded/   the same patterns laid over real audio
+    <corpus-root>/synth_cf/        training songs' rhythms re-stepped in several
+                                   footing styles (counterfactual.py)
+    <corpus-root>/synth_cf_stream/ the same for synthetic stream rhythms, no audio
 
 Only `real/` may hold validation songs. A derived shard (`aug_stem`,
-`synth_thin`, `synth_style_grounded`) names its parent and inherits the
+`synth_thin`, `synth_style_grounded`, `synth_cf`) names its parent and inherits the
 parent's `song_id`, and is only ever built from a training song.
 """
 from __future__ import annotations
 
 #: Source folders under a corpus root, and whether their shards carry audio.
 SOURCES = ("real", "aug_stem", "synth_groove", "synth_thin", "synth_style",
-           "synth_style_grounded")
+           "synth_style_grounded", "synth_cf", "synth_cf_stream")
 #: Sources that must never contribute a validation or test item.
 TRAIN_ONLY = tuple(s for s in SOURCES if s != "real")

@@ -36,14 +36,22 @@ P_DROP_ALL = 0.25
 #: Sources under a corpus root that only ever train (mirrors synth.TRAIN_ONLY;
 #: repeated here so the trainers do not import the synthesis package).
 TRAIN_ONLY_SOURCES = ("aug_stem", "synth_groove", "synth_thin", "synth_style",
-                      "synth_style_grounded")
+                      "synth_style_grounded", "synth_cf", "synth_cf_stream")
+#: Sources whose shards borrow another shard's audio (loaded after the rest).
+ATTACHED_SOURCES = ("synth_thin", "synth_style_grounded", "synth_cf")
+#: The style sliders the step network alone decides (crossovers, jacks,
+#: footswitches). On a counterfactual chart they are never dropped: its rhythm
+#: and audio are shared with the other variants of its group, so these three
+#: numbers are the only thing that tells the variants apart.
+FOOTING_FIELDS = (cond.INDEX["crossover_share"], cond.INDEX["jack_share"],
+                  cond.INDEX["footswitch_share"])
 #: Relative sampling weight of a thinned chart whose tier the song already has.
 COMPANION_WEIGHT = 0.5
 
 
 class Chart:
     __slots__ = ("song", "j", "difficulty", "meter", "tick", "tok", "flav", "da",
-                 "ds", "tms", "mines", "style", "uid", "weight")
+                 "ds", "tms", "mines", "style", "uid", "weight", "group", "variant")
 
 
 class Song:
@@ -78,6 +86,8 @@ def _read_charts(z, song: Song, entry: dict, meta: dict, reencode: bool) -> None
             c.style = z[f"c{j}_style"].astype(np.float32)
         c.uid = zlib.crc32(f"{song.key}:{j}".encode())
         c.weight = COMPANION_WEIGHT if cm.get("companion") else 1.0
+        # counterfactual charts: the base rhythm they share, and which footing
+        c.group, c.variant = cm.get("rhythm_group"), cm.get("variant")
         song.charts.append(c)
 
 
@@ -150,7 +160,7 @@ def load_sources(corpus_root, names, max_songs: int | None = None,
     parents = {("real", s.key): s for s in out["real"]}
     # sources with audio first, so attached shards can find any of them
     order = sorted((n for n in names if n != "real"),
-                   key=lambda n: n in ("synth_thin", "synth_style_grounded"))
+                   key=lambda n: n in ATTACHED_SOURCES)
     for name in order:
         if name not in TRAIN_ONLY_SOURCES:
             raise ValueError(f"unknown corpus source '{name}'")
@@ -169,7 +179,11 @@ def load_sources(corpus_root, names, max_songs: int | None = None,
     return out
 
 
-def _cond_vector(chart: Chart, train: bool, rng, has_stems: bool) -> np.ndarray:
+def _cond_vector(chart: Chart, train: bool, rng, has_stems: bool,
+                 keep: tuple = ()) -> np.ndarray:
+    """The conditioning vector of a chart. In training each slider is hidden
+    at random (so the network also works with sliders left to it), except the
+    ones listed in `keep`."""
     style = cond.training_style(chart.style)
     style[9] = 1.0 if has_stems else 0.0
     drop = []
@@ -178,6 +192,7 @@ def _cond_vector(chart: Chart, train: bool, rng, has_stems: bool) -> np.ndarray:
             drop = list(range(1, 9))
         else:
             drop = [i for i in range(1, 9) if rng.random() < P_DROP_FIELD]
+        drop = [i for i in drop if i not in keep]
     return cond.cond19(style, drop)
 
 
@@ -324,7 +339,9 @@ class StageBDataset(_ChartDataset):
         return {"ctx": torch.from_numpy(ctx), "scalars": torch.from_numpy(scal),
                 "tokens": torch.from_numpy(c.tok[lo:hi].astype(np.int64)),
                 "dtb": torch.from_numpy(C.dt_bucket(dt).astype(np.int64)),
-                "cond": torch.from_numpy(_cond_vector(c, self.train, rng, use_stems)),
+                "cond": torch.from_numpy(_cond_vector(
+                    c, self.train, rng, use_stems,
+                    keep=FOOTING_FIELDS if getattr(c, "group", None) else ())),
                 "drop_audio": torch.tensor(bool(drop_audio))}
 
 
@@ -347,6 +364,35 @@ def collate_b(items: list) -> dict:
     return out
 
 
+class GroupedStageBDataset(StageBDataset):
+    """Counterfactual charts, drawn two at a time: two footing variants of the
+    SAME rhythm (`Chart.group`), cropped to the same window with the same
+    sliders hidden. Next to each other in a batch, the two items differ in
+    their arrows and in their three footing sliders and in nothing else, so
+    every gradient step contrasts what those sliders mean.
+
+    `groups` lists the chart indices of every rhythm that has at least two
+    variants; a rhythm with one is left out (there is nothing to contrast)."""
+
+    def __init__(self, songs: list, *args, **kwargs):
+        super().__init__(songs, *args, **kwargs)
+        by: dict = {}
+        for i, c in enumerate(self.charts):
+            if c.group is not None:
+                by.setdefault((c.song.key, c.group), []).append(i)
+        self.groups = [g for g in by.values() if len(g) >= 2]
+        keep = sorted(i for g in self.groups for i in g)
+        remap = {old: new for new, old in enumerate(keep)}
+        self.charts = [self.charts[i] for i in keep]
+        self.groups = [[remap[i] for i in g] for g in self.groups]
+
+    def pair(self, rng) -> tuple:
+        """Two chart indices: different variants of one randomly chosen rhythm."""
+        g = self.groups[int(rng.integers(len(self.groups)))]
+        a, b = rng.choice(len(g), 2, replace=False)
+        return g[int(a)], g[int(b)]
+
+
 class MixedDataset(Dataset):
     """Training items drawn from several datasets by share.
 
@@ -364,6 +410,7 @@ class MixedDataset(Dataset):
         self.schedule = sorted(schedule, key=lambda e: e[0])
         self.epoch_items, self.seed = int(epoch_items), seed
         self.epoch = 0
+        self._paired = any(getattr(ds, "groups", None) for ds in self.parts.values())
         self._cdf = {}
         for name, ds in self.parts.items():
             w = ds.weights
@@ -386,12 +433,30 @@ class MixedDataset(Dataset):
         return self.epoch_items
 
     def pick(self, i: int):
-        """(part name, index in that part, rng) for item i of this epoch."""
-        rng = np.random.default_rng((self.seed, self.epoch, i))
+        """(part name, index in that part, rng) for item i of this epoch.
+
+        With a grouped part present (`GroupedStageBDataset`), items are drawn
+        in pairs (2k, 2k+1): the pair shares its source, and from a grouped
+        source it is two variants of one rhythm under one random generator —
+        same window, same hidden sliders. The loader must not shuffle and the
+        batch size must be even, so the two land in the same batch."""
         sh = self.shares()
         names = list(sh)
-        name = names[int(np.searchsorted(np.cumsum([sh[k] for k in names]),
-                                         rng.random(), side="right").clip(0, len(names) - 1))]
+        cum = np.cumsum([sh[k] for k in names])
+        if self._paired:
+            prng = np.random.default_rng((self.seed, self.epoch, i // 2, 1))
+            name = names[int(np.searchsorted(cum, prng.random(), side="right")
+                             .clip(0, len(names) - 1))]
+            ds = self.parts[name]
+            if getattr(ds, "groups", None):
+                j = ds.pair(prng)[i % 2]
+                return name, j, np.random.default_rng((self.seed, self.epoch, i // 2, 2))
+            rng = np.random.default_rng((self.seed, self.epoch, i))
+            rng.random()
+        else:
+            rng = np.random.default_rng((self.seed, self.epoch, i))
+            name = names[int(np.searchsorted(cum, rng.random(), side="right")
+                             .clip(0, len(names) - 1))]
         cdf = self._cdf[name]
         j = int(min(np.searchsorted(cdf, rng.random(), side="right"), len(cdf) - 1))
         return name, j, rng
