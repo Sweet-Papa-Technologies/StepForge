@@ -20,6 +20,11 @@ def chart_metrics(placements: list[Placement], analysis: dict, difficulty: str,
     """
     b = BUDGETS[difficulty]
     bpm, offset = analysis["bpm"], analysis["offset"]
+    # A mine is something to avoid, not a step: it is not on the music, moves
+    # no foot and presses no panel. Counted as a step (as it used to be) it
+    # was walked through the foot model like an arrow, and a chart with a
+    # dozen mines failed the flow-ceiling gate for steps nobody takes.
+    placements = [p for p in placements if p.kind != "mine"]
     n = len(placements)
     onset_times = sorted(o["time"] for o in analysis.get("onsets", []))
 

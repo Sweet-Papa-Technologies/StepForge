@@ -9,5 +9,5 @@ safetensors
 onnx
 onnxscript
 tqdm
-# Optional, only for `corpus compile --with-demucs` (4-stem shards):
-# demucs
+# Building the v1.5 training corpus (stems, augmentation, synthesis) needs more:
+#   requirements-synth.txt

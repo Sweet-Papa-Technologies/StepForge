@@ -241,6 +241,36 @@ class FlowModel:
         v = own.get(difficulty)
         return float(v) if isinstance(v, (int, float)) else DENSITY_SCALE.get(difficulty, 1.0)
 
+    def sixteenth_boost(self, difficulty: str) -> float | None:
+        """Odds multiplier for 16th-note figures at this tier, for THESE
+        weights (`decoder.hard_sixteenth_boost` in model_meta.json; see
+        `_promote_sixteenths`). None when the model declares none, which is
+        the decoder as it always was."""
+        if difficulty not in SIXTEENTH_BURST_TIERS:
+            return None
+        v = (self.meta.get("decoder") or {}).get("hard_sixteenth_boost")
+        return float(v) if isinstance(v, (int, float)) and v > 1.0 else None
+
+    def energy_tilt(self, difficulty: str) -> tuple | None:
+        """The ladder of energy-tilt weights for this tier, for THESE weights
+        (`decoder.energy_tilt` in model_meta.json: {tier: [weights]}), or None
+        for the engine's own (`ENERGY_TILT`). A rhythm network trained longer
+        is surer of itself, and the engine's steepest tilt then no longer
+        bends a Beginner chart toward the loud bars; such a model carries a
+        longer ladder, fitted by `calibrate_decoder --fit-energy-tilt`."""
+        own = (self.meta.get("decoder") or {}).get("energy_tilt") or {}
+        v = own.get(difficulty)
+        if isinstance(v, (list, tuple)) and v and all(isinstance(x, (int, float)) for x in v):
+            return tuple(float(x) for x in v)
+        return None
+
+    @property
+    def neural_stream(self) -> bool:
+        """Were these weights trained to write stream charts when asked
+        (`decoder.neural_stream` in model_meta.json)? Without it Stream mode
+        always uses the rule fill."""
+        return bool((self.meta.get("decoder") or {}).get("neural_stream"))
+
     # -- Stage A ---------------------------------------------------------- #
     def rhythm(self, x: np.ndarray, cond19: np.ndarray) -> dict:
         """X (T, 64) -> per-tick logits, run in overlapping 32-measure windows
@@ -339,6 +369,13 @@ _FINEST = {"beginner": 4, "easy": 8, "medium": 8, "hard": 16, "challenge": 16}
 RUN_LIMIT = {"beginner": 1, "easy": 2, "medium": 6, "hard": 16, "challenge": 24}
 
 
+STREAM_FILLS = ("neural", "rule")
+#: A model-written stream chart is kept when the model itself puts at least
+#: this share of the stream's notes above even odds; below it the model has
+#: not written a stream and the rule fill is used instead.
+NEURAL_STREAM_MIN_SHARE = 0.60
+
+
 @dataclass(frozen=True)
 class DecodeOptions:
     """What the user asked of the decoder beyond the style sliders. Everything
@@ -349,6 +386,15 @@ class DecodeOptions:
                      breaks between them, instead of note-by-note selection
     stream_coverage  share of the playable bars that are stream (Stream mode)
     min_break_bars   a break is never shorter than this many bars (Stream mode)
+    stream_fill      Stream mode: 'neural' asks the model itself for a stream
+                     chart (see `stream_style`) and falls back to 'rule' when
+                     the model does not write one; 'rule' lays the streams out
+                     over an ordinary chart's probabilities, as v1.4 did
+    stream_share     Stream mode: the share of the chart's NOTES that should
+                     sit in 16th streams (the style vector's `stream_share`,
+                     what the Stream slider means). The coverage in bars is
+                     then solved for it and `stream_coverage` is ignored.
+                     Set by `route_stream`; None: `stream_coverage` as given
     crossovers       False: no step may end with the feet crossed
     density          multiplier on the note count the model itself expects
                      (used when the NPS slider is left to the model)
@@ -359,8 +405,15 @@ class DecodeOptions:
     min_break_bars: int = 2
     crossovers: bool = True
     density: float = 1.0
+    stream_fill: str = "neural"
+    stream_share: float | None = None
 
     def __post_init__(self):
+        if self.stream_share is not None and not 0.0 < float(self.stream_share) <= 1.0:
+            raise ValueError("stream_share must be in (0, 1]")
+        if self.stream_fill not in STREAM_FILLS:
+            raise ValueError(f"stream_fill must be one of {', '.join(STREAM_FILLS)}, "
+                             f"not {self.stream_fill!r}")
         if self.max_subdivision not in (None, 4, 8, 16):
             raise ValueError(f"max_subdivision must be 4, 8 or 16, not {self.max_subdivision!r}")
         if not 0.0 < float(self.stream_coverage) <= 1.0:
@@ -395,6 +448,8 @@ class DecodeOptions:
         else:
             out.pop("stream_coverage", None)
             out.pop("min_break_bars", None)
+            out.pop("stream_fill", None)
+            out.pop("stream_share", None)
         return out
 
 
@@ -679,6 +734,107 @@ def stream_subdivision(difficulty: str, max_subdivision: int | None,
     return 4
 
 
+def stream_style(style: np.ndarray, difficulty: str, opts: DecodeOptions,
+                 beat_s: float) -> np.ndarray:
+    """The style a Stream-mode chart is described by, for asking the model to
+    write one: the density of the stream's own subdivision at this tempo, and
+    — when that subdivision is 16ths, the only runs the stream slider counts —
+    the share of the chart the user wants as stream. Sliders the user set
+    stay; the rest stay with the model. Deliberately not clamped to the tier:
+    Stream mode already exceeds the tier's run length by design."""
+    out = np.asarray(style, np.float32).copy()
+    sub = stream_subdivision(difficulty, opts.max_subdivision, beat_s)
+    rate = float(np.clip((sub / 4.0) / beat_s, 0.5, 16.0))
+    out[cond.INDEX["meter_norm"]] = cond.effective_meter(rate) / 15.0
+    out[cond.INDEX["nps_norm"]] = rate / 16.0
+    asked = opts.stream_coverage if opts.stream_share is None else opts.stream_share
+    out[cond.INDEX["stream_share"]] = float(asked) if sub == 16 else 0.0
+    return out
+
+
+#: Stream routing. Outside Stream mode the tier's limits on speed and run
+#: length decide how much of a chart can be stream, whatever the Stream slider
+#: says: on 20 held-out songs a preset asking for 80 % stream got 3 %. So a
+#: chart that is ASKED to be a stream chart is made in Stream mode: the
+#: `itg_stamina` preset, or a Stream slider the caller set to at least
+#: STREAM_ROUTE_MIN_SHARE, at the tiers that write streams at all. The other
+#: presets carry a stream value too (jumpstream asks 56 % at Challenge), but
+#: Stream mode writes no jumps inside a stream, so they stay note-by-note.
+STREAM_ROUTE_MIN_SHARE = 0.45
+STREAM_ROUTE_TIERS = ("hard", "challenge")
+STREAM_ROUTE_PRESETS = ("itg_stamina",)
+#: Narrowest stream coverage the solver for `DecodeOptions.stream_share` tries.
+STREAM_COVERAGE_MIN = 0.05
+STREAM_SHARE_ITERS = 7
+#: In a routed chart the jump and freeze sliders are shares of the whole chart,
+#: but only break notes can carry them: at most this share of the break notes.
+STREAM_BREAK_SHARE_MAX = 0.5
+
+
+def route_stream(difficulty: str, style: np.ndarray, preset: str | None,
+                 overrides: dict | None, options: "DecodeOptions | None") -> tuple:
+    """Should this chart be made in Stream mode although the caller did not
+    switch it on? -> (options to decode with, why or None).
+
+    `overrides` are the sliders the caller set by hand (not ones filled in by
+    style retrieval). A chart that is not routed gets `options` back untouched,
+    so nothing about an ordinary chart changes."""
+    if difficulty not in STREAM_ROUTE_TIERS or (options is not None and options.stream):
+        return options, None
+    asked = float(style[cond.INDEX["stream_share"]])
+    if asked < STREAM_ROUTE_MIN_SHARE - 1e-4:
+        return options, None
+    if preset in STREAM_ROUTE_PRESETS:
+        why = f"preset {preset}"
+    elif overrides and "stream_share" in overrides:
+        why = "stream_share slider"
+    else:
+        return options, None
+    routed = dataclasses.replace(options or DecodeOptions(), stream=True,
+                                 stream_share=min(1.0, asked))
+    return routed, why
+
+
+def _solve_stream_share(decode, opts: DecodeOptions) -> "RhythmPlan":
+    """Stream mode with `opts.stream_share` set: find the coverage (in bars) at
+    which that share of the chart's notes is in 16th streams, by bisection.
+    `decode(options) -> RhythmPlan`.
+
+    A stream note is not a bar: a bar of 16ths is sixteen notes and a bar of
+    break two to four, so 80 % of the bars as stream would be 95 % of the
+    notes. Where the tier's rate makes the stream run in 8ths at this tempo the
+    slider's statistic (runs of 16ths) cannot see it at all; the share asked
+    for is then taken as the share of bars."""
+    target = float(opts.stream_share)
+
+    def at(c: float):
+        plan = decode(dataclasses.replace(opts, stream_coverage=float(c)))
+        share = cond.stream_share(plan.tick, plan.is_jump) if len(plan.tick) else 0.0
+        return plan, float(share)
+
+    c = float(np.clip(target, STREAM_COVERAGE_MIN, 1.0))
+    plan, share = at(c)
+    best = (abs(share - target), c, plan, share)
+    if plan.stats.get("stream", {}).get("subdivision") == 16:
+        lo, hi = (STREAM_COVERAGE_MIN, c) if share > target else (c, 1.0)
+        for _ in range(STREAM_SHARE_ITERS):
+            if hi - lo < 1e-3:
+                break
+            c = 0.5 * (lo + hi)
+            plan, share = at(c)
+            if abs(share - target) < best[0]:
+                best = (abs(share - target), c, plan, share)
+            if share > target:
+                hi = c
+            else:
+                lo = c
+    _, c, plan, share = best
+    if "stream" in plan.stats:
+        plan.stats["stream"].update(coverage=round(c, 3), share_asked=round(target, 3),
+                                    share=round(share, 3))
+    return plan
+
+
 def _stream_layout(p: np.ndarray, allowed: np.ndarray, tick_times: np.ndarray,
                    difficulty: str, opts: DecodeOptions,
                    rank: np.ndarray | None) -> dict:
@@ -775,7 +931,9 @@ def _stream_layout(p: np.ndarray, allowed: np.ndarray, tick_times: np.ndarray,
     info = {"subdivision": sub, "segments": segments,
             "stream_bars": int(sum(e - s for s, e in segments)),
             "playable_bars": n_play, "nps": round(nps, 2),
-            "over_tier_rate": bool(nps > BUDGETS[difficulty].max_nps_4s + 1e-6)}
+            "over_tier_rate": bool(nps > BUDGETS[difficulty].max_nps_4s + 1e-6),
+            # how much of the stream the model would have written unprompted
+            "model_share": round(float((p[ticks] >= 0.5).mean()), 3) if len(ticks) else 0.0}
     return {"ticks": ticks, "break_allowed": break_allowed, "info": info}
 
 
@@ -827,6 +985,111 @@ def _cap_off_transient(ticks, scores, keep, on_transient):
     return keep, n_drop == excess
 
 
+#: 16th-note figures at Hard. The median human Hard chart has about twenty
+#: 16th notes; the model's has none, because a 16th rarely gets enough
+#: probability to pass the threshold on its own (v1.5: mean 7, median 0). A
+#: model can carry an odds multiplier for them (`decoder.hard_sixteenth_boost`,
+#: fitted by calibrate_decoder.py). It is not a blanket boost: a 16th is only
+#: promoted BETWEEN two notes the chart already has, with a transient under
+#: it — which makes every promoted note part of a figure that starts and ends
+#: on an 8th or a quarter (8th-16th-8th is three notes; two in a row make
+#: five, four make nine) and never an isolated 16th.
+SIXTEENTH_BURST_TIERS = ("hard",)
+SIXTEENTH_BURST_MAX_RUN = 9         # notes a 16th apart in one figure
+
+
+def _promote_sixteenths(tk: np.ndarray, score: np.ndarray, theta: float, boost: float,
+                        allowed: np.ndarray, on_transient: np.ndarray | None,
+                        tick_times: np.ndarray, max_nps: float, fine_frac: float,
+                        run_limit: int, gap_s: float) -> tuple:
+    """Add 16ths whose score, with its odds multiplied by `boost`, reaches the
+    chart's threshold, where both neighbouring 8th positions already carry a
+    note. Strongest first, and only while the tier's own limits still hold
+    (peak rate, off-beat share, run length, physical gap). Returns (ticks,
+    how many were added)."""
+    t = len(score)
+    if len(tk) < 2 or boost <= 1.0:
+        return tk, 0
+    have = np.zeros(t, bool)
+    have[tk] = True
+    k = np.arange(3, t - 3)
+    k = k[(k % 6 == 3) & allowed[k] & ~have[k] & have[k - 3] & have[k + 3]]
+    if on_transient is not None:
+        k = k[on_transient[k]]
+    if len(k) == 0:
+        return tk, 0
+    boosted = _scale_odds(score[k], boost)
+    ok = boosted >= theta
+    k, boosted = k[ok], boosted[ok]
+    # no 16th in a beat that is counted in triplets (see _one_grid_per_beat)
+    beat0 = (k // C.TICKS_PER_BEAT) * C.TICKS_PER_BEAT
+    triplet = np.zeros(len(k), bool)
+    for r in (2, 4, 8, 10):
+        idx = beat0 + r
+        triplet |= have[np.minimum(idx, t - 1)] & (idx < t)
+    k, boosted = k[~triplet], boosted[~triplet]
+    if len(k) == 0:
+        return tk, 0
+    limit = int(math.floor(max_nps * 4.0 + 1e-9))
+    quarters = int((tk % C.TICKS_PER_BEAT == 0).sum())
+    fine = len(tk) - quarters
+    fine_max = (10 ** 9 if fine_frac >= 0.999
+                else int(math.floor(fine_frac / (1 - fine_frac) * quarters + 1e-9)))
+    added = {}
+    for i in np.argsort(-boosted, kind="stable"):
+        if fine + len(added) + 1 > fine_max:
+            break
+        c = int(k[i])
+        if (tick_times[c] - tick_times[c - 3] < gap_s - 1e-9
+                or tick_times[c + 3] - tick_times[c] < gap_s - 1e-9):
+            continue
+        # the figure this note would be part of: notes a 16th apart
+        a = c
+        while a - 3 >= 0 and have[a - 3]:
+            a -= 3
+        z = c
+        while z + 3 < t and have[z + 3]:
+            z += 3
+        if (z - a) // 3 + 1 > SIXTEENTH_BURST_MAX_RUN:
+            continue
+        # the run of 8ths-or-faster it sits in
+        idx = np.nonzero(have)[0]
+        pos = int(np.searchsorted(idx, c))
+        lo = pos - 1
+        while lo > 0 and idx[lo] - idx[lo - 1] <= 6:
+            lo -= 1
+        hi = pos
+        while hi + 1 < len(idx) and idx[hi + 1] - idx[hi] <= 6:
+            hi += 1
+        if hi - lo + 2 > run_limit:
+            continue
+        # the tier's peak rate, in every 4 s window that contains the note
+        tt = tick_times[idx]
+        first = int(np.searchsorted(tt, tick_times[c] - 4.0, side="right"))
+        ends = np.searchsorted(tt, tt[first:pos] + 4.0, side="left") - np.arange(first, pos)
+        tail = int(np.searchsorted(tt, tick_times[c] + 4.0, side="left")) - pos
+        if (len(ends) and int(ends.max()) + 1 > limit) or tail + 1 > limit:
+            continue
+        have[c] = True
+        added[c] = float(boosted[i])
+    # figures of three, five or nine notes: seven loses its weakest promoted 16th
+    for c in sorted(added):
+        if not have[c]:
+            continue
+        a = c
+        while a - 3 >= 0 and have[a - 3]:
+            a -= 3
+        z = c
+        while z + 3 < t and have[z + 3]:
+            z += 3
+        if (z - a) // 3 + 1 == 7:
+            mine = [m for m in range(a, z + 1, 3) if m in added and have[m]]
+            if mine:
+                have[min(mine, key=lambda m: added[m])] = False
+    n_added = int(sum(have[c] for c in added))
+    return np.nonzero(have)[0].astype(np.int64), n_added
+
+
 #: Default density, as a multiple of the note count RhythmNet itself expects,
 #: used when the caller leaves the NPS slider to the model. Left alone the model
 #: wrote more notes than human charters do on the same song (v1.0 benchmark,
@@ -865,7 +1128,9 @@ def decode_rhythm(logits: dict, tick_times: np.ndarray, difficulty: str,
                   options: DecodeOptions | None = None,
                   density_scale: float | None = None,
                   window: tuple | None = None,
-                  blocked: np.ndarray | None = None) -> RhythmPlan:
+                  blocked: np.ndarray | None = None,
+                  sixteenth_boost: float | None = None,
+                  energy_tilt: tuple | None = None) -> RhythmPlan:
     """RhythmNet logits -> the notes of the chart (spec §6.3).
 
     1. mask ticks the tier may not use, and anything outside the playable window
@@ -891,6 +1156,11 @@ def decode_rhythm(logits: dict, tick_times: np.ndarray, difficulty: str,
     is being held there). In a window the density target is always the model's
     own expectation for those ticks times `options.density`: the NPS slider
     describes a whole chart, not eight bars of one.
+
+    `sixteenth_boost`, above 1, promotes 16th-note figures at the tiers in
+    SIXTEENTH_BURST_TIERS (see `_promote_sixteenths`); the note count is still
+    calibrated on the chart that results, so the figures replace the chart's
+    weakest notes rather than adding to it.
     """
     b = BUDGETS[difficulty]
     opts = options or DecodeOptions()
@@ -932,6 +1202,9 @@ def decode_rhythm(logits: dict, tick_times: np.ndarray, difficulty: str,
                      - float(tick_times[min(t - 1, int(FIRST_PLAYABLE_BEAT * 12))]))
     cand = np.nonzero(allowed)[0]
     energy = None if rank is None else np.asarray(energy_per_bar, np.float64)
+    burst = (float(sixteenth_boost) if sixteenth_boost and sixteenth_boost > 1.0
+             and difficulty in SIXTEENTH_BURST_TIERS and 3 in subdiv else None)
+    promoted = {"n": 0}
 
     def select(weight: float):
         """Peak-pick and calibrate with the onset probability tilted toward
@@ -969,7 +1242,13 @@ def decode_rhythm(logits: dict, tick_times: np.ndarray, difficulty: str,
             if on_transient is not None:
                 keep, on_met = _cap_off_transient(tk, score[tk], keep, on_transient)
                 met = met and on_met
-            return tk[keep], met
+            out = tk[keep]
+            if burst is not None:
+                out, promoted["n"] = _promote_sixteenths(
+                    out, score, theta, burst, allowed, on_transient, tick_times,
+                    b.max_nps_4s, b.fine_frac, RUN_LIMIT.get(difficulty, b.max_run),
+                    min_gap_s(difficulty))
+            return out, met
 
         def miss(theta: float) -> float:                   # > 0: too dense
             tk, _ = chosen(theta)
@@ -1004,7 +1283,7 @@ def decode_rhythm(logits: dict, tick_times: np.ndarray, difficulty: str,
         if below:
             tk = np.sort(picked[:floor])
             theta = float(pscore[floor - 1]) if floor else theta
-        return tk, theta, met, below
+        return tk, theta, met, below, (0 if below else promoted["n"])
 
     def energy_corr(tk) -> float:
         """Spearman of notes-per-bar against bar energy — the QA gate's own
@@ -1018,18 +1297,21 @@ def decode_rhythm(logits: dict, tick_times: np.ndarray, difficulty: str,
     # follow the song's energy (the project's density-vs-energy gate).
     best = None
     weights, enough = ENERGY_TILT.get(difficulty, (ENERGY_WEIGHTS, MIN_ENERGY_CORR))
+    if energy_tilt:
+        weights = tuple(energy_tilt)       # the model's own ladder (FlowModel.energy_tilt)
     if local:
         # the correlation is a whole-chart statistic; a part of the song takes
         # the gentlest tilt and is not searched
         weights = weights[:1]
     for weight in weights if energy is not None else (0.0,):
-        tk, theta, met, below = select(weight)
+        tk, theta, met, below, n_promoted = select(weight)
         corr = energy_corr(tk) if energy is not None and len(tk) and not local else None
         if best is None or (corr is not None and corr > best[4]):
-            best = (tk, theta, met, below, corr if corr is not None else 1.0, weight)
+            best = (tk, theta, met, below, corr if corr is not None else 1.0, weight,
+                    n_promoted)
         if corr is None or corr >= enough:
             break
-    ticks, theta, fine_met, below_range, corr, weight = best
+    ticks, theta, fine_met, below_range, corr, weight, n_promoted = best
     n_calibrated = len(ticks)
     stream_bars = 0
     meter = float(style[0]) * 15.0
@@ -1054,6 +1336,8 @@ def decode_rhythm(logits: dict, tick_times: np.ndarray, difficulty: str,
              "energy_corr": None if (energy is None or local) else round(corr, 3)}
     if stream is not None:
         stats["stream"] = stream["info"]
+    if burst is not None:
+        stats["sixteenth_boost"] = {"boost": burst, "promoted": int(n_promoted)}
     if opts.to_dict():
         stats["options"] = opts.to_dict()
     if n == 0:
@@ -1068,7 +1352,15 @@ def decode_rhythm(logits: dict, tick_times: np.ndarray, difficulty: str,
     # Stream mode that is the breaks, and the whole chart's share spent there
     # would turn every break note into a jump
     n_open = int((~in_stream).sum())
+    # ...unless the chart was routed here by its Stream slider: then the other
+    # sliders describe the whole chart too, and the breaks carry what was
+    # asked for, up to STREAM_BREAK_SHARE_MAX of their notes
+    whole = stream is not None and opts.stream_share is not None
+    n_break_max = int(math.floor(STREAM_BREAK_SHARE_MAX * n_open + 1e-9))
     n_jump = int(math.floor(min(share, _JUMP_MAX_FRAC[b.jumps]) * n_open + 1e-9))
+    if whole:
+        n_jump = min(n_break_max,
+                     int(math.floor(min(share, _JUMP_MAX_FRAC[b.jumps]) * n + 1e-9)))
     is_jump = np.zeros(n, bool)
     if n_jump > 0:
         ok = (ticks % _JUMP_TICKS[b.jumps] == 0) & ~in_stream
@@ -1090,6 +1382,9 @@ def decode_rhythm(logits: dict, tick_times: np.ndarray, difficulty: str,
     # tier's share is the only limit: its fixed count (max_holds, written for
     # the LLM designer) held a 400-note Hard chart to 3% freezes.
     n_hold = int(math.floor(min(share, b.hold_share[1]) * n_open + 1e-9))
+    if whole:
+        n_hold = min(n_break_max,
+                     int(math.floor(min(share, b.hold_share[1]) * n + 1e-9)))
     flavor = np.zeros(n, np.int64)
     dur = np.zeros(n, np.int64)
     if n_hold > 0:
@@ -1670,9 +1965,40 @@ class StepManiaNeuralEngine:
         cv = self.cond_for(style, has_stems)
         if progress:
             progress("rhythm")
-        plan = decode_rhythm(self.model.rhythm(x, cv), tick_times, difficulty, style,
-                             duration_s, energy_per_bar, on_transient, options=opts,
-                             density_scale=self.model.density_scale(difficulty))
+
+        def rhythm(cond_vec):
+            logits = self.model.rhythm(x, cond_vec)
+
+            def decode(o):
+                return decode_rhythm(logits, tick_times, difficulty,
+                                     style, duration_s, energy_per_bar, on_transient,
+                                     options=o,
+                                     density_scale=self.model.density_scale(difficulty),
+                                     sixteenth_boost=self.model.sixteenth_boost(difficulty),
+                                     energy_tilt=self.model.energy_tilt(difficulty))
+            if opts.stream and opts.stream_share is not None:
+                return _solve_stream_share(decode, opts)
+            return decode(opts)
+
+        fill = None
+        if opts.stream:
+            fill = "rule"
+            if opts.stream_fill == "neural" and self.model.neural_stream and len(tick_times) > 1:
+                # ask the model for a stream chart, and keep its answer if it
+                # wrote one; otherwise fall back to laying the streams out
+                beat_s = float(np.median(np.diff(tick_times))) * C.TICKS_PER_BEAT
+                asked = stream_style(style, difficulty, opts, beat_s)
+                cv_stream = self.cond_for(asked, has_stems)
+                plan = rhythm(cv_stream)
+                share = plan.stats.get("stream", {}).get("model_share", 0.0)
+                if share >= NEURAL_STREAM_MIN_SHARE:
+                    fill, cv, style = "neural", cv_stream, asked
+                else:
+                    fill = f"rule (the model wrote {share:.0%} of the stream)"
+        if fill != "neural":
+            plan = rhythm(cv)
+        if fill is not None and "stream" in plan.stats:
+            plan.stats["stream"]["fill"] = fill
         n = len(plan.tick)
         stats = {"rhythm": plan.stats, "difficulty": difficulty, "seed": seed,
                  "tau": tau, "quantization": self.model.quantization}
@@ -1832,7 +2158,9 @@ class StepManiaNeuralEngine:
         plan = decode_rhythm(self.model.rhythm(x, cv), tick_times, difficulty, style,
                              duration_s, energy_per_bar, on_transient, options=opts,
                              density_scale=self.model.density_scale(difficulty),
-                             window=(lo_t, hi_t), blocked=blocked)
+                             window=(lo_t, hi_t), blocked=blocked,
+                             sixteenth_boost=self.model.sixteenth_boost(difficulty),
+                             energy_tilt=self.model.energy_tilt(difficulty))
 
         # a new freeze ends before the chart that follows the range resumes
         after = events.tick[keep & (events.tick >= hi_t)]

@@ -11,7 +11,7 @@ export interface FeedbackRequest {
   /** Written into the issue only when `includeTitle` is true. */
   songTitle?: string;
   includeTitle?: boolean;
-  /** "StepForge Flow v1.4", when known. */
+  /** "StepForge Flow v1.5", when known. */
   model?: string | null;
   /** The Copy diagnostics text (`api.engineDiagnostics()`). */
   diagnostics: string;

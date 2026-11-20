@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import shutil
 import time
 from pathlib import Path
 
@@ -50,9 +51,12 @@ def param_groups(model: torch.nn.Module, weight_decay: float) -> list:
 class RunDir:
     """Output directory of a training run: config, log, last/best checkpoints."""
 
-    def __init__(self, path, config: dict):
+    def __init__(self, path, config: dict, mirror=None):
         self.path = Path(path)
         self.path.mkdir(parents=True, exist_ok=True)
+        #: A second folder (a mounted drive, say) that `sync` copies the run's
+        #: files to, so a reclaimed training machine does not take them along.
+        self.mirror_dir = Path(mirror) if mirror else None
         (self.path / "config.json").write_text(json.dumps(config, indent=2))
         self.log_path = self.path / "log.jsonl"
         self.t0 = time.time()
@@ -69,6 +73,24 @@ class RunDir:
         tmp = self.path / f"{name}.tmp"
         torch.save(state, tmp)
         os.replace(tmp, self.path / f"{name}.pt")
+
+    def sync(self, *names: str) -> None:
+        """Copy checkpoints (by name, e.g. "best") and the log and config to
+        the mirror folder. A failed copy is reported, never raised: losing the
+        mirror must not stop a training run."""
+        if self.mirror_dir is None:
+            return
+        try:
+            self.mirror_dir.mkdir(parents=True, exist_ok=True)
+            files = [self.path / f"{n}.pt" for n in names] + [self.log_path,
+                                                                self.path / "config.json"]
+            for f in files:
+                if f.exists():
+                    tmp = self.mirror_dir / (f.name + ".part")
+                    shutil.copyfile(f, tmp)
+                    os.replace(tmp, self.mirror_dir / f.name)
+        except OSError as e:
+            print(f"[train] WARNING: could not mirror to {self.mirror_dir}: {e}", flush=True)
 
     def load(self, name: str = "last"):
         p = self.path / f"{name}.pt"

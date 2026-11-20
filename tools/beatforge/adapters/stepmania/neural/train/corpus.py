@@ -22,6 +22,13 @@ title + artist, or a near-identical spectral fingerprint) under one `song_id`
 and splits by that id, so the Easy and Challenge charts of a song — or the same
 song repackaged in two packs — can never straddle train and validation.
 
+`compile --stems-dir <cache>` reads a 4-stem cache written by
+`neural.synth.stems_cache` and stores the 16 stem channels in each shard;
+songs the cache does not hold compile without them. `manifest --split-manifest
+<file>` takes every song's id, split and per-chart verdict from an earlier
+manifest instead of deciding them again — that is how a recompiled corpus
+keeps a locked train / validation split.
+
 No PyTorch here: this runs on the machine that holds the packs.
 """
 from __future__ import annotations
@@ -171,13 +178,13 @@ def song_key(folder: Path) -> str:
     return hashlib.sha1(folder.name.encode("utf-8", "surrogatepass")).hexdigest()[:16]
 
 
-def process_song(folder, out_dir, with_demucs: bool = False) -> dict:
+def process_song(folder, out_dir, with_demucs: bool = False, stems_dir=None) -> dict:
     """Compile one song folder. Returns the index row; never raises."""
     folder, out_dir = Path(folder), Path(out_dir)
     row = {"folder": folder.name, "key": song_key(folder), "ok": False}
     t0 = time.time()
     try:
-        return _process_song(folder, out_dir, row, with_demucs)
+        return _process_song(folder, out_dir, row, with_demucs, stems_dir)
     except Exception as e:                       # one bad folder must not stop a run
         row["reason"] = f"error:{type(e).__name__}:{str(e)[:160]}"
         return row
@@ -185,7 +192,86 @@ def process_song(folder, out_dir, with_demucs: bool = False) -> dict:
         row["seconds"] = round(time.time() - t0, 2)
 
 
-def _process_song(folder: Path, out_dir: Path, row: dict, with_demucs: bool) -> dict:
+def timing_facts(timing: GF.TimingMap) -> dict:
+    """A TimingMap as plain JSON, complete (the `bpms` / `stops` rows of the
+    index are capped at 64 entries; this is not), so a shard can be put back on
+    its exact grid — or on that grid at another tempo — without the simfile."""
+    sb, sc = timing._stops
+    db, dc = timing._delays
+    return {"offset_s": float(timing.offset_s),
+            "bpms": [[float(b), float(v)] for b, v in zip(timing.bpm_beats, timing.bpm_vals)],
+            "stops": [[float(b), float(v)] for b, v in zip(sb, np.diff(sc))],
+            "delays": [[float(b), float(v)] for b, v in zip(db, np.diff(dc))]}
+
+
+def timing_from_facts(facts: dict, rate: float = 1.0) -> GF.TimingMap:
+    """Inverse of `timing_facts`. `rate` plays the song `rate` times faster:
+    every tempo is multiplied by it and every duration divided, so tick k is
+    the same musical position in both."""
+    return GF.TimingMap(facts["offset_s"] / rate,
+                        [(b, v * rate) for b, v in facts["bpms"]],
+                        [(b, v / rate) for b, v in facts["stops"]],
+                        [(b, v / rate) for b, v in facts["delays"]])
+
+
+def pack_chart(arrays: dict, j: int, ev: C.ChartEvents, times_ms: np.ndarray,
+               meter: int, slot: str, *, has_stems: bool = False,
+               difficulty_raw: str | None = None, description: str = "",
+               credit: str = "", st: C.IngestStats | None = None,
+               offgrid: int = 0, snapped: int = 0) -> dict:
+    """Encode one chart into `arrays` (the `c<j>_*` entries of a shard) and
+    return its row for the shard's meta. Shared by the compiler and by every
+    generator of synthetic or derived charts, so they cannot drift apart."""
+    times_ms = np.asarray(times_ms, np.float64)
+    enc, info = C.encode(ev, times_ms)
+    style = cond.compute_style_vector(enc, times_ms / 1000.0, meter, has_stems=has_stems)
+    arrays.update({
+        f"c{j}_tick": ev.tick.astype(np.int32),
+        f"c{j}_tok": enc.token, f"c{j}_flav": enc.flavor,
+        f"c{j}_da": enc.dur_alt.astype(np.int32),
+        f"c{j}_ds": enc.dur_same.astype(np.int32),
+        f"c{j}_tms": times_ms.astype(np.float32),
+        f"c{j}_mines": ev.mines.astype(np.int32).reshape(-1, 2),
+        # raw rows, so a codec change never needs the audio again
+        f"c{j}_raw": np.stack([ev.p0, ev.p1, ev.k0, ev.k1]).astype(np.int8),
+        f"c{j}_rawd": np.stack([ev.d0, ev.d1]).astype(np.int32),
+        f"c{j}_style": style,
+    })
+    n = len(ev)
+    st = st or C.IngestStats(notes=n, rows=n)
+    return {
+        "j": j, "difficulty": slot if slot in DIFFICULTY_SLOTS else "edit",
+        "difficulty_raw": difficulty_raw if difficulty_raw is not None else slot,
+        "meter": int(meter), "description": (description or "")[:80],
+        "credit": (credit or "")[:80],
+        "f_init": int(enc.f_init), "n_events": n,
+        "n_jumps": int((enc.token >= 8).sum()),
+        "n_holds": int((enc.flavor > 0).sum()), "n_mines": int(len(ev.mines)),
+        "sustained_nps": round(cond.sustained_nps(times_ms / 1000.0), 3),
+        "peak_nps": round(cond.peak_nps(times_ms / 1000.0), 3),
+        "hold_share": round(float((enc.flavor > 0).mean()), 4) if n else 0.0,
+        "hand_share": round(st.hand_share, 4), "hands": st.hands,
+        "offgrid_dropped": offgrid, "snapped": snapped,
+        "ingest_dropped": st.dropped, "open_holds": st.open_holds,
+        "mean_cost": round(info.mean_cost, 3),
+        "lock_violations": info.lock_violations, "spins": info.spins,
+        "last_tick": int(ev.tick[-1]) if n else 0,
+    }
+
+
+def save_shard(path, arrays: dict, meta: dict) -> None:
+    """Write one shard atomically: arrays + the JSON meta as a byte array."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    arrays = dict(arrays)
+    arrays["meta"] = np.frombuffer(json.dumps(meta).encode("utf-8"), dtype=np.uint8)
+    tmp = path.with_name(path.stem + ".tmp.npz")
+    np.savez(tmp, **arrays)
+    os.replace(tmp, path)
+
+
+def _process_song(folder: Path, out_dir: Path, row: dict, with_demucs: bool,
+                  stems_dir=None) -> dict:
     import simfile
     sm_path = _find_simfile(folder)
     if sm_path is None:
@@ -254,52 +340,32 @@ def _process_song(folder: Path, out_dir: Path, row: dict, with_demucs: bool) -> 
 
     arrays = {"core": core.astype(np.float16), "dt_ms": dt_ms.astype(np.float32),
               "fingerprint": spectral_fingerprint(ff.level)}
-    if with_demucs:
+    stems = None
+    if stems_dir is not None:
+        from ..synth import stems_cache
+        # the cache holds stems of the DECODED file; the mix was peak-normalized
+        # on load, so the stems take the same gain and still sum to it
+        stems = stems_cache.load_stems(stems_dir, row["key"], n_samples=len(y),
+                                       match_mix=y)
+    elif with_demucs:
         stems = separate_stems(str(audio_path))
+    has_stems = stems is not None
+    if has_stems:
         arrays["stems"] = GF.stem_features(stems, timing, n_ticks).astype(np.float16)
 
     chart_meta = []
     for j, (chart, ev, st, offgrid, snapped) in enumerate(parsed):
         times_ms = timing.time_at(ev.tick / C.TICKS_PER_BEAT) * 1000.0
-        enc, info = C.encode(ev, times_ms)
         try:
             meter = int(float(chart.meter))
         except (TypeError, ValueError):
             meter = 0
-        style = cond.compute_style_vector(enc, times_ms / 1000.0, meter,
-                                          has_stems=with_demucs)
-        slot = (chart.difficulty or "").strip().lower()
-        arrays.update({
-            f"c{j}_tick": ev.tick.astype(np.int32),
-            f"c{j}_tok": enc.token, f"c{j}_flav": enc.flavor,
-            f"c{j}_da": enc.dur_alt.astype(np.int32),
-            f"c{j}_ds": enc.dur_same.astype(np.int32),
-            f"c{j}_tms": times_ms.astype(np.float32),
-            f"c{j}_mines": ev.mines.astype(np.int32),
-            # raw rows, so a codec change never needs the audio again
-            f"c{j}_raw": np.stack([ev.p0, ev.p1, ev.k0, ev.k1]).astype(np.int8),
-            f"c{j}_rawd": np.stack([ev.d0, ev.d1]).astype(np.int32),
-            f"c{j}_style": style,
-        })
-        n = len(ev)
-        chart_meta.append({
-            "j": j, "difficulty": slot if slot in DIFFICULTY_SLOTS else "edit",
-            "difficulty_raw": chart.difficulty, "meter": meter,
-            "description": (getattr(chart, "description", "") or "")[:80],
-            "credit": (getattr(chart, "credit", "") or "")[:80],
-            "f_init": int(enc.f_init), "n_events": n,
-            "n_jumps": int((enc.token >= 8).sum()),
-            "n_holds": int((enc.flavor > 0).sum()), "n_mines": int(len(ev.mines)),
-            "sustained_nps": round(cond.sustained_nps(times_ms / 1000.0), 3),
-            "peak_nps": round(cond.peak_nps(times_ms / 1000.0), 3),
-            "hold_share": round(float((enc.flavor > 0).mean()), 4),
-            "hand_share": round(st.hand_share, 4), "hands": st.hands,
-            "offgrid_dropped": offgrid, "snapped": snapped,
-            "ingest_dropped": st.dropped, "open_holds": st.open_holds,
-            "mean_cost": round(info.mean_cost, 3),
-            "lock_violations": info.lock_violations, "spins": info.spins,
-            "last_tick": int(ev.tick[-1]),
-        })
+        chart_meta.append(pack_chart(
+            arrays, j, ev, times_ms, meter, (chart.difficulty or "").strip().lower(),
+            has_stems=has_stems, difficulty_raw=chart.difficulty,
+            description=getattr(chart, "description", "") or "",
+            credit=getattr(chart, "credit", "") or "", st=st, offgrid=offgrid,
+            snapped=snapped))
 
     title = sf.titletranslit or sf.title or folder.name
     artist = sf.artisttranslit or sf.artist or ""
@@ -313,18 +379,15 @@ def _process_song(folder: Path, out_dir: Path, row: dict, with_demucs: bool) -> 
         "tick0_time_s": float(tick_times[0]),
         "sync": {k: round(v, 4) for k, v in sync.items()},
         "sync_shift_applied_s": round(shift, 4),
-        "timesig_44": _timesig_ok(sf), "has_stems": bool(with_demucs),
+        "timesig_44": _timesig_ok(sf), "has_stems": has_stems,
+        "source_type": "real", "timing": timing_facts(timing),
         **{k: facts[k] for k in ("offset", "bpm_min", "bpm_max", "n_bpm_changes",
                                  "n_stops")},
         "charts": chart_meta,
     }
-    arrays["meta"] = np.frombuffer(json.dumps(meta).encode("utf-8"), dtype=np.uint8)
-    songs = out_dir / "songs"
-    songs.mkdir(parents=True, exist_ok=True)
-    tmp = songs / f"{row['key']}.tmp.npz"
-    np.savez(tmp, **arrays)
-    os.replace(tmp, songs / f"{row['key']}.npz")
+    save_shard(out_dir / "songs" / f"{row['key']}.npz", arrays, meta)
     row.update(ok=True, n_charts=len(chart_meta), n_ticks=int(n_ticks),
+               has_stems=has_stems,
                duration_s=round(duration, 1), sync=round(sync["contrast"], 2),
                shift_ms=round(shift * 1000))
     return row
@@ -349,6 +412,7 @@ def separate_stems(audio_path: str) -> dict:
     with torch.no_grad():
         out = apply_model(model, wav[None].to(dev), device=dev, split=True,
                           overlap=0.1, progress=False)[0].cpu().numpy()
+    out = out * float(ref.std() + 1e-8) + float(ref.mean())   # back to the file's level
     stems = {}
     g = int(np.gcd(model.samplerate, GF.SR))
     for name, src in zip(model.sources, out):
@@ -394,7 +458,7 @@ def _work(args):
 
 
 def compile_corpus(packs_dir, out_dir, workers: int = 4, with_demucs: bool = False,
-                   limit: int | None = None, log=print) -> dict:
+                   limit: int | None = None, log=print, stems_dir=None) -> dict:
     packs_dir, out_dir = Path(packs_dir), Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     index = out_dir / "index.jsonl"
@@ -413,7 +477,7 @@ def compile_corpus(packs_dir, out_dir, workers: int = 4, with_demucs: bool = Fal
         f"{workers} worker(s)")
     stats = {"ok": 0, "rejected": 0}
     t0 = time.time()
-    jobs = [(str(p), str(out_dir), with_demucs) for p in todo]
+    jobs = [(str(p), str(out_dir), with_demucs, stems_dir) for p in todo]
 
     def consume(rows):
         with open(index, "a", encoding="utf-8") as f:
@@ -600,7 +664,57 @@ def split_of(song_id: str) -> str:
     return SPLITS[-1][0]
 
 
-def build_manifest(out_dir, log=print) -> dict:
+def apply_locked_split(manifest: dict, locked: dict, allow_missing: bool = False) -> dict:
+    """Overwrite every song's id, split and chart verdicts with those of
+    `locked` (an earlier manifest over the same song folders). A song the
+    locked manifest does not list is dropped; a chart that no longer matches
+    the one the verdict was given to is an error, not a guess. So is a song
+    the locked manifest uses that was not compiled, unless `allow_missing`
+    (a deliberately partial corpus, e.g. a test fixture)."""
+    by_key = {s["key"]: s for s in locked["songs"]}
+    for s in manifest["songs"]:
+        ref = by_key.get(s["key"])
+        if ref is None:
+            s["reject"] = s["reject"] or "not_in_locked_split"
+            for c in s["charts"]:
+                c["keep"], c["reject"] = False, "not_in_locked_split"
+            continue
+        s["song_id"], s["split"], s["reject"] = ref["song_id"], ref["split"], ref["reject"]
+        want = {c["j"]: c for c in ref["charts"]}
+        for c in s["charts"]:
+            r = want.get(c["j"])
+            if r is None or (r["difficulty"], r["n_events"]) != (c["difficulty"],
+                                                                 c["n_events"]):
+                raise ValueError(
+                    f"locked split: chart {c['j']} of '{s['title']}' ({s['key']}) "
+                    f"no longer matches the manifest it was locked in")
+            c["keep"], c["reject"] = r["keep"], r["reject"]
+    missing = set(by_key) - {s["key"] for s in manifest["songs"]}
+    used = [k for k in missing if any(c["keep"] for c in by_key[k]["charts"])]
+    if used and not allow_missing:
+        raise ValueError(f"locked split: {len(used)} song(s) it trains or validates "
+                         f"on were not compiled, e.g. {sorted(used)[:3]}")
+    reasons: dict = {}
+    by_split = {name: {"songs": 0, "charts": 0} for name, _ in SPLITS}
+    kept = 0
+    for s in manifest["songs"]:
+        k = sum(c["keep"] for c in s["charts"])
+        kept += k
+        for c in s["charts"]:
+            if c["reject"]:
+                reasons[c["reject"]] = reasons.get(c["reject"], 0) + 1
+        if k:
+            by_split[s["split"]]["songs"] += 1
+            by_split[s["split"]]["charts"] += k
+    manifest.update(n_charts_kept=kept, splits=by_split,
+                    n_song_ids=len({s["song_id"] for s in manifest["songs"]}),
+                    rejections=dict(sorted(reasons.items(), key=lambda kv: -kv[1])),
+                    locked_split=True)
+    return manifest
+
+
+def build_manifest(out_dir, log=print, split_manifest=None,
+                   allow_missing: bool = False) -> dict:
     out_dir = Path(out_dir)
     files = sorted((out_dir / "songs").glob("*.npz"))
     files = [f for f in files if not f.name.endswith(".tmp.npz")]
@@ -639,11 +753,15 @@ def build_manifest(out_dir, log=print) -> dict:
                 "n_songs": len(songs), "n_song_ids": len(set(ids)),
                 "n_charts": n_charts, "n_charts_kept": n_kept,
                 "rejections": dict(sorted(reasons.items(), key=lambda kv: -kv[1])),
-                "splits": by_split, "songs": songs}
+                "splits": by_split, "source_type": "real", "songs": songs}
+    if split_manifest:
+        manifest = apply_locked_split(manifest, json.loads(Path(split_manifest).read_text()),
+                                      allow_missing)
     (out_dir / "manifest.json").write_text(json.dumps(manifest))
-    log(f"[manifest] {len(songs)} songs -> {len(set(ids))} song ids; "
-        f"{n_kept}/{n_charts} charts kept; splits {by_split}; "
-        f"rejections {manifest['rejections']}")
+    log(f"[manifest] {len(songs)} songs -> {manifest['n_song_ids']} song ids; "
+        f"{manifest['n_charts_kept']}/{n_charts} charts kept; "
+        f"splits {manifest['splits']}; rejections {manifest['rejections']}"
+        + ("; split locked" if split_manifest else ""))
     return manifest
 
 
@@ -657,9 +775,17 @@ def main(argv=None):
     cp.add_argument("--out-dir", default="build/neural_corpus")
     cp.add_argument("--workers", type=int, default=4)
     cp.add_argument("--with-demucs", action="store_true")
+    cp.add_argument("--stems-dir", help="4-stem cache from neural.synth.stems_cache")
+    cp.add_argument("--split-manifest",
+                    help="(no-subcommand form) lock ids, splits and verdicts to this manifest")
+    cp.add_argument("--split-allow-missing", action="store_true",
+                    help="accept a corpus that holds only part of the locked manifest")
     cp.add_argument("--limit", type=int)
     mp_ = sub.add_parser("manifest", help="quality gate + song-level splits")
     mp_.add_argument("--out-dir", default="build/neural_corpus")
+    mp_.add_argument("--split-manifest",
+                     help="take ids, splits and chart verdicts from this manifest")
+    mp_.add_argument("--split-allow-missing", action="store_true")
     rp = sub.add_parser("reencode", help="re-run the codec on stored raw rows")
     rp.add_argument("--out-dir", default="build/neural_corpus")
     rp.add_argument("--workers", type=int, default=4)
@@ -668,14 +794,18 @@ def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     if argv and argv[0] not in ("compile", "manifest", "reencode", "-h", "--help"):
         a = cp.parse_args(argv)
-        compile_corpus(a.packs_dir, a.out_dir, a.workers, a.with_demucs, a.limit)
-        build_manifest(a.out_dir)
+        compile_corpus(a.packs_dir, a.out_dir, a.workers, a.with_demucs, a.limit,
+                       stems_dir=a.stems_dir)
+        build_manifest(a.out_dir, split_manifest=a.split_manifest,
+                       allow_missing=a.split_allow_missing)
         return
     a = ap.parse_args(argv)
     if a.cmd == "compile":
-        compile_corpus(a.packs_dir, a.out_dir, a.workers, a.with_demucs, a.limit)
+        compile_corpus(a.packs_dir, a.out_dir, a.workers, a.with_demucs, a.limit,
+                       stems_dir=a.stems_dir)
     elif a.cmd == "manifest":
-        build_manifest(a.out_dir)
+        build_manifest(a.out_dir, split_manifest=a.split_manifest,
+                       allow_missing=a.split_allow_missing)
     elif a.cmd == "reencode":
         reencode_corpus(a.out_dir, a.workers)
     else:

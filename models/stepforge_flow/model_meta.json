@@ -1,9 +1,9 @@
 {
   "name": "stepforge_flow",
-  "version": "1.4",
-  "display_name": "StepForge Flow v1.4",
+  "version": "1.5",
+  "display_name": "StepForge Flow v1.5",
   "codec_version": "1.0",
-  "created": "2026-11-15T22:02:46Z",
+  "created": "2026-11-20T07:51:09Z",
   "opset": 17,
   "files": {
     "stage_a": "stage_a_rhythm.onnx",
@@ -48,7 +48,7 @@
       "n_heads": 4,
       "ffn_mult": 4,
       "conv_kernel": 7,
-      "dropout": 0.3
+      "dropout": 0.25
     },
     "params": 9643539,
     "outputs": [
@@ -74,7 +74,7 @@
       "d_audio": 128,
       "dropout": 0.1
     },
-    "params": 15216852,
+    "params": 15216980,
     "inputs": [
       "ctx",
       "scalars",
@@ -85,46 +85,99 @@
   },
   "metrics": {
     "stage_a": {
-      "focal": 0.051753721199929714,
-      "card": 1.0770825743675232,
-      "w1": 3.865469217300415,
-      "jump": 0.25271327048540115,
-      "hold_type": 0.32971128076314926,
-      "hold_dur": 2.8023869395256042,
-      "mine": 0.002685135928913951,
-      "loss": 5.531533479690552,
-      "ap": 0.7925829337916137,
-      "r_prec": 0.7801652329749075,
-      "f1": 0.7905731742798953,
-      "count_err": 1.0827489556937382,
-      "jump_acc": 0.9245939675174014,
-      "hold_type_acc": 0.9253266577115643
+      "focal": 0.05775138642638922,
+      "card": 1.0723443031311035,
+      "w1": 4.026578009128571,
+      "jump": 0.25440600886940956,
+      "hold_type": 0.3361249715089798,
+      "hold_dur": 3.2229124307632446,
+      "mine": 0.0029627254989463836,
+      "loss": 6.04607617855072,
+      "ap": 0.7888030122446967,
+      "r_prec": 0.7773785092707338,
+      "f1": 0.7916703328933862,
+      "count_err": 1.0805398349104256,
+      "jump_acc": 0.9220295518378312,
+      "hold_type_acc": 0.9228843570643547,
+      "f1_hard16": 0.4100856327307326,
+      "n_hard16": 1319,
+      "phase_acc": 1.0,
+      "phase_gain": -9.88967075060915,
+      "phase_gain_worst": -2.400675892829895,
+      "val_score": 0.7469229143050315,
+      "polish_score": 0.74121066281805
     },
     "stage_b": {
-      "ce": 1.417552411556244,
-      "ergo": 0.08816451206803322,
-      "acc": 0.3932814598083496,
-      "loss": 1.4219606518745422,
-      "acc_full": 0.34781290273671445,
-      "acc_half": 0.482265184959659,
-      "gen_cost": 0.11697872570695676,
-      "gen_hard": 0.0,
-      "gen_dstep": 0.0003003003003003003,
-      "ref_cost": 1.910839072642146,
+      "ce": 1.4103320240974426,
+      "ergo": 0.09408995881676674,
+      "acc": 0.3891765773296356,
+      "loss": 1.4150364995002747,
+      "acc_full": 0.3528921234174816,
+      "acc_half": 0.4771665410700829,
+      "gen_cost": 0.22356722608335755,
+      "gen_hard": 8.386447500838645e-05,
+      "gen_dstep": 0.00023689480974840936,
+      "ref_cost": 1.941975412221331,
       "ref_hard": 0.0,
-      "ref_dstep": 0.011650316885303779
+      "ref_dstep": 0.012024557801382287,
+      "probe_mae_cross": 0.015411117114126682,
+      "probe_cross_lo": 0.0035437289625406265,
+      "probe_cross_hi": 0.1569245308637619,
+      "probe_cross_delta": 0.15338080190122128,
+      "probe_mae_jack": 0.03881414234638214,
+      "probe_jack_lo": 0.021334519609808922,
+      "probe_jack_hi": 0.09330309182405472,
+      "probe_jack_delta": 0.0719685722142458,
+      "probe_mae_fsw": 0.015005309134721756,
+      "probe_fsw_lo": 0.0176914781332016,
+      "probe_fsw_hi": 0.071628637611866,
+      "probe_fsw_delta": 0.0539371594786644,
+      "probe_sens": 0.9663175526592468
     },
-    "stage_a_epoch": 44,
-    "stage_b_epoch": 120
+    "stage_a_epoch": 66,
+    "stage_b_epoch": 112
+  },
+  "lineage": {
+    "stage_a": "v1.5b a_lean best (epoch 66, phase 2)",
+    "stage_b": "v1.5b b_cf best (epoch 112)",
+    "decoder": "calibrated on the 60 tuning songs (phase rule, density, Beginner/Easy energy tilt); neural_stream from streambench on 30 of them"
   },
   "decoder": {
-    "phase_rule": "vote",
+    "phase_rule": "margin",
+    "phase_margin": 1.5,
     "density_scale": {
-      "beginner": 0.52,
-      "easy": 0.73,
-      "medium": 0.85,
-      "hard": 0.87,
-      "challenge": 0.9
+      "beginner": 0.8,
+      "easy": 1.0,
+      "medium": 0.95,
+      "hard": 0.94,
+      "challenge": 0.88
+    },
+    "energy_tilt": {
+      "beginner": [
+        1.5,
+        3.0,
+        6.0,
+        12.0
+      ],
+      "easy": [
+        1.5,
+        3.0,
+        6.0,
+        12.0
+      ]
+    },
+    "neural_stream": true
+  },
+  "calibration": {
+    "tuning_songs": 60,
+    "phase_errors": 1,
+    "phase_songs": 58,
+    "median_ratio": {
+      "beginner": 1.041,
+      "easy": 1.044,
+      "medium": 0.975,
+      "hard": 0.994,
+      "challenge": 1.009
     }
   }
 }

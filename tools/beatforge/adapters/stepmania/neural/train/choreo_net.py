@@ -12,6 +12,13 @@ state (the spec allows either). That keeps the two stages independently
 trainable and retrainable — a new RhythmNet does not invalidate a ChoreoNet —
 and the eight transformer layers contextualise the per-note audio across the
 whole phrase anyway.
+
+`no_audio_embed` is a TRAINING-ONLY vector that stands in for the audio
+encoder's output when a sequence has no audio (synthetic step patterns) or
+when its audio is deliberately withheld (`drop_audio`). It teaches the network
+to choreograph from rhythm and style alone without ever being fed silence as
+if it were music. Inference always passes real audio and never `drop_audio`,
+so the exported graph does not contain the vector at all.
 """
 from __future__ import annotations
 
@@ -93,11 +100,20 @@ class ChoreoNet(nn.Module):
         self.blocks = nn.ModuleList(TransformerBlock(cfg) for _ in range(cfg.n_layers))
         self.out_norm = nn.LayerNorm(d)
         self.head = nn.Linear(d, N_TOKENS)
+        self.no_audio_embed = nn.Parameter(torch.zeros(cfg.d_audio))
+        nn.init.normal_(self.no_audio_embed, std=0.02)
 
     def forward(self, ctx: torch.Tensor, scalars: torch.Tensor, tokens: torch.Tensor,
-                cond: torch.Tensor, pad_mask: torch.Tensor | None = None):
+                cond: torch.Tensor, pad_mask: torch.Tensor | None = None,
+                drop_audio: torch.Tensor | None = None):
+        """`drop_audio` (B,) bool, training only: sequences whose audio is
+        replaced by `no_audio_embed`."""
         c = self.cond(cond)
-        h = self.in_proj(torch.cat([self.audio(ctx), scalars], dim=-1)) + self.tok(tokens)
+        audio = self.audio(ctx)
+        if drop_audio is not None:
+            audio = torch.where(drop_audio[:, None, None],
+                                self.no_audio_embed.to(audio.dtype), audio)
+        h = self.in_proj(torch.cat([audio, scalars], dim=-1)) + self.tok(tokens)
         for blk in self.blocks:
             h = blk(h, c, pad_mask)
         return self.head(self.out_norm(h))
@@ -132,3 +148,5 @@ def mask_tokens(tokens: torch.Tensor, pad_mask: torch.Tensor,
 
 
 INPUT_NAMES = ("ctx", "scalars", "tokens", "cond")
+#: Parameters that exist for training and must not reach an exported graph.
+TRAINING_ONLY = ("no_audio_embed",)

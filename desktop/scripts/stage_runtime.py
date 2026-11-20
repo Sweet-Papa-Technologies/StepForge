@@ -308,12 +308,15 @@ def audit_native(py_root: Path, triple: str) -> None:
     log("every native library the runtime loads is bundled or part of the OS")
 
 
-def copy_engine(dest: Path, version: str) -> None:
+def copy_engine(dest: Path, version: str, model_dir: Path | None = None) -> None:
     ignore = shutil.ignore_patterns("__pycache__", ".pytest_cache", "tests", "*.pyc")
     shutil.copytree(REPO / "tools" / "beatforge", dest / "tools" / "beatforge", ignore=ignore)
     for f in ("requirements.txt", "package.json"):
         shutil.copy2(REPO / f, dest / f)
-    shutil.copytree(REPO / "models" / "stepforge_flow", dest / "models" / "stepforge_flow")
+    # a candidate model can be staged for a local test build without
+    # installing it in the repository (--model-dir)
+    shutil.copytree(model_dir or REPO / "models" / "stepforge_flow",
+                    dest / "models" / "stepforge_flow")
     for d in ("assets/tracks", "public/assets/tracks", "public/maps", "build"):
         (dest / d).mkdir(parents=True, exist_ok=True)
     try:
@@ -410,6 +413,9 @@ def main() -> int:
                     help="app version stamped into ENGINE_VERSION")
     ap.add_argument("--out", default=str(OUT))
     ap.add_argument("--cache", default=str(REPO / ".cache" / "runtime"))
+    ap.add_argument("--model-dir",
+                    help="bundle this model folder instead of models/stepforge_flow "
+                         "(a local test build of a candidate model)")
     ap.add_argument("--keep-python", action="store_true",
                     help="reuse an already staged python/ (refresh the engine only)")
     a = ap.parse_args()
@@ -428,7 +434,10 @@ def main() -> int:
         bundle_vc_runtime(py_root)
     audit_native(py_root, a.triple)
     shutil.rmtree(engine, ignore_errors=True)
-    copy_engine(engine, a.version)
+    model_dir = Path(a.model_dir).expanduser().resolve() if a.model_dir else None
+    if model_dir is not None and not (model_dir / "model_meta.json").is_file():
+        raise SystemExit(f"--model-dir {model_dir} has no model_meta.json")
+    copy_engine(engine, a.version, model_dir)
     smoke_test(python_exe(py_root), engine, a.triple)
     for p in out.rglob("__pycache__"):
         shutil.rmtree(p, ignore_errors=True)

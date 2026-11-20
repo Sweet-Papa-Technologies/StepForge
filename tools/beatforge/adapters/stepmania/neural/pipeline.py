@@ -189,6 +189,86 @@ def _notefield_png(path, notes, times, bpm, offset, sections) -> None:
     im.save(path)
 
 
+def cheapest_reading(placements, difficulty: str, bpm: float | None = None) -> list:
+    """footflow's cost of every step under the foot assignment that makes the
+    whole chart cheapest for it -> [(index into `placements`, cost)].
+
+    A chart on disk carries no foot labels, so anyone reading one — a player,
+    or the benchmark's `footflow_optimal`, which this mirrors step for step —
+    has to pick the feet themselves, and the natural pick is the least total
+    effort. That reading is not always the one the engine had in mind, and it
+    can run through a step that is worse than anything in the engine's own:
+    it accepts one very bad step if that makes the notes around it easy."""
+    from .. import footflow as ff
+    budget = BUDGETS[difficulty]
+    notes = [(i, p) for i, p in enumerate(placements)
+             if p.kind != "mine" and 1 <= len(p.panels) <= 2]
+    if len(notes) < 2:
+        return []
+    dp = {ff.REST_STATE: (0.0, None, 0.0)}
+    back, prev_beat = [], None
+    for _, p in notes:
+        ndp = {}
+        dt_s = None if bpm is None or prev_beat is None \
+            else (p.beat - prev_beat) * 60.0 / bpm
+        prev_beat = p.beat
+        for st, (c0, _, _) in dp.items():
+            if len(p.panels) == 2:
+                moves = [ff.jump_cost(st, a, b, budget) for a, b in
+                         (p.panels, p.panels[::-1])]
+            else:
+                moves = [ff.step(st, foot, p.panels[0], budget, "static", 0.0, dt_s=dt_s)
+                         for foot in (ff.LEFT, ff.RIGHT)]
+            for dc, ns in moves:
+                if ns not in ndp or c0 + dc < ndp[ns][0]:
+                    ndp[ns] = (c0 + dc, st, dc)
+        back.append(ndp)
+        dp = ndp
+    state = min(dp, key=lambda k: dp[k][0])
+    costs = []
+    for step in reversed(back):
+        _, prev, dc = step[state]
+        costs.append(max(0.0, dc))
+        state = prev
+    costs.reverse()
+    return [(i, c) for (i, _), c in zip(notes, costs)]
+
+
+def read_double_steps(events: C.ChartEvents, times_ms) -> list:
+    """Notes that are an unforced double-step in the annotator's own reading
+    of a chart (`codec.encode`): the same foot goes to a new panel although
+    the other foot is free and less than half a second has passed.
+
+    The engine never writes one in its own footing. But a chart on disk has no
+    foot labels, and where the engine kept its feet crossed for a long stretch
+    the cheapest way to stand on the same arrows can be a single double-step
+    that uncrosses them. Whoever reads the chart that way — a player, or the
+    benchmark, which counts exactly this — meets a double-step the engine never
+    intended."""
+    if len(events) < 2:
+        return []
+    times_ms = np.asarray(times_ms, np.float64)
+    enc, _ = C.encode(events, times_ms)
+    tok = enc.token.astype(np.int64)
+    before, _, _ = C.foot_path(enc)
+    t = C.tables()
+    dtb = C.dt_bucket(np.concatenate([[1e9], np.diff(times_ms)]))
+    lock = t["lockbits"][C._held_masks(events), before]
+    fl = before & 1
+    pl, pr = (before >> 1) // 4, (before >> 1) % 4
+    same = (tok >= 4) & (tok < 8)
+    same_pos = np.where(fl == C.LEFT, pl, pr)
+    same_panel = np.where(fl == C.LEFT, tok & 3, np.asarray(C.PANEL_OF[C.RIGHT])[tok & 3])
+    other_locked = ((lock >> (1 - fl)) & 1) == 1
+    return np.nonzero(same & (same_panel != same_pos) & ~other_locked
+                      & (dtb <= READ_DSTEP_MAX_BUCKET))[0].tolist()
+
+
+#: Gap bucket (codec.DT_EDGES_MS) up to which a double-step is not excused by
+#: the pause before it: under 480 ms.
+READ_DSTEP_MAX_BUCKET = 3
+
+
 def flow_veto(difficulty: str, bpm: float | None = None):
     """The project's flow-ceiling gate as a per-note referee for the engine.
 
@@ -201,6 +281,18 @@ def flow_veto(difficulty: str, bpm: float | None = None):
     those rules, replay the gate's own arithmetic and hand back the notes it
     objects to; the engine bans each and re-solves. `bpm` gives the gate the
     time between steps, as `qa.chart_metrics` does, so slow repeats pass.
+
+    A chart whose own footing passes is then read the way someone without the
+    engine's foot labels reads it (`cheapest_reading`), and a step that reaches
+    the forbidden tier in THAT reading is objected to as well. On 900
+    benchmark charts three had one: an arrow repeated within a third of a
+    second — a fast jack, which sits exactly at the ceiling — that the cheapest
+    reading plays with the feet crossed, or with the jump before it crossed,
+    because that saves more on the neighbouring steps than the bad step costs.
+
+    Last, the codec's annotator reads the chart (`read_double_steps`): a note
+    it can only explain as an unforced double-step is objected to as well. On
+    900 benchmark charts of the v1.5b step network 41 had one or two.
     """
     from .. import footflow as ff
     budget = BUDGETS[difficulty]
@@ -209,6 +301,20 @@ def flow_veto(difficulty: str, bpm: float | None = None):
     def veto(chart) -> list:
         placements = infer.to_placements(chart)
         index = {int(t): i for i, t in enumerate(chart.events.tick)}
+        bad = own(placements, index)
+        if not bad:
+            for j, c in cheapest_reading(placements, difficulty, bpm):
+                if c >= ceiling:
+                    i = index.get(int(round(placements[j].beat * C.TICKS_PER_BEAT)))
+                    if i is not None:
+                        bad.append(i)
+        if not bad and bpm:
+            # ...and the way the codec's annotator reads it may not hold an
+            # unforced double-step either (`read_double_steps`)
+            bad = read_double_steps(chart.events, chart.events.tick * (5000.0 / bpm))
+        return bad
+
+    def own(placements, index) -> list:
         state, bad, prev_beat = ff.REST_STATE, [], None
         for p in placements:
             dt_s = None if bpm is None or prev_beat is None \
@@ -574,12 +680,34 @@ def phase_margin(engine) -> float:
     return float(v) if isinstance(v, (int, float)) else PHASE_MARGIN
 
 
+PHASE_RULES = ("margin", "vote", "margin_vote")
+
+
 def phase_rule(engine) -> str:
-    """How this model decides the half-beat question: 'margin' (the default)
-    or 'vote', from `decoder.phase_rule` in model_meta.json. See verify_phase."""
+    """How this model decides the half-beat question: 'margin' (the default),
+    'vote' or 'margin_vote', from `decoder.phase_rule` in model_meta.json. See
+    verify_phase."""
     meta = getattr(getattr(engine, "model", None), "meta", None) or {}
     v = (meta.get("decoder") or {}).get("phase_rule")
-    return v if v in ("margin", "vote") else "margin"
+    return v if v in PHASE_RULES else "margin"
+
+
+def phase_decision(rule: str, margin: float, onset: float, jump: float | None = None,
+                   audio: float | None = None) -> bool:
+    """Move the grid half a beat? From the three pieces of evidence
+    (`phase_evidence`), each positive when it favours moving:
+
+      margin        the onset statistic alone, when it exceeds `margin`
+      vote          two of the three, by sign
+      margin_vote   the onset statistic when it is sure of itself (beyond
+                    `margin` either way), the vote of all three when it is not
+    """
+    if rule == "margin":
+        return bool(onset > margin)
+    votes = sum(v > 0 for v in (onset, jump, audio)) >= 2
+    if rule == "margin_vote" and abs(onset) > margin:
+        return bool(onset > 0)
+    return bool(votes)
 
 
 #: Core feature channel of the percussive mid-band (150 Hz - 2 kHz) onset flux:
@@ -629,6 +757,11 @@ def verify_phase(engine, core: np.ndarray, dt_ms: np.ndarray) -> dict:
     over seven such statistics whose error counts ranged from 5 to 17 with a
     median of 8 — expect something between those on new songs, against 18.
 
+    A third rule, 'margin_vote', is for a model whose onset statistic is
+    reliable when it is large and not when it is small: beyond the margin
+    either way the statistic decides alone, inside it the vote does.
+    `calibrate_decoder` picks among the three on a set of tuning songs.
+
     **Which beat is beat 1.** dsp.py's beat 0 is the first beat it tracked, not
     a downbeat: on 166 songs its bar lines matched the charter's on 44 (27%).
     The networks are told where each tick sits in the bar, and jumps at the low
@@ -666,17 +799,18 @@ def verify_phase(engine, core: np.ndarray, dt_ms: np.ndarray) -> dict:
     half = C.TICKS_PER_BEAT // 2
     p0, p_half = onset_p(0), onset_p(half)
     gain = contrast(p_half) - contrast(p0)
-    if rule == "vote":
+    if rule == "margin":
+        out.update(half_beat=phase_decision(rule, phase_margin(engine), gain),
+                   gain=round(gain, 2))
+    else:
         cm = engine.cond_for(cond.resolve_style("medium"))
         jump = contrast(heads(half, cm, "jump")) - contrast(heads(0, cm, "jump"))
         k = np.arange(len(core)) % C.TICKS_PER_BEAT
         perc = np.maximum(core[:, PERC_MID].astype(np.float64), 0.0)
         audio = float(np.log((perc[k == half].sum() + 1e-6) / (perc[k == 0].sum() + 1e-6)))
         votes = {"onset": round(gain, 2), "jump": round(jump, 2), "audio": round(audio, 2)}
-        out.update(half_beat=sum(v > 0 for v in (gain, jump, audio)) >= 2, votes=votes,
-                   gain=round(gain, 2))
-    else:
-        out.update(half_beat=bool(gain > phase_margin(engine)), gain=round(gain, 2))
+        out.update(half_beat=phase_decision(rule, phase_margin(engine), gain, jump, audio),
+                   votes=votes, gain=round(gain, 2))
     base = half if out["half_beat"] else 0
     share = [on_beat_one(p_half if out["half_beat"] else p0)]
     share += [on_beat_one(onset_p(base + k * C.TICKS_PER_BEAT)) for k in (1, 2, 3)]
@@ -792,6 +926,7 @@ def _design_note(difficulty: str, style, preset, stats: dict) -> dict:
         said.append(f"Stream mode ({s['subdivision']}ths, {s['stream_bars']} of "
                     f"{s['playable_bars']} bars, {s['nps']:g} notes/s"
                     + (", above this difficulty's usual peak rate" if s["over_tier_rate"] else "")
+                    + (f"; switched on by the {s['routed']}" if s.get("routed") else "")
                     + ")")
     if opts.get("crossovers") is False:
         said.append("no crossovers")
@@ -906,14 +1041,20 @@ def chart_song(ctx: SongContext, difficulties, engine: infer.StepManiaNeuralEngi
                     overrides[key] = val
         style = cond.resolve_style(diff, style_preset, overrides or None)
         styles[diff] = style
+        # a chart asked to be a stream chart is made in Stream mode (see
+        # infer.route_stream); `style_overrides` are the caller's own sliders
+        chart_options, routed = infer.route_stream(diff, style, style_preset,
+                                                   style_overrides, options)
         charts[diff] = engine.generate(
             g.X, g.tick_times_sec, diff, style, analysis["duration_s"],
             seed=_default_seed(track_id, diff) if seed is None else seed,
             tau=tau, energy_per_bar=analysis.get("energy_curve"),
             veto=flow_veto(diff, analysis["bpm"]), on_transient=ctx.on_transient,
-            options=options,
+            options=chart_options,
             progress=(lambda stage, d=diff: log(f"    [{d}] neural: {stage}…", flush=True))
             if log else None)
+        if routed and "stream" in charts[diff].stats.get("rhythm", {}):
+            charts[diff].stats["rhythm"]["stream"]["routed"] = routed
     return charts, styles, retrieved
 
 
