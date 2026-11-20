@@ -574,12 +574,34 @@ def phase_margin(engine) -> float:
     return float(v) if isinstance(v, (int, float)) else PHASE_MARGIN
 
 
+PHASE_RULES = ("margin", "vote", "margin_vote")
+
+
 def phase_rule(engine) -> str:
-    """How this model decides the half-beat question: 'margin' (the default)
-    or 'vote', from `decoder.phase_rule` in model_meta.json. See verify_phase."""
+    """How this model decides the half-beat question: 'margin' (the default),
+    'vote' or 'margin_vote', from `decoder.phase_rule` in model_meta.json. See
+    verify_phase."""
     meta = getattr(getattr(engine, "model", None), "meta", None) or {}
     v = (meta.get("decoder") or {}).get("phase_rule")
-    return v if v in ("margin", "vote") else "margin"
+    return v if v in PHASE_RULES else "margin"
+
+
+def phase_decision(rule: str, margin: float, onset: float, jump: float | None = None,
+                   audio: float | None = None) -> bool:
+    """Move the grid half a beat? From the three pieces of evidence
+    (`phase_evidence`), each positive when it favours moving:
+
+      margin        the onset statistic alone, when it exceeds `margin`
+      vote          two of the three, by sign
+      margin_vote   the onset statistic when it is sure of itself (beyond
+                    `margin` either way), the vote of all three when it is not
+    """
+    if rule == "margin":
+        return bool(onset > margin)
+    votes = sum(v > 0 for v in (onset, jump, audio)) >= 2
+    if rule == "margin_vote" and abs(onset) > margin:
+        return bool(onset > 0)
+    return bool(votes)
 
 
 #: Core feature channel of the percussive mid-band (150 Hz - 2 kHz) onset flux:
@@ -629,6 +651,11 @@ def verify_phase(engine, core: np.ndarray, dt_ms: np.ndarray) -> dict:
     over seven such statistics whose error counts ranged from 5 to 17 with a
     median of 8 — expect something between those on new songs, against 18.
 
+    A third rule, 'margin_vote', is for a model whose onset statistic is
+    reliable when it is large and not when it is small: beyond the margin
+    either way the statistic decides alone, inside it the vote does.
+    `calibrate_decoder` picks among the three on a set of tuning songs.
+
     **Which beat is beat 1.** dsp.py's beat 0 is the first beat it tracked, not
     a downbeat: on 166 songs its bar lines matched the charter's on 44 (27%).
     The networks are told where each tick sits in the bar, and jumps at the low
@@ -666,17 +693,18 @@ def verify_phase(engine, core: np.ndarray, dt_ms: np.ndarray) -> dict:
     half = C.TICKS_PER_BEAT // 2
     p0, p_half = onset_p(0), onset_p(half)
     gain = contrast(p_half) - contrast(p0)
-    if rule == "vote":
+    if rule == "margin":
+        out.update(half_beat=phase_decision(rule, phase_margin(engine), gain),
+                   gain=round(gain, 2))
+    else:
         cm = engine.cond_for(cond.resolve_style("medium"))
         jump = contrast(heads(half, cm, "jump")) - contrast(heads(0, cm, "jump"))
         k = np.arange(len(core)) % C.TICKS_PER_BEAT
         perc = np.maximum(core[:, PERC_MID].astype(np.float64), 0.0)
         audio = float(np.log((perc[k == half].sum() + 1e-6) / (perc[k == 0].sum() + 1e-6)))
         votes = {"onset": round(gain, 2), "jump": round(jump, 2), "audio": round(audio, 2)}
-        out.update(half_beat=sum(v > 0 for v in (gain, jump, audio)) >= 2, votes=votes,
-                   gain=round(gain, 2))
-    else:
-        out.update(half_beat=bool(gain > phase_margin(engine)), gain=round(gain, 2))
+        out.update(half_beat=phase_decision(rule, phase_margin(engine), gain, jump, audio),
+                   votes=votes, gain=round(gain, 2))
     base = half if out["half_beat"] else 0
     share = [on_beat_one(p_half if out["half_beat"] else p0)]
     share += [on_beat_one(onset_p(base + k * C.TICKS_PER_BEAT)) for k in (1, 2, 3)]

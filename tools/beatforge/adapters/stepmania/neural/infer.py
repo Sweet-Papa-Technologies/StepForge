@@ -241,6 +241,13 @@ class FlowModel:
         v = own.get(difficulty)
         return float(v) if isinstance(v, (int, float)) else DENSITY_SCALE.get(difficulty, 1.0)
 
+    @property
+    def neural_stream(self) -> bool:
+        """Were these weights trained to write stream charts when asked
+        (`decoder.neural_stream` in model_meta.json)? Without it Stream mode
+        always uses the rule fill."""
+        return bool((self.meta.get("decoder") or {}).get("neural_stream"))
+
     # -- Stage A ---------------------------------------------------------- #
     def rhythm(self, x: np.ndarray, cond19: np.ndarray) -> dict:
         """X (T, 64) -> per-tick logits, run in overlapping 32-measure windows
@@ -339,6 +346,13 @@ _FINEST = {"beginner": 4, "easy": 8, "medium": 8, "hard": 16, "challenge": 16}
 RUN_LIMIT = {"beginner": 1, "easy": 2, "medium": 6, "hard": 16, "challenge": 24}
 
 
+STREAM_FILLS = ("neural", "rule")
+#: A model-written stream chart is kept when the model itself puts at least
+#: this share of the stream's notes above even odds; below it the model has
+#: not written a stream and the rule fill is used instead.
+NEURAL_STREAM_MIN_SHARE = 0.60
+
+
 @dataclass(frozen=True)
 class DecodeOptions:
     """What the user asked of the decoder beyond the style sliders. Everything
@@ -349,6 +363,10 @@ class DecodeOptions:
                      breaks between them, instead of note-by-note selection
     stream_coverage  share of the playable bars that are stream (Stream mode)
     min_break_bars   a break is never shorter than this many bars (Stream mode)
+    stream_fill      Stream mode: 'neural' asks the model itself for a stream
+                     chart (see `stream_style`) and falls back to 'rule' when
+                     the model does not write one; 'rule' lays the streams out
+                     over an ordinary chart's probabilities, as v1.4 did
     crossovers       False: no step may end with the feet crossed
     density          multiplier on the note count the model itself expects
                      (used when the NPS slider is left to the model)
@@ -359,8 +377,12 @@ class DecodeOptions:
     min_break_bars: int = 2
     crossovers: bool = True
     density: float = 1.0
+    stream_fill: str = "neural"
 
     def __post_init__(self):
+        if self.stream_fill not in STREAM_FILLS:
+            raise ValueError(f"stream_fill must be one of {', '.join(STREAM_FILLS)}, "
+                             f"not {self.stream_fill!r}")
         if self.max_subdivision not in (None, 4, 8, 16):
             raise ValueError(f"max_subdivision must be 4, 8 or 16, not {self.max_subdivision!r}")
         if not 0.0 < float(self.stream_coverage) <= 1.0:
@@ -395,6 +417,7 @@ class DecodeOptions:
         else:
             out.pop("stream_coverage", None)
             out.pop("min_break_bars", None)
+            out.pop("stream_fill", None)
         return out
 
 
@@ -679,6 +702,23 @@ def stream_subdivision(difficulty: str, max_subdivision: int | None,
     return 4
 
 
+def stream_style(style: np.ndarray, difficulty: str, opts: DecodeOptions,
+                 beat_s: float) -> np.ndarray:
+    """The style a Stream-mode chart is described by, for asking the model to
+    write one: the density of the stream's own subdivision at this tempo, and
+    — when that subdivision is 16ths, the only runs the stream slider counts —
+    the share of the chart the user wants as stream. Sliders the user set
+    stay; the rest stay with the model. Deliberately not clamped to the tier:
+    Stream mode already exceeds the tier's run length by design."""
+    out = np.asarray(style, np.float32).copy()
+    sub = stream_subdivision(difficulty, opts.max_subdivision, beat_s)
+    rate = float(np.clip((sub / 4.0) / beat_s, 0.5, 16.0))
+    out[cond.INDEX["meter_norm"]] = cond.effective_meter(rate) / 15.0
+    out[cond.INDEX["nps_norm"]] = rate / 16.0
+    out[cond.INDEX["stream_share"]] = float(opts.stream_coverage) if sub == 16 else 0.0
+    return out
+
+
 def _stream_layout(p: np.ndarray, allowed: np.ndarray, tick_times: np.ndarray,
                    difficulty: str, opts: DecodeOptions,
                    rank: np.ndarray | None) -> dict:
@@ -775,7 +815,9 @@ def _stream_layout(p: np.ndarray, allowed: np.ndarray, tick_times: np.ndarray,
     info = {"subdivision": sub, "segments": segments,
             "stream_bars": int(sum(e - s for s, e in segments)),
             "playable_bars": n_play, "nps": round(nps, 2),
-            "over_tier_rate": bool(nps > BUDGETS[difficulty].max_nps_4s + 1e-6)}
+            "over_tier_rate": bool(nps > BUDGETS[difficulty].max_nps_4s + 1e-6),
+            # how much of the stream the model would have written unprompted
+            "model_share": round(float((p[ticks] >= 0.5).mean()), 3) if len(ticks) else 0.0}
     return {"ticks": ticks, "break_allowed": break_allowed, "info": info}
 
 
@@ -1670,9 +1712,32 @@ class StepManiaNeuralEngine:
         cv = self.cond_for(style, has_stems)
         if progress:
             progress("rhythm")
-        plan = decode_rhythm(self.model.rhythm(x, cv), tick_times, difficulty, style,
-                             duration_s, energy_per_bar, on_transient, options=opts,
-                             density_scale=self.model.density_scale(difficulty))
+
+        def rhythm(cond_vec):
+            return decode_rhythm(self.model.rhythm(x, cond_vec), tick_times, difficulty,
+                                 style, duration_s, energy_per_bar, on_transient,
+                                 options=opts,
+                                 density_scale=self.model.density_scale(difficulty))
+
+        fill = None
+        if opts.stream:
+            fill = "rule"
+            if opts.stream_fill == "neural" and self.model.neural_stream and len(tick_times) > 1:
+                # ask the model for a stream chart, and keep its answer if it
+                # wrote one; otherwise fall back to laying the streams out
+                beat_s = float(np.median(np.diff(tick_times))) * C.TICKS_PER_BEAT
+                asked = stream_style(style, difficulty, opts, beat_s)
+                cv_stream = self.cond_for(asked, has_stems)
+                plan = rhythm(cv_stream)
+                share = plan.stats.get("stream", {}).get("model_share", 0.0)
+                if share >= NEURAL_STREAM_MIN_SHARE:
+                    fill, cv, style = "neural", cv_stream, asked
+                else:
+                    fill = f"rule (the model wrote {share:.0%} of the stream)"
+        if fill != "neural":
+            plan = rhythm(cv)
+        if fill is not None and "stream" in plan.stats:
+            plan.stats["stream"]["fill"] = fill
         n = len(plan.tick)
         stats = {"rhythm": plan.stats, "difficulty": difficulty, "seed": seed,
                  "tau": tau, "quantization": self.model.quantization}

@@ -1,0 +1,13 @@
+# StepForge Flow — OFFLINE DATA SYNTHESIS ONLY
+# (tools/beatforge/adapters/stepmania/neural/synth). Never needed to run the app
+# or to train from an existing corpus: the stem cache and the acoustic
+# augmentation are the only tools that use anything beyond requirements.txt.
+#
+#   python3 -m pip install -r requirements.txt -r requirements-train.txt -r requirements-synth.txt
+demucs             # 4-stem separation (synth/stems_cache.py); pulls in torch
+# Also needed on PATH, not from pip:
+#   rubberband     pitch / tempo changes that keep transients in place
+#                  (apt install rubberband-cli | brew install rubberband)
+#   ffmpeg         the lossy-codec round trip of the "degrade" variant
+# Without them the augmenter still runs, with weaker variants; pass
+# --require-rubberband to make their absence an error.

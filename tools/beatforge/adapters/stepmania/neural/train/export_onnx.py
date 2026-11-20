@@ -27,7 +27,7 @@ from .. import conditioning as cond
 from .. import event_features as EF
 from .. import grid_features as GF
 from .choreo_net import INPUT_NAMES as B_INPUTS
-from .choreo_net import ChoreoConfig, ChoreoNet
+from .choreo_net import TRAINING_ONLY, ChoreoConfig, ChoreoNet
 from .rhythm_net import OUTPUT_NAMES as A_OUTPUTS
 from .rhythm_net import RhythmConfig, RhythmNet
 
@@ -74,6 +74,25 @@ def export_stage_b(model: ChoreoNet, path) -> None:
             "tokens": {0: "batch", 1: "events"}, "cond": {0: "batch"},
             "logits": {0: "batch", 1: "events"}}
     _export(model, stage_b_inputs(1, 9, model.cfg), path, B_INPUTS, ("logits",), axes)
+
+
+def graph_signature(path) -> dict:
+    """An exported graph's contract with the runtime: input and output names
+    with their shapes (symbolic dimensions by name)."""
+    sess = _session(path)
+    return {"inputs": {i.name: list(i.shape) for i in sess.get_inputs()},
+            "outputs": {o.name: list(o.shape) for o in sess.get_outputs()}}
+
+
+def training_only_leaks(path) -> list:
+    """Names in an exported graph that belong to training-only parameters
+    (`choreo_net.TRAINING_ONLY`). Must be empty: inference never withholds the
+    audio, so nothing that implements withholding may ship."""
+    import onnx
+    g = onnx.load(str(path)).graph
+    names = [i.name for i in g.initializer] + [i.name for i in g.input]
+    names += [n.name for n in g.node] + [o for n in g.node for o in n.output]
+    return sorted({n for n in names for bad in TRAINING_ONLY if bad in n})
 
 
 def _session(path):
@@ -137,7 +156,8 @@ def feature_spec() -> dict:
 
 def export_models(model_a: RhythmNet, model_b: ChoreoNet, out_dir, *,
                   metrics: dict | None = None, trained_with_stems: bool = False,
-                  int8: bool = False, extra: dict | None = None) -> dict:
+                  int8: bool = False, extra: dict | None = None,
+                  version: str | None = None) -> dict:
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     meta_path = out_dir / META_FILE
@@ -148,6 +168,9 @@ def export_models(model_a: RhythmNet, model_b: ChoreoNet, out_dir, *,
     export_stage_b(model_b, out_dir / STAGE_B_FILE)
     diff_a = verify_stage_a(model_a, out_dir / STAGE_A_FILE)
     diff_b = verify_stage_b(model_b, out_dir / STAGE_B_FILE)
+    leaks = training_only_leaks(out_dir / STAGE_B_FILE)
+    if leaks:
+        raise AssertionError(f"training-only parameters reached the exported graph: {leaks}")
     files = {"stage_a": STAGE_A_FILE, "stage_b": STAGE_B_FILE}
     quantization = "fp32"
     if int8:
@@ -157,7 +180,10 @@ def export_models(model_a: RhythmNet, model_b: ChoreoNet, out_dir, *,
             files[key + "_int8"] = q
         quantization = "fp32+int8"
     meta = {
-        "name": "stepforge_flow", "codec_version": C.CODEC_VERSION,
+        "name": "stepforge_flow",
+        **({"version": version, "display_name": f"StepForge Flow v{version}"}
+           if version else {}),
+        "codec_version": C.CODEC_VERSION,
         "created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "opset": OPSET, "files": files, "quantization": quantization,
         "trained_with_stems": bool(trained_with_stems),
@@ -179,7 +205,13 @@ def load_checkpoint(path, stage: str):
         model = RhythmNet(RhythmConfig(**state["config"]))
     else:
         model = ChoreoNet(ChoreoConfig(**state["config"]))
-    model.load_state_dict(state["model"])
+    missing, unexpected = model.load_state_dict(state["model"], strict=False)
+    # a checkpoint from before v1.5 has no training-only parameters; nothing
+    # else may be absent
+    missing = [k for k in missing if k not in TRAINING_ONLY]
+    if missing or unexpected:
+        raise RuntimeError(f"checkpoint {path} does not fit the model: "
+                           f"missing {missing}, unexpected {list(unexpected)}")
     return model.eval(), state
 
 
@@ -192,13 +224,15 @@ def main(argv=None):
     ap.add_argument("--int8", action="store_true",
                     help="also write dynamic-quantized int8 variants")
     ap.add_argument("--trained-with-stems", action="store_true")
+    ap.add_argument("--version", help="model version to record, e.g. 1.5")
     a = ap.parse_args(argv)
     model_a, sa = load_checkpoint(a.stage_a, "a")
     model_b, sb = load_checkpoint(a.stage_b, "b")
     metrics = {"stage_a": sa.get("val", {}), "stage_b": sb.get("val", {}),
                "stage_a_epoch": sa.get("epoch"), "stage_b_epoch": sb.get("epoch")}
     meta = export_models(model_a, model_b, a.out, metrics=metrics,
-                         trained_with_stems=a.trained_with_stems, int8=a.int8)
+                         trained_with_stems=a.trained_with_stems, int8=a.int8,
+                         version=a.version)
     print(f"[export] wrote {a.out}: stage A {meta['stage_a']['params'] / 1e6:.2f}M "
           f"(parity {meta['stage_a']['parity_max_abs_diff']:.1e}), stage B "
           f"{meta['stage_b']['params'] / 1e6:.2f}M "
