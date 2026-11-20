@@ -419,7 +419,8 @@ def test_a_model_can_carry_its_own_density_scale(tmp_path):
 def test_the_shipped_model_carries_its_decoder_settings():
     meta = json.loads((infer.default_model_dir() / "model_meta.json").read_text())
     dec = meta.get("decoder") or {}
-    assert dec.get("phase_rule") == "vote"
+    # v1.5's rhythm network decides the half beat by itself; v1.4 needed the vote.
+    assert dec.get("phase_rule") == "margin" and dec.get("phase_margin", 0) > 0
     assert set(dec.get("density_scale") or {}) == set(BUDGETS)
     assert all(0.3 <= v <= 1.2 for v in dec["density_scale"].values())
 
