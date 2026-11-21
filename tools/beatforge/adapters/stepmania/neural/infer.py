@@ -493,6 +493,28 @@ SLOW_REPEAT_RUN = 3
 #: many nats unless the footswitch slider asks for them.
 FOOTSWITCH_PENALTY = 2.5
 FOOTSWITCH_SLOW_S = 0.60
+#: Footswitch placement. A footswitch on disk is one repeated arrow, and whoever
+#: reads the chart decides which foot plays it. Read the other way it is a jack
+#: with the feet swapped, and that reading is the cheaper one unless the steps
+#: after it punish it: with the v1.5b step network, 12% of a chart's steps were
+#: footswitches in the decoder's own footing when 16% was asked, and 2.7% in
+#: the annotator's reading — the rest were read as jacks. What makes the
+#: reading stick is the two steps that follow: each foot out to its own side
+#: panel. Swapped, that is a spin, so the footswitch is the only way to stand
+#: on it. When the footswitch slider asks for more than FSW_PLACE_MIN_SHARE the
+#: decoder therefore places them: a bonus on a D/U footswitch at chosen notes
+#: and on that continuation, the chart read back as a player would read it
+#: (`codec.encode`), and every footswitch that was not read as one taken out
+#: again, until the READ share is what was asked. Below the threshold, and with
+#: the slider left to the model, nothing here runs.
+FSW_PLACE_MIN_SHARE = 0.03
+FSW_MAX_GAP_S = 0.48               # slower than this a repeated arrow is a jack to anyone
+FSW_BONUS = 8.0                    # nats on a D/U footswitch at a chosen note
+FSW_FOLLOW_BONUS = 4.0             # ...and on each of the two steps after it going home
+FSW_BLOCK = 50.0                   # nats against a footswitch that reads as a jack
+FSW_SPACING = 4                    # notes between two placed footswitches
+FSW_ROUNDS = 6
+FSW_OVERSHOOT = 1.3                # place this many times what is still missing
 
 
 @dataclass(frozen=True)
@@ -716,6 +738,24 @@ STREAM_MIN_BARS = 2
 STREAM_ENERGY_WEIGHT = 0.25
 
 
+#: Stream mode's own speed limit, as the shortest gap between two notes of a
+#: stream. A chart that is asked to be a stream chart (Stream mode, the stamina
+#: preset, a Stream slider of STREAM_ROUTE_MIN_SHARE or more) is not held to
+#: the peak rate of an ordinary chart of its tier: that rate (8 / 10 notes a
+#: second) turned every stream above 120 / 150 BPM into 8ths, and the stamina
+#: preset then delivered 48% of the chart as 16th stream where 80% was asked.
+#: These keep 16ths up to 170 BPM at Hard and 200 BPM at Challenge. Nothing
+#: outside Stream mode reads them.
+STREAM_MIN_GAP_S = {"hard": 0.088, "challenge": 0.075}
+
+
+def stream_rate_limit(difficulty: str) -> float:
+    """Fastest notes-per-second a Stream-mode stream may run at for a tier."""
+    limit = float(BUDGETS[difficulty].max_nps_4s)
+    gap = STREAM_MIN_GAP_S.get(difficulty)
+    return max(limit, 1.0 / gap) if gap else limit
+
+
 def stream_subdivision(difficulty: str, max_subdivision: int | None,
                        beat_s: float) -> int:
     """The subdivision (4, 8 or 16) a Stream-mode chart runs at.
@@ -723,11 +763,11 @@ def stream_subdivision(difficulty: str, max_subdivision: int | None,
     A subdivision the user chose is taken as given, up to the finest the tier
     writes at all — they asked for 16ths, they get 16ths, whatever rate that
     is at this tempo. Left open, it is the finest one whose rate stays inside
-    the tier's peak notes-per-second."""
+    Stream mode's speed limit for the tier (`stream_rate_limit`)."""
     finest = _FINEST[difficulty]
     if max_subdivision is not None:
         return min(int(max_subdivision), finest)
-    limit = BUDGETS[difficulty].max_nps_4s
+    limit = stream_rate_limit(difficulty)
     for sub in (16, 8, 4):
         if sub <= finest and (sub / 4.0) / beat_s <= limit + 1e-6:
             return sub
@@ -1482,6 +1522,7 @@ def _gen_tables() -> dict:
     s_n, a_n = C.N_STATES, C.N_TOKENS
     crossed = np.zeros((s_n, a_n), bool)
     fsw = np.zeros((s_n, a_n), bool)
+    fsw_du = np.zeros((s_n, a_n), bool)       # the footswitch the style vector counts
     dstep = np.zeros((s_n, a_n), bool)
     repeat = np.zeros((s_n, a_n), bool)
     repeat_any = np.zeros((s_n, a_n), bool)   # ...when the previous row was a jump
@@ -1503,6 +1544,7 @@ def _gen_tables() -> dict:
                 panel = pa if a < 4 else ps
                 other = 1 - foot
                 fsw[s, a] = panel == pos[other] and panel != pos[foot]
+                fsw_du[s, a] = a < 4 and fsw[s, a] and panel in (C.D, C.U)
                 dstep[s, a] = a >= 4 and panel != pos[foot]
                 repeat[s, a] = panel == pos[fl]
                 repeat_any[s, a] = panel in pos
@@ -1530,7 +1572,7 @@ def _gen_tables() -> dict:
         if lr:
             bad |= t["moves_r"] | onto_r
         lock_bad[lb] = bad
-    _GEN = {"crossed": crossed, "fsw": fsw, "dstep": dstep, "repeat": repeat,
+    _GEN = {"crossed": crossed, "fsw": fsw, "fsw_du": fsw_du, "dstep": dstep, "repeat": repeat,
             "repeat_any": repeat_any, "panels": panels,
             "holder": holder, "lock_bad": lock_bad,
             "jump_tok": np.arange(a_n) >= 8}
@@ -1581,7 +1623,8 @@ def constrained_viterbi(unary: np.ndarray, dtb: np.ndarray, is_jump: np.ndarray,
                         ban: np.ndarray | None = None,
                         panel_bias: np.ndarray | None = None,
                         repeat_pen: np.ndarray | None = None,
-                        fsw_pen: np.ndarray | None = None) -> ViterbiResult:
+                        fsw_pen: np.ndarray | None = None,
+                        fsw_bonus: np.ndarray | None = None) -> ViterbiResult:
     """Exact dynamic programme over (pL, pR, f_last) x lock ownership (spec
     §6.5 step 11).
 
@@ -1600,8 +1643,9 @@ def constrained_viterbi(unary: np.ndarray, dtb: np.ndarray, is_jump: np.ndarray,
     `ban`, (N, 20) bool, removes individual tokens at individual notes (the
     QA veto loop); `panel_bias`, (4,), adds that many nats per press of each
     panel (the panel-balance loop); `repeat_pen` and `fsw_pen`, (N,), cost that
-    many nats for repeating the previous row / footswitching at that note.
-    None of them applies to clamped notes.
+    many nats for repeating the previous row / footswitching at that note;
+    `fsw_bonus`, (N,), pays that many for a D/U footswitch there (see
+    FSW_PLACE_MIN_SHARE). None of them applies to clamped notes.
 
     If the rules ever leave a note with no legal token (they cannot for a plan
     from `decode_rhythm`; they can for a hand-built one), that note's tier
@@ -1672,6 +1716,8 @@ def constrained_viterbi(unary: np.ndarray, dtb: np.ndarray, is_jump: np.ndarray,
                         "repeat_any" if is_jump[j - 1] else "repeat"][sq_s]
                 if fsw_pen is not None and fsw_pen[j]:
                     gain = gain - fsw_pen[j] * g["fsw"][sq_s]
+                if fsw_bonus is not None and fsw_bonus[j]:
+                    gain = gain + fsw_bonus[j] * g["fsw_du"][sq_s]
                 if bias_tab is not None:
                     gain = gain + bias_tab[sq_s]
             cand = np.where(ok, score[:, None] + gain, NEG)
@@ -1893,6 +1939,124 @@ class NeuralChart:
     stats: dict
 
 
+def read_footswitches(events: C.ChartEvents, times_ms) -> np.ndarray:
+    """Per note: is it a D/U footswitch in the annotator's own reading of the
+    chart (`codec.encode`) — what the style vector's `footswitch_share` counts,
+    and what someone reading the arrows without foot labels would play."""
+    enc, _ = C.encode(events, np.asarray(times_ms, np.float64))
+    return cond.footswitch_flags(enc)
+
+
+def place_footswitches(attempt, first: tuple, unary: np.ndarray, plan: RhythmPlan,
+                       times_ms: np.ndarray, slots: np.ndarray, hold_kind: np.ndarray,
+                       asked: float, seed: int) -> tuple:
+    """Bring the share of READ footswitches up to `asked` (see
+    FSW_PLACE_MIN_SHARE). `attempt(un=, fsw_bonus=, fsw_block=)` solves the
+    foot path as `generate` does, referee and panel balance included, and
+    `first` is its result without any placement.
+
+    Each round: read the chart back; block every footswitch — placed here or
+    the step network's own — that the reading turned into a jack; if the read
+    share is still short, choose more notes for one (fast enough, inside a run
+    of single steps, clear of freezes and of each other, where the model
+    itself likes a D/U step best) and solve again. Returns (the attempt whose
+    read share is closest to `asked`, a summary for the report)."""
+    n = len(plan.tick)
+    g = _gen_tables()
+    rng = np.random.default_rng((int(seed), 0xF5))
+    single = ~np.asarray(plan.is_jump, bool)
+    n_single = max(1, int(single.sum()))
+    target = int(round(asked * n_single))
+    dt_s = np.concatenate([[1e9], np.diff(times_ms)]) / 1000.0
+    # a note can carry a placed footswitch if it and the two after it are
+    # single steps of one run, with no freeze starting or held anywhere near
+    busy = ~single | (slots > 0) | (hold_kind > 0)
+    fast = dt_s < FSW_MAX_GAP_S
+    can = np.zeros(n, bool)
+    for j in range(2, n - 2):
+        can[j] = (not busy[j - 1:j + 3].any()) and bool(fast[j:j + 3].all())
+    noise = rng.gumbel(0.0, 0.5, n)
+    bonus = np.zeros(n)
+    block = np.zeros(n, bool)
+    cur = first
+    extra_rounds = 0
+    best = None
+
+    def unaries() -> np.ndarray:
+        """The step network's unaries with the placement's wishes written in:
+        at a chosen note every alternating step is as good as the one the
+        network sampled (so the bonus alone decides, however sure the network
+        was of something else), and each of the two steps after it prefers the
+        stepping foot's own side panel to anything else."""
+        un = unary.copy()
+        for j in np.nonzero(bonus > 0)[0]:
+            un[j, :4] = np.maximum(un[j, :4], 0.0)
+            for k in (j + 1, j + 2):
+                un[k, 0] = max(float(un[k].max()), 0.0) + FSW_FOLLOW_BONUS
+        return un
+
+    un = unary
+
+    for rnd in range(FSW_ROUNDS + 1):
+        res, _, chart = cur[0], cur[1], cur[2]
+        read = read_footswitches(chart.events, times_ms)
+        have = int(read.sum())
+        states = np.asarray(res.states, np.int64)
+        own = g["fsw"][states, res.token.astype(np.int64)]
+        # closest to what was asked; among charts that are close enough, the
+        # one with the fewest footswitches that read as jacks
+        off = abs(have - target)
+        key = (off > max(1, int(0.1 * target)), int((own & ~read).sum()), off, rnd)
+        if best is None or key < best[0]:
+            best = (key, cur, have)
+        if rnd == FSW_ROUNDS:
+            break
+        changed = False
+        # a footswitch that is read as something else is a jack: take it out
+        for j in np.nonzero(own & ~read & ~block)[0]:
+            block[j] = True
+            changed = True
+            bonus[j] = 0.0
+        if have > target + max(1, int(0.15 * target)):
+            # too many: give up the ones the model itself did not ask for first
+            extra = [int(j) for j in np.nonzero(read)[0]]
+            extra.sort(key=lambda j: (bonus[j] > 0, noise[j]))
+            for j in extra[:have - target]:
+                block[j] = True
+                changed = True
+                bonus[j] = 0.0
+        elif have < target:
+            taken = read | (bonus > 0)
+            near = np.zeros(n + 2 * FSW_SPACING + 1, bool)
+            for j in np.nonzero(taken)[0]:
+                near[j:j + 2 * FSW_SPACING + 1] = True
+            # where the path stands now, which notes could be a D/U footswitch
+            able = g["fsw_du"][states].any(axis=1)
+            cand = [int(j) for j in np.nonzero(can & able & ~block & ~taken)[0]]
+            score = {j: float(np.max(np.where(g["fsw_du"][states[j]], un[j], NEG))) + noise[j]
+                     for j in cand}
+            cand.sort(key=lambda j: -score[j])
+            want = int(math.ceil((target - have) * FSW_OVERSHOOT))
+            for j in cand:
+                if want <= 0:
+                    break
+                if near[j + FSW_SPACING]:
+                    continue
+                near[j:j + 2 * FSW_SPACING + 1] = True
+                bonus[j] = FSW_BONUS
+                want -= 1
+                changed = True
+        if not changed:
+            break
+        un = unaries()
+        cur = attempt(un=un, fsw_bonus=bonus, fsw_block=block)
+        extra_rounds += cur[4]
+    _, cur, have = best
+    info = {"asked": round(asked, 4), "read": have, "read_share": round(have / n_single, 4),
+            "placed": int((bonus > 0).sum()), "blocked": int(block.sum())}
+    return (cur[0], cur[1], cur[2], cur[3], extra_rounds, cur[5]), info
+
+
 def _encoded_from(plan: RhythmPlan, tokens: np.ndarray, f_init: int,
                   mines: np.ndarray) -> C.EncodedChart:
     """Attach Stage A's freezes to the feet Stage B chose."""
@@ -2021,13 +2185,21 @@ class StepManiaNeuralEngine:
         dt = np.concatenate([[1e9], np.diff(times_ms)])
         dt_s = dt / 1000.0
         slots, hold_kind = lock_schedule(plan.tick, plan.is_jump, plan.flavor, plan.dur)
-        def attempt(rules: TierRules):
+        def attempt(rules: TierRules, un=None, fsw_bonus=None, fsw_block=None):
             """Solve the foot path under `rules`: re-solve until the caller's
-            referee has no objection, and nudge until the panels balance."""
-            args = dict(unary=unary, dtb=C.dt_bucket(dt), is_jump=plan.is_jump, slots=slots,
+            referee has no objection, and nudge until the panels balance.
+            `un`, `fsw_bonus` and `fsw_block` are the footswitch placement's
+            (`place_footswitches`): its own unaries, the notes it wants a
+            footswitch at, and the notes that may not have one."""
+            args = dict(unary=unary if un is None else un, dtb=C.dt_bucket(dt),
+                        is_jump=plan.is_jump, slots=slots,
                         hold_kind=hold_kind, rules=rules, f_init=f_init)
             extra, base_no_repeat = timing_penalties(rules, style, dt_s)
             args.update(extra)
+            if fsw_bonus is not None:
+                args["fsw_bonus"] = fsw_bonus
+            if fsw_block is not None and fsw_block.any():
+                args["fsw_pen"] = args.get("fsw_pen", np.zeros(n)) + FSW_BLOCK * fsw_block
             ban = np.zeros((n, C.N_TOKENS), bool)
             bias = np.zeros(4)
             rounds, best = 0, None
@@ -2080,6 +2252,15 @@ class StepManiaNeuralEngine:
                 rounds += r2[4]
                 if _cross_share(r2[0].token) < _cross_share(res.token):
                     res, enc, chart, bias, vetoed = r2[0], r2[1], r2[2], r2[3], r2[5]
+        fsw_info = None
+        asked_fsw = float(style[cond.INDEX["footswitch_share"]])
+        if asked_fsw > FSW_PLACE_MIN_SHARE and not rules.no_footswitch and n >= 8:
+            placed = place_footswitches(
+                lambda **kw: attempt(dataclasses.replace(rules, cross_scale=cross_scale), **kw),
+                (res, enc, chart, bias, 0, vetoed), unary, plan, times_ms, slots, hold_kind,
+                asked_fsw, seed)
+            (res, enc, chart, bias, more, vetoed), fsw_info = placed
+            rounds += more
         enc.mines = place_mines(plan.mine_tick, enc, seed)
         stats["choreo"] = {"viterbi_score": round(res.score, 2), "relaxed": res.relaxed,
                            "changed_by_viterbi": int((res.token != sampled).sum()),
@@ -2088,6 +2269,8 @@ class StepManiaNeuralEngine:
                            "panel_bias": [round(float(v), 2) for v in bias]}
         if cross_scale != rules.cross_scale:
             stats["choreo"]["cross_scale"] = cross_scale
+        if fsw_info is not None:
+            stats["choreo"]["footswitches"] = fsw_info
         return NeuralChart(C.decode(enc), enc, stats)
 
     def inpaint_section(self, events: C.ChartEvents, x: np.ndarray,

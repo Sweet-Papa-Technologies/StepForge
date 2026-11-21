@@ -233,18 +233,52 @@ class _ChartDataset(Dataset):
         return np.array([c.weight for c in self.charts], np.float64)
 
 
+#: SpecAugment on the input tensor (v1.5c): what is masked are the acoustic
+#: channels only — mel, flux, stems, chroma. The metric-timing channels say
+#: where in the bar and at what tempo a tick is; a model that cannot rely on
+#: them cannot place anything, so they are never touched.
+SPEC_ACOUSTIC = GF.METRIC.start                 # channels [0, 54) are acoustic
+SPEC_TIME_MASKS = 2
+SPEC_TIME_TICKS = (4, 12)                       # inclusive
+SPEC_BAND_MASKS = (1, 2)                        # inclusive
+SPEC_BAND_CHANNELS = (2, 5)                     # inclusive
+
+
+def spec_augment(x: np.ndarray, rng) -> np.ndarray:
+    """Zero SPEC_TIME_MASKS random spans of ticks and one or two random bands
+    of channels, in the acoustic channels of `x` (ticks, 64) only. In place;
+    returns `x`."""
+    n = len(x)
+    for _ in range(SPEC_TIME_MASKS):
+        w = int(rng.integers(SPEC_TIME_TICKS[0], SPEC_TIME_TICKS[1] + 1))
+        if n > w:
+            a = int(rng.integers(0, n - w + 1))
+            x[a:a + w, :SPEC_ACOUSTIC] = 0.0
+    for _ in range(int(rng.integers(SPEC_BAND_MASKS[0], SPEC_BAND_MASKS[1] + 1))):
+        w = int(rng.integers(SPEC_BAND_CHANNELS[0], SPEC_BAND_CHANNELS[1] + 1))
+        c = int(rng.integers(0, SPEC_ACOUSTIC - w + 1))
+        x[:, c:c + w] = 0.0
+    return x
+
+
 class StageADataset(_ChartDataset):
     """One item = one chart, cropped to `crop` ticks of its song.
 
     `stems`: 'drop' zeroes the stem channels on a random `p_drop_stems` of
     training items (and never in evaluation), 'off' always zeroes them — the
-    app's situation, which has no separator — and 'on' never does."""
+    app's situation, which has no separator — and 'on' never does.
+
+    `spec_augment` masks parts of the acoustic input of every training item
+    (see `spec_augment`); an evaluation dataset never does, whatever it is
+    given."""
 
     def __init__(self, songs: list, crop: int = CROP_TICKS, train: bool = True,
-                 seed: int = 0, p_drop_stems: float = P_DROP_STEMS, stems: str = "drop"):
+                 seed: int = 0, p_drop_stems: float = P_DROP_STEMS, stems: str = "drop",
+                 spec_augment: bool = False):
         self.charts = [c for s in songs for c in s.charts if s.core is not None]
         self.crop, self.train, self.seed = crop, train, seed
         self.p_drop_stems, self.stems = p_drop_stems, stems
+        self.spec_augment = bool(spec_augment) and train
         self.epoch = 0
 
     def _use_stems(self, s: Song, rng) -> bool:
@@ -279,8 +313,12 @@ class StageADataset(_ChartDataset):
         if len(c.mines):
             mt = c.mines[:, 0]
             mine[mt[(mt >= a) & (mt < b)] - a] = 1.0
-        return {"x": torch.from_numpy(x),
-                "cond": torch.from_numpy(_cond_vector(c, self.train, rng, use_stems)),
+        cv = _cond_vector(c, self.train, rng, use_stems)
+        if self.spec_augment:
+            # drawn after everything else, so the crop and the conditioning of
+            # an item are the ones a run without masking would have seen
+            x = spec_augment(np.array(x, np.float32, copy=True), rng)
+        return {"x": torch.from_numpy(x), "cond": torch.from_numpy(cv),
                 "valid": torch.from_numpy(valid), "onset": torch.from_numpy(onset),
                 "jump": torch.from_numpy(jump), "hold_type": torch.from_numpy(hold_type),
                 "hold_dur": torch.from_numpy(hold_dur), "mine": torch.from_numpy(mine)}

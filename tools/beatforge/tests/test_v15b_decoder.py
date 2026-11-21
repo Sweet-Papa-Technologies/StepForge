@@ -155,7 +155,7 @@ def test_coverage_is_solved_so_the_asked_share_of_notes_is_stream(monkeypatch, s
 
 def test_where_the_tier_only_allows_8ths_the_share_is_taken_in_bars(monkeypatch):
     engine = _engine(monkeypatch)
-    g, dur = _song(180.0)                          # 16ths would be 12 notes/s
+    g, dur = _song(210.0)                          # 16ths would be 14 notes/s
     chart = engine.generate(g.X, g.tick_times_sec, "challenge", cond.resolve_style("challenge"),
                             dur, options=DecodeOptions(stream=True, stream_share=0.8))
     info = chart.stats["rhythm"]["stream"]

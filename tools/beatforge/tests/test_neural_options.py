@@ -228,16 +228,19 @@ def test_stream_subdivision_left_open_fits_the_tiers_rate():
     # 16ths at 120 BPM are 8 notes/s: inside Challenge's 10, and Hard's 8
     assert infer.stream_subdivision("challenge", None, 0.5) == 16
     assert infer.stream_subdivision("hard", None, 0.5) == 16
-    # at 175 BPM they are 11.7/s: too fast for either, so 8ths
-    assert infer.stream_subdivision("challenge", None, 60 / 175) == 8
+    # Stream mode has its own speed limit (16ths to 170 BPM at Hard, 200 at
+    # Challenge); past it the stream runs in 8ths
+    assert infer.stream_subdivision("challenge", None, 60 / 175) == 16
+    assert infer.stream_subdivision("hard", None, 60 / 175) == 8
+    assert infer.stream_subdivision("challenge", None, 60 / 210) == 8
     # ...unless the user asked for 16ths by name
-    assert infer.stream_subdivision("challenge", 16, 60 / 175) == 16
+    assert infer.stream_subdivision("challenge", 16, 60 / 210) == 16
     # and never finer than the tier writes at all
     assert infer.stream_subdivision("medium", 16, 0.5) == 8
     assert infer.stream_subdivision("beginner", None, 0.5) == 4
     t = 48 * 32
-    plan = infer.decode_rhythm(four_on_the_floor(t), tick_times(t, 175.0), "challenge",
-                               cond.resolve_style("challenge"), tick_times(t, 175.0)[-1] + 2,
+    plan = infer.decode_rhythm(four_on_the_floor(t), tick_times(t, 210.0), "challenge",
+                               cond.resolve_style("challenge"), tick_times(t, 210.0)[-1] + 2,
                                options=DecodeOptions(max_subdivision=16, stream=True))
     assert plan.stats["stream"]["over_tier_rate"] is True     # said so in the report
 
