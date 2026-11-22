@@ -426,6 +426,16 @@ def test_the_shipped_model_carries_its_decoder_settings():
     assert dec.get("phase_rule") == "margin" and dec.get("phase_margin", 0) > 0
     assert set(dec.get("density_scale") or {}) == set(BUDGETS)
     assert all(0.3 <= v <= 1.2 for v in dec["density_scale"].values())
+    # v1.6: arrows come back where the music repeats; the rhythm is left alone
+    # (weight 0), so the notes are the same with and without it.
+    assert meta["version"] == "1.6" and meta["display_name"] == "StepForge Flow v1.6"
+    cb = dec.get("callbacks") or {}
+    assert cb.get("enabled") is True
+    model = infer.FlowModel(infer.default_model_dir())
+    assert model.callbacks() == {"tau_sim": 0.7, "rhythm_weight": 0.0, "choreo_bonus": 3.0}
+    # the folder asks for neither of the dormant paths (voice network, critic)
+    assert "stage_0" not in meta["files"] and "stage_3" not in meta["files"]
+    assert model.critic() is None
 
 
 # --------------------------------------------------------------------------- #
