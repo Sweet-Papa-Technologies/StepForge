@@ -113,6 +113,24 @@ def training_style(style: np.ndarray) -> np.ndarray:
     return out
 
 
+def footswitch_flags(enc: C.EncodedChart) -> np.ndarray:
+    """Per note: a footswitch as the style vector counts them — an ALT token
+    landing on the D/U panel the other foot rests on."""
+    tok = np.asarray(enc.token, np.int64)
+    if len(tok) == 0:
+        return np.zeros(0, bool)
+    before, _, _ = C.foot_path(enc)
+    pl, pr, fl = (before >> 1) // 4, (before >> 1) % 4, before & 1
+    alt = tok < 4
+    alt_foot = 1 - fl
+    alt_panel = np.where(alt_foot == C.LEFT, tok & 3,
+                         np.asarray(C.PANEL_OF[C.RIGHT])[tok & 3])
+    other_pos = np.where(alt_foot == C.LEFT, pr, pl)
+    fsw = alt & (alt_panel == other_pos) & ((alt_panel == C.D) | (alt_panel == C.U))
+    fsw[0] = False                       # nothing precedes the first step
+    return fsw
+
+
 def compute_style_vector(enc: C.EncodedChart, times_s, meter: float,
                          has_stems: bool = False) -> np.ndarray:
     """Empirical style of an encoded chart -> c in R^10, every field inside its
@@ -143,15 +161,7 @@ def compute_style_vector(enc: C.EncodedChart, times_s, meter: float,
     same_panel = np.where(fl == C.LEFT, tok & 3, np.asarray(C.PANEL_OF[C.RIGHT])[tok & 3])
     c[6] = (same & (same_panel == same_pos)).sum() / n_single
 
-    # footswitch: ALT token landing on the D/U panel the other foot rests on
-    alt = tok < 4
-    alt_foot = 1 - fl
-    alt_panel = np.where(alt_foot == C.LEFT, tok & 3,
-                         np.asarray(C.PANEL_OF[C.RIGHT])[tok & 3])
-    other_pos = np.where(alt_foot == C.LEFT, pr, pl)
-    fsw = alt & (alt_panel == other_pos) & ((alt_panel == C.D) | (alt_panel == C.U))
-    fsw[0] = False                       # nothing precedes the first step
-    c[7] = fsw.sum() / n_single
+    c[7] = footswitch_flags(enc).sum() / n_single
 
     c[8] = len(enc.mines) / n
     lo = np.zeros(STYLE_DIM, np.float32)

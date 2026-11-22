@@ -85,7 +85,7 @@ the charts.
 We charted 180 songs that have human-made charts, without showing StepForge the
 human charts, and compared step by step.
 
-| 180 held-out songs | StepForge Flow v1.5 | Best open-source auto-charter tested | Two humans |
+| 180 held-out songs | StepForge Flow v1.6 | Best open-source auto-charter tested | Two humans |
 |---|---:|---:|---:|
 | Steps placed where the human charter put one (F1, ±20 ms) | **0.689** | 0.674 | ≈ 0.75 |
 | … Beginner | 0.606 | 0.587 | |
@@ -94,6 +94,7 @@ human charts, and compared step by step.
 | Notes written, relative to the human chart | 1.06× | 1.34× | |
 | Chart statistics inside the human range | **97%** | 90% | 94% |
 | Unforced double-steps | **none** | 1.04% of steps | 0.35% |
+| Same arrow again when the music repeats, above chance (60 held-out songs) | +4.4 pts | | ≈ +4.9 |
 
 StepForge is ahead of the best open-source tool on step placement at every
 difficulty. Overall the lead (0.015) is too small for 180 songs to tell from
@@ -101,13 +102,25 @@ level; at Medium it is real. It is also clearly cleaner to play. Beginner is
 still its weakest difficulty. Some decoder settings were tuned on 60 of the 180
 songs; on the other 120 the picture is the same (0.685 vs 0.671).
 
-These are the numbers for 0.1.0-beta.10 and later, which ship StepForge Flow
-v1.5. Earlier betas shipped v1.4, which scored 0.671 at its best (0.562 at
-Beginner); the gain is larger than chance on these songs. v1.5 is trained on the same songs as
-v1.4. What changed is how: the rhythm network learned to tell which half of the
-beat the grid sits on, and the step network learned to follow the crossover and
-jack sliders, which did nothing measurable before. Details:
-[model card](models/stepforge_flow/MODEL_CARD.md).
+These are the numbers for 0.1.0-beta.11 and later, which ship StepForge Flow
+v1.6. Its two networks are v1.5's (0.1.0-beta.10), so step placement is the
+same; what v1.6 adds is in how a chart is decoded from them:
+
+- **Arrows come back when the music does.** Where a bar sounds like an earlier
+  one, the chart leans toward the arrows it used there. Without this the same
+  arrow returned 1.3 points more often than chance; now 4.4, close to what
+  human charts do.
+- **The footswitch slider works.** Asked for 6% footswitches, a chart shows
+  6.3% as a player reads it (v1.5: 1.7%).
+- **Faster streams.** Stream mode writes 16th-note streams up to 200 BPM at
+  Challenge and 170 BPM at Hard (v1.5: 150 and 120).
+
+Betas before 10 shipped v1.4, which scored 0.671 at its best (0.562 at
+Beginner); the gain is larger than chance on these songs. v1.5 and v1.6 are
+trained on the same songs as v1.4. What changed is how: the rhythm network
+learned to tell which half of the beat the grid sits on, and the step network
+learned to follow the crossover and jack sliders, which did nothing measurable
+before. Details: [model card](models/stepforge_flow/MODEL_CARD.md).
 
 We also checked for memorization. StepForge doesn't reproduce its training
 charts (its longest exact copy of one is 8 steps), and it carries fewer
@@ -133,7 +146,7 @@ original design plan is in
 
 ### Training data and credits
 
-StepForge Flow v1.5 learned from 254 songs and their charts from the StepMix 1–5
+StepForge Flow v1.6 learned from 254 songs and their charts from the StepMix 1–5
 community contest packs, OutFox Serenity and the StepMania 5 default songs. Every
 song, its musicians and step artists, and its license are listed in
 [`CREDITS.csv`](models/stepforge_flow/CREDITS.csv). Thank you to all of them.

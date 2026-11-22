@@ -28,8 +28,10 @@ from ..grammar import BUDGETS
 from . import MODEL_DIR_NAME
 from . import codec as C
 from . import conditioning as cond
+from . import critic as CR
 from . import event_features as EF
 from . import grid_features as GF
+from . import structure as ST
 
 META_FILE = "model_meta.json"
 ENV_MODEL_DIR = "BEATFORGE_NEURAL_MODEL_DIR"
@@ -231,6 +233,25 @@ class FlowModel:
         self.sess_b = ort.InferenceSession(str(self.dir / (b or files["stage_b"])),
                                            opts, providers=prov)
         self.trained_with_stems = bool(self.meta.get("trained_with_stems"))
+        # v1.6: a voice network (Stage 0) and the structure analysis fill the
+        # sixteen channels X[:, 32:48] for the rhythm network. A model without
+        # one (v1.4, v1.5) leaves them zero, as before.
+        self.feature_layout = str(self.meta.get("feature_layout_version") or "")
+        self.sess_0 = None
+        v = (files.get("stage_0_int8") if int8 else None) or files.get("stage_0")
+        if self.feature_layout == VOICE_LAYOUT and v:
+            self.sess_0 = ort.InferenceSession(str(self.dir / v), opts, providers=prov)
+        self._voice_key, self._voice_x = None, None
+        # `stage_0.live: false` silences the voice channels (the structure
+        # channels stay): how a rhythm network trained without them is run,
+        # and what one trained with them falls back to.
+        self.voice_live = bool((self.meta.get("stage_0") or {}).get("live", True))
+        # v1.6 Phase 3: a critic that picks among several samples of the step
+        # network on one rhythm (`decoder.critic`; see `critic.py`).
+        self.sess_c = None
+        c = files.get("stage_3")
+        if c and (self.dir / c).exists():
+            self.sess_c = CR.Critic(self.dir / c)
 
     def density_scale(self, difficulty: str) -> float:
         """The tier's density scale for THESE weights. DENSITY_SCALE was fitted
@@ -271,10 +292,102 @@ class FlowModel:
         always uses the rule fill."""
         return bool((self.meta.get("decoder") or {}).get("neural_stream"))
 
+    def callbacks(self) -> dict | None:
+        """The model's callback settings (`decoder.callbacks` in
+        model_meta.json), or None when it declares none or switches them off:
+        {'tau_sim', 'rhythm_weight', 'choreo_bonus'} — see CALLBACK_DEFAULTS."""
+        cb = (self.meta.get("decoder") or {}).get("callbacks")
+        if not isinstance(cb, dict) or not cb.get("enabled", True):
+            return None
+        out = dict(CALLBACK_DEFAULTS)
+        for k in out:
+            try:
+                out[k] = float(cb.get(k, out[k]))
+            except (TypeError, ValueError):
+                pass
+        if not 0.0 < out["tau_sim"] < 1.0 or out["rhythm_weight"] < 0 or out["choreo_bonus"] < 0:
+            return None
+        out["rhythm_weight"] = min(out["rhythm_weight"], 1.0)
+        return out if (out["rhythm_weight"] > 0 or out["choreo_bonus"] > 0) else None
+
+    def critic(self) -> dict | None:
+        """The model's reranking settings (`decoder.critic` in
+        model_meta.json), or None when it has no critic or switches it off —
+        see CRITIC_DEFAULTS."""
+        cr = (self.meta.get("decoder") or {}).get("critic")
+        if self.sess_c is None or not isinstance(cr, dict) or not cr.get("enabled", True):
+            return None
+        out = dict(CRITIC_DEFAULTS)
+        try:
+            out["k"] = int(cr.get("k", out["k"]))
+            out["source"] = str(cr.get("source", out["source"]))
+            out["steps"] = int(cr.get("steps", out["steps"]))
+            out["remask"] = float(cr.get("remask", out["remask"]))
+            out["tau_sim"] = float(cr.get("tau_sim", out["tau_sim"]))
+            for key in ("bonus_scale", "tau_scale"):
+                v = cr.get(key)
+                if isinstance(v, (list, tuple)) and v:
+                    out[key] = tuple(float(q) for q in v)
+        except (TypeError, ValueError):
+            return None
+        if out["k"] < 2 or out["steps"] < 1 or not 0.0 < out["remask"] <= 1.0 \
+                or out["source"] not in ("sample", "logits"):
+            return None
+        return out
+
+    # -- Stage 0 ---------------------------------------------------------- #
+    @property
+    def has_voice(self) -> bool:
+        return self.sess_0 is not None
+
+    def voice(self, x: np.ndarray) -> np.ndarray:
+        """X (T, 64) -> the voice network's 14 channels (T, 14), run in
+        windows with a short overlap and cross-faded over it."""
+        t = len(x)
+        win = int((self.meta.get("stage_0") or {}).get("window_ticks") or VOICE_WINDOW_TICKS)
+        xv = np.ascontiguousarray(x[:, VOICE_COLUMNS], np.float32)
+        if t <= win:
+            return self.sess_0.run(None, {"x_voice": xv[None]})[0][0]
+        hop = win - VOICE_OVERLAP_TICKS
+        starts = list(range(0, t - win, hop)) + [t - win]
+        out = np.stack(self.sess_0.run(None, {"x_voice": np.stack([xv[a:a + win] for a in starts])})[0])
+        edge = np.minimum(np.arange(1, win + 1), np.arange(win, 0, -1)).astype(np.float32)
+        w = np.minimum(edge / VOICE_OVERLAP_TICKS, 1.0) + 1e-3
+        acc = np.zeros((t, out.shape[2]), np.float32)
+        wsum = np.zeros(t, np.float32)
+        for a, o in zip(starts, out):
+            acc[a:a + win] += o * w[:, None]
+            wsum[a:a + win] += w
+        return acc / wsum[:, None]
+
+    def with_voice(self, x: np.ndarray) -> np.ndarray:
+        """X as the rhythm network of a v1.6 model wants it: channels 32..45
+        from the voice network, 46..47 from the structure analysis. The last
+        song's result is kept, since a song is charted once per difficulty."""
+        key = (x.shape, float(x[::37, :32].sum()), float(x[-1, :32].sum()) if len(x) else 0.0)
+        if self._voice_key == key and self._voice_x is not None:
+            return self._voice_x
+        out = np.array(x, np.float32, copy=True)
+        if len(out):
+            v = self.voice(out)
+            out[:, VOICE_SLICE] = v
+            out[:, STRUCTURE_SLICE] = ST.analyze_structure(x, v).channels()
+        self._voice_key, self._voice_x = key, out
+        return out
+
     # -- Stage A ---------------------------------------------------------- #
     def rhythm(self, x: np.ndarray, cond19: np.ndarray) -> dict:
         """X (T, 64) -> per-tick logits, run in overlapping 32-measure windows
-        (the length it was trained on) and cross-faded."""
+        (the length it was trained on) and cross-faded. A v1.6 model first has
+        its voice and structure channels filled in (`with_voice`)."""
+        if self.has_voice:
+            x = self.with_voice(x)
+            if self.voice_live:
+                cond19 = np.array(cond19, np.float32, copy=True)
+                cond19[cond.INDEX["has_stems"]] = 1.0   # "channels 32..45 are live"
+            else:
+                x = np.array(x, np.float32, copy=True)
+                x[:, VOICE_SLICE] = 0.0
         t = len(x)
         names = ("onset", "jump", "hold_type", "hold_dur", "mine")
         c = cond19[None, :].astype(np.float32)
@@ -323,6 +436,34 @@ class FlowModel:
             wsum[a:a + EVENT_WINDOW] += w
         return acc / wsum[:, None]
 
+    def choreo_many(self, ctx: np.ndarray, scalars: np.ndarray, tokens: np.ndarray,
+                    cond19: np.ndarray) -> np.ndarray:
+        """`choreo` for K token arrays on the same notes in one batched call:
+        (N, K, 64), (N, 31), (K, N) -> logits (K, N, 20)."""
+        k, n = tokens.shape
+        c = np.repeat(cond19[None, :].astype(np.float32), k, axis=0)
+
+        def run(a, b):
+            m = b - a
+            return self.sess_b.run(None, {
+                "ctx": np.ascontiguousarray(np.broadcast_to(
+                    ctx[None, a:b].astype(np.float32), (k, m) + ctx.shape[1:])),
+                "scalars": np.ascontiguousarray(np.broadcast_to(
+                    scalars[None, a:b].astype(np.float32), (k, m, scalars.shape[1]))),
+                "tokens": np.ascontiguousarray(tokens[:, a:b].astype(np.int64)), "cond": c})[0]
+
+        if n <= EVENT_WINDOW:
+            return run(0, n)
+        starts = list(range(0, n - EVENT_WINDOW, EVENT_HOP)) + [n - EVENT_WINDOW]
+        ramp = np.minimum(np.arange(1, EVENT_WINDOW + 1), np.arange(EVENT_WINDOW, 0, -1))
+        w = (ramp / ramp.max()).astype(np.float32) + 1e-3
+        acc = np.zeros((k, n, C.N_TOKENS), np.float32)
+        wsum = np.zeros(n, np.float32)
+        for a in starts:
+            acc[:, a:a + EVENT_WINDOW] += run(a, a + EVENT_WINDOW) * w[None, :, None]
+            wsum[a:a + EVENT_WINDOW] += w
+        return acc / wsum[None, :, None]
+
 
 def sigmoid(z):
     return 1.0 / (1.0 + np.exp(-np.clip(z, -30, 30)))
@@ -367,6 +508,97 @@ _FINEST = {"beginner": 4, "easy": 8, "medium": 8, "hard": 16, "challenge": 16}
 #: intervals, where human charts have 8%. Unbroken streams are Stream mode's
 #: job (`DecodeOptions.stream`), not the default chart's.
 RUN_LIMIT = {"beginner": 1, "easy": 2, "medium": 6, "hard": 16, "challenge": 24}
+
+
+#: v1.6 feature layout: a model that names it carries a voice network.
+VOICE_LAYOUT = "1.6_voicenet"
+VOICE_COLUMNS = np.r_[0:32, 48:64]          # what the voice network reads of X
+VOICE_SLICE = slice(32, 46)                 # ...and what it fills
+STRUCTURE_SLICE = slice(46, 48)
+VOICE_WINDOW_TICKS = 8 * C.G
+VOICE_OVERLAP_TICKS = C.G
+
+
+#: Callbacks (v1.6). Where a passage of the song comes back (`structure.py`
+#: links a bar to the earlier bar it repeats), the chart may answer it with
+#: what it wrote the first time:
+#:   rhythm_weight   how far the rhythm network's onset logits of the later bar
+#:                   are moved toward the earlier bar's, at a perfect match
+#:                   (scaled down to nothing at tau_sim)
+#:   choreo_bonus    nats, times the similarity, in favour of the codec token
+#:                   the earlier bar has on the same tick. The token is
+#:                   relative to the feet, so it brings back the same figure or
+#:                   its left-right mirror, whichever the feet are placed for.
+#: Both are soft: a fill or a variation the networks are sure of still wins,
+#: and every hard rule of the foot-path solver and the referees applies as
+#: before. Off unless the model declares `decoder.callbacks`.
+CALLBACK_DEFAULTS = {"tau_sim": ST.TAU_SIM, "rhythm_weight": 0.0, "choreo_bonus": 0.0}
+
+
+def echo_onset_logits(onset: np.ndarray, links: list, tau_sim: float,
+                      weight: float) -> np.ndarray:
+    """Onset logits with every linked bar blended toward the bar it repeats.
+    Always reads the network's own logits, so the order of the links does not
+    matter and a chain of repeats cannot compound."""
+    if weight <= 0 or not links:
+        return onset
+    src = np.asarray(onset)
+    out = src.astype(np.float32, copy=True)
+    t = len(src)
+    for b, j, sim, _ in links:
+        a = weight * float(np.clip((sim - tau_sim) / max(1e-6, 1.0 - tau_sim), 0.0, 1.0))
+        lo, lo2 = b * C.G, j * C.G
+        n = min(C.G, t - lo, t - lo2)
+        if a <= 0 or n <= 0:
+            continue
+        out[lo:lo + n] = (1.0 - a) * src[lo:lo + n] + a * src[lo2:lo2 + n]
+    return out
+
+
+def callback_bonus(ticks: np.ndarray, is_jump: np.ndarray, tokens: np.ndarray,
+                   links: list, bonus: float) -> tuple:
+    """(N, 20) unary bonus toward the token the linked earlier bar has on the
+    same tick of the bar, and how many notes got one. A single is only ever
+    pointed at a single's token and a jump at a jump's."""
+    n = len(ticks)
+    out = np.zeros((n, C.N_TOKENS), np.float64)
+    if bonus <= 0 or not links or n == 0:
+        return out, 0
+    index = {int(t): i for i, t in enumerate(ticks)}
+    hit = 0
+    for b, j, sim, _ in links:
+        lo, hi = np.searchsorted(ticks, [b * C.G, (b + 1) * C.G])
+        for i in range(lo, hi):
+            k = index.get(int(ticks[i]) - (b - j) * C.G)
+            if k is None or bool(is_jump[i]) != bool(is_jump[k]):
+                continue
+            out[i, int(tokens[k])] += bonus * float(sim)
+            hit += 1
+    return out, hit
+
+
+#: Best-of-K (v1.6 Phase 3). The rhythm is decided once; the step network is
+#: then sampled K times on those ticks and `critic.py` keeps the sample it
+#: scores highest among those the referees pass. Sample 0 is always the chart
+#: the model writes without a critic.
+#:   k            samples, the first included
+#:   source       where the further samples come from. "sample": the step
+#:                network is run again for each (K - 1 more unmasking passes,
+#:                batched). "logits": they are drawn from the note-by-note
+#:                probabilities the first pass already ended with — no further
+#:                network call, only one more foot-path solve each
+#:   steps        unmasking steps of each further sample ("sample" only)
+#:   remask       share of the first sample's arrows a further sample redraws
+#:                (1.0 = an independent sample; less = a variation, in fewer steps)
+#:   bonus_scale  per sample, a factor on the callback bonus
+#:   tau_scale    per sample, a factor on the sampling temperature
+#:   tau_sim      similarity from which bars are linked when the model
+#:                declares no callbacks of its own
+#: Off unless the model ships `stage_3` and declares `decoder.critic`.
+CRITIC_DEFAULTS = {"k": 4, "source": "sample", "steps": UNMASK_STEPS, "remask": 1.0,
+                   "bonus_scale": (1.0, 1.0, 2.0, 1.0), "tau_scale": (1.0, 1.0, 1.0, 0.75),
+                   "tau_sim": 0.70}
+CRITIC_MIN_NOTES = 24
 
 
 STREAM_FILLS = ("neural", "rule")
@@ -493,6 +725,28 @@ SLOW_REPEAT_RUN = 3
 #: many nats unless the footswitch slider asks for them.
 FOOTSWITCH_PENALTY = 2.5
 FOOTSWITCH_SLOW_S = 0.60
+#: Footswitch placement. A footswitch on disk is one repeated arrow, and whoever
+#: reads the chart decides which foot plays it. Read the other way it is a jack
+#: with the feet swapped, and that reading is the cheaper one unless the steps
+#: after it punish it: with the v1.5b step network, 12% of a chart's steps were
+#: footswitches in the decoder's own footing when 16% was asked, and 2.7% in
+#: the annotator's reading — the rest were read as jacks. What makes the
+#: reading stick is the two steps that follow: each foot out to its own side
+#: panel. Swapped, that is a spin, so the footswitch is the only way to stand
+#: on it. When the footswitch slider asks for more than FSW_PLACE_MIN_SHARE the
+#: decoder therefore places them: a bonus on a D/U footswitch at chosen notes
+#: and on that continuation, the chart read back as a player would read it
+#: (`codec.encode`), and every footswitch that was not read as one taken out
+#: again, until the READ share is what was asked. Below the threshold, and with
+#: the slider left to the model, nothing here runs.
+FSW_PLACE_MIN_SHARE = 0.03
+FSW_MAX_GAP_S = 0.48               # slower than this a repeated arrow is a jack to anyone
+FSW_BONUS = 8.0                    # nats on a D/U footswitch at a chosen note
+FSW_FOLLOW_BONUS = 4.0             # ...and on each of the two steps after it going home
+FSW_BLOCK = 50.0                   # nats against a footswitch that reads as a jack
+FSW_SPACING = 4                    # notes between two placed footswitches
+FSW_ROUNDS = 6
+FSW_OVERSHOOT = 1.3                # place this many times what is still missing
 
 
 @dataclass(frozen=True)
@@ -716,6 +970,24 @@ STREAM_MIN_BARS = 2
 STREAM_ENERGY_WEIGHT = 0.25
 
 
+#: Stream mode's own speed limit, as the shortest gap between two notes of a
+#: stream. A chart that is asked to be a stream chart (Stream mode, the stamina
+#: preset, a Stream slider of STREAM_ROUTE_MIN_SHARE or more) is not held to
+#: the peak rate of an ordinary chart of its tier: that rate (8 / 10 notes a
+#: second) turned every stream above 120 / 150 BPM into 8ths, and the stamina
+#: preset then delivered 48% of the chart as 16th stream where 80% was asked.
+#: These keep 16ths up to 170 BPM at Hard and 200 BPM at Challenge. Nothing
+#: outside Stream mode reads them.
+STREAM_MIN_GAP_S = {"hard": 0.088, "challenge": 0.075}
+
+
+def stream_rate_limit(difficulty: str) -> float:
+    """Fastest notes-per-second a Stream-mode stream may run at for a tier."""
+    limit = float(BUDGETS[difficulty].max_nps_4s)
+    gap = STREAM_MIN_GAP_S.get(difficulty)
+    return max(limit, 1.0 / gap) if gap else limit
+
+
 def stream_subdivision(difficulty: str, max_subdivision: int | None,
                        beat_s: float) -> int:
     """The subdivision (4, 8 or 16) a Stream-mode chart runs at.
@@ -723,11 +995,11 @@ def stream_subdivision(difficulty: str, max_subdivision: int | None,
     A subdivision the user chose is taken as given, up to the finest the tier
     writes at all — they asked for 16ths, they get 16ths, whatever rate that
     is at this tempo. Left open, it is the finest one whose rate stays inside
-    the tier's peak notes-per-second."""
+    Stream mode's speed limit for the tier (`stream_rate_limit`)."""
     finest = _FINEST[difficulty]
     if max_subdivision is not None:
         return min(int(max_subdivision), finest)
-    limit = BUDGETS[difficulty].max_nps_4s
+    limit = stream_rate_limit(difficulty)
     for sub in (16, 8, 4):
         if sub <= finest and (sub / 4.0) / beat_s <= limit + 1e-6:
             return sub
@@ -1482,6 +1754,7 @@ def _gen_tables() -> dict:
     s_n, a_n = C.N_STATES, C.N_TOKENS
     crossed = np.zeros((s_n, a_n), bool)
     fsw = np.zeros((s_n, a_n), bool)
+    fsw_du = np.zeros((s_n, a_n), bool)       # the footswitch the style vector counts
     dstep = np.zeros((s_n, a_n), bool)
     repeat = np.zeros((s_n, a_n), bool)
     repeat_any = np.zeros((s_n, a_n), bool)   # ...when the previous row was a jump
@@ -1503,6 +1776,7 @@ def _gen_tables() -> dict:
                 panel = pa if a < 4 else ps
                 other = 1 - foot
                 fsw[s, a] = panel == pos[other] and panel != pos[foot]
+                fsw_du[s, a] = a < 4 and fsw[s, a] and panel in (C.D, C.U)
                 dstep[s, a] = a >= 4 and panel != pos[foot]
                 repeat[s, a] = panel == pos[fl]
                 repeat_any[s, a] = panel in pos
@@ -1530,7 +1804,7 @@ def _gen_tables() -> dict:
         if lr:
             bad |= t["moves_r"] | onto_r
         lock_bad[lb] = bad
-    _GEN = {"crossed": crossed, "fsw": fsw, "dstep": dstep, "repeat": repeat,
+    _GEN = {"crossed": crossed, "fsw": fsw, "fsw_du": fsw_du, "dstep": dstep, "repeat": repeat,
             "repeat_any": repeat_any, "panels": panels,
             "holder": holder, "lock_bad": lock_bad,
             "jump_tok": np.arange(a_n) >= 8}
@@ -1581,7 +1855,8 @@ def constrained_viterbi(unary: np.ndarray, dtb: np.ndarray, is_jump: np.ndarray,
                         ban: np.ndarray | None = None,
                         panel_bias: np.ndarray | None = None,
                         repeat_pen: np.ndarray | None = None,
-                        fsw_pen: np.ndarray | None = None) -> ViterbiResult:
+                        fsw_pen: np.ndarray | None = None,
+                        fsw_bonus: np.ndarray | None = None) -> ViterbiResult:
     """Exact dynamic programme over (pL, pR, f_last) x lock ownership (spec
     §6.5 step 11).
 
@@ -1600,8 +1875,9 @@ def constrained_viterbi(unary: np.ndarray, dtb: np.ndarray, is_jump: np.ndarray,
     `ban`, (N, 20) bool, removes individual tokens at individual notes (the
     QA veto loop); `panel_bias`, (4,), adds that many nats per press of each
     panel (the panel-balance loop); `repeat_pen` and `fsw_pen`, (N,), cost that
-    many nats for repeating the previous row / footswitching at that note.
-    None of them applies to clamped notes.
+    many nats for repeating the previous row / footswitching at that note;
+    `fsw_bonus`, (N,), pays that many for a D/U footswitch there (see
+    FSW_PLACE_MIN_SHARE). None of them applies to clamped notes.
 
     If the rules ever leave a note with no legal token (they cannot for a plan
     from `decode_rhythm`; they can for a hand-built one), that note's tier
@@ -1672,6 +1948,8 @@ def constrained_viterbi(unary: np.ndarray, dtb: np.ndarray, is_jump: np.ndarray,
                         "repeat_any" if is_jump[j - 1] else "repeat"][sq_s]
                 if fsw_pen is not None and fsw_pen[j]:
                     gain = gain - fsw_pen[j] * g["fsw"][sq_s]
+                if fsw_bonus is not None and fsw_bonus[j]:
+                    gain = gain + fsw_bonus[j] * g["fsw_du"][sq_s]
                 if bias_tab is not None:
                     gain = gain + bias_tab[sq_s]
             cand = np.where(ok, score[:, None] + gain, NEG)
@@ -1886,11 +2164,191 @@ def unmask(model: FlowModel, ctx, scalars, cond19, is_jump: np.ndarray,
     return cur, log_softmax(final)
 
 
+def resample(logp: np.ndarray, k: int, tau: float, tau_scale, seed: int):
+    """`k` further token arrays drawn note by note from `logp`, the step
+    network's probabilities with every other note of the first sample
+    committed (a temperature scale of 0 takes the likeliest token). No network
+    call: each differs from the first sample where the network was undecided.
+    Returns (tokens (k, N), log-probs (k, N, 20)), the log-probs being `logp`."""
+    n = len(logp)
+    out = np.empty((k, n), np.int64)
+    for j in range(k):
+        t = (tau / DEFAULT_TAU) * float(tau_scale[j % len(tau_scale)])
+        if t <= 0:
+            out[j] = logp.argmax(1)
+            continue
+        rng = np.random.default_rng([int(seed) & 0x7FFFFFFF, 7919, j + 1])
+        gumbel = -np.log(-np.log(rng.uniform(1e-9, 1.0, logp.shape)))
+        out[j] = (logp / t + gumbel).argmax(1)
+    return out, np.broadcast_to(logp, (k,) + logp.shape)
+
+
+def unmask_many(model: FlowModel, ctx, scalars, cond19, is_jump: np.ndarray,
+                base: np.ndarray, k: int, steps: int, tau: float, tau_scale,
+                remask: float, seed: int):
+    """`unmask` for `k` further samples at once (one batched call per step).
+    Each starts from `base` with a `remask` share of its notes masked again
+    (all of them at 1.0) and has its own random stream, so the samples do not
+    depend on how many are drawn. Returns (tokens (k, N), log-probs (k, N, 20))."""
+    n = len(is_jump)
+    legal = (np.arange(C.N_TOKENS) >= 8)[None, :] == np.asarray(is_jump, bool)[:, None]
+    rngs = [np.random.default_rng([int(seed) & 0x7FFFFFFF, 7919, j + 1]) for j in range(k)]
+    cur = np.full((k, n), C.MASK, np.int64)
+    frozen = np.zeros((k, n), bool)
+    if remask < 1.0:
+        for j in range(k):
+            frozen[j] = rngs[j].random(n) >= remask
+            cur[j, frozen[j]] = base[frozen[j]]
+    n_free = (~frozen).sum(axis=1)
+    rows = np.arange(n)
+    for s in range(1, steps + 1):
+        logits = np.where(legal[None], model.choreo_many(ctx, scalars, cur, cond19), NEG)
+        for j in range(k):
+            if n_free[j] == 0:
+                continue
+            rng = rngs[j]
+            t_tok = (tau / DEFAULT_TAU) * float(tau_scale[j % len(tau_scale)])
+            gumbel = -np.log(-np.log(rng.uniform(1e-9, 1.0, logits[j].shape)))
+            pick = (logits[j] / max(t_tok, 1e-6) + gumbel).argmax(1)
+            conf = CONFIDENCE_WEIGHT * log_softmax(logits[j])[rows, pick] \
+                - np.log(-np.log(rng.uniform(1e-9, 1.0, n)))
+            known = cur[j] != C.MASK
+            conf = np.where(known, 1e9, conf)
+            conf[frozen[j]] = np.inf
+            keep = int(n_free[j]) if s == steps else int(math.floor(
+                n_free[j] * (1 - math.cos(math.pi * s / (2 * steps)))))
+            order = np.argsort(-conf, kind="stable")
+            commit = np.zeros(n, bool)
+            commit[order[:int(frozen[j].sum()) + keep]] = True
+            nxt = np.where(known, cur[j], pick)
+            cur[j] = np.where(commit, nxt, C.MASK)
+    final = np.where(legal[None], model.choreo_many(ctx, scalars, cur, cond19), NEG)
+    return cur, log_softmax(final)
+
+
 @dataclass
 class NeuralChart:
     events: C.ChartEvents
     encoded: C.EncodedChart
     stats: dict
+
+
+def read_footswitches(events: C.ChartEvents, times_ms) -> np.ndarray:
+    """Per note: is it a D/U footswitch in the annotator's own reading of the
+    chart (`codec.encode`) — what the style vector's `footswitch_share` counts,
+    and what someone reading the arrows without foot labels would play."""
+    enc, _ = C.encode(events, np.asarray(times_ms, np.float64))
+    return cond.footswitch_flags(enc)
+
+
+def place_footswitches(attempt, first: tuple, unary: np.ndarray, plan: RhythmPlan,
+                       times_ms: np.ndarray, slots: np.ndarray, hold_kind: np.ndarray,
+                       asked: float, seed: int) -> tuple:
+    """Bring the share of READ footswitches up to `asked` (see
+    FSW_PLACE_MIN_SHARE). `attempt(un=, fsw_bonus=, fsw_block=)` solves the
+    foot path as `generate` does, referee and panel balance included, and
+    `first` is its result without any placement.
+
+    Each round: read the chart back; block every footswitch — placed here or
+    the step network's own — that the reading turned into a jack; if the read
+    share is still short, choose more notes for one (fast enough, inside a run
+    of single steps, clear of freezes and of each other, where the model
+    itself likes a D/U step best) and solve again. Returns (the attempt whose
+    read share is closest to `asked`, a summary for the report)."""
+    n = len(plan.tick)
+    g = _gen_tables()
+    rng = np.random.default_rng((int(seed), 0xF5))
+    single = ~np.asarray(plan.is_jump, bool)
+    n_single = max(1, int(single.sum()))
+    target = int(round(asked * n_single))
+    dt_s = np.concatenate([[1e9], np.diff(times_ms)]) / 1000.0
+    # a note can carry a placed footswitch if it and the two after it are
+    # single steps of one run, with no freeze starting or held anywhere near
+    busy = ~single | (slots > 0) | (hold_kind > 0)
+    fast = dt_s < FSW_MAX_GAP_S
+    can = np.zeros(n, bool)
+    for j in range(2, n - 2):
+        can[j] = (not busy[j - 1:j + 3].any()) and bool(fast[j:j + 3].all())
+    noise = rng.gumbel(0.0, 0.5, n)
+    bonus = np.zeros(n)
+    block = np.zeros(n, bool)
+    cur = first
+    extra_rounds = 0
+    best = None
+
+    def unaries() -> np.ndarray:
+        """The step network's unaries with the placement's wishes written in:
+        at a chosen note every alternating step is as good as the one the
+        network sampled (so the bonus alone decides, however sure the network
+        was of something else), and each of the two steps after it prefers the
+        stepping foot's own side panel to anything else."""
+        un = unary.copy()
+        for j in np.nonzero(bonus > 0)[0]:
+            un[j, :4] = np.maximum(un[j, :4], 0.0)
+            for k in (j + 1, j + 2):
+                un[k, 0] = max(float(un[k].max()), 0.0) + FSW_FOLLOW_BONUS
+        return un
+
+    un = unary
+
+    for rnd in range(FSW_ROUNDS + 1):
+        res, _, chart = cur[0], cur[1], cur[2]
+        read = read_footswitches(chart.events, times_ms)
+        have = int(read.sum())
+        states = np.asarray(res.states, np.int64)
+        own = g["fsw"][states, res.token.astype(np.int64)]
+        # closest to what was asked; among charts that are close enough, the
+        # one with the fewest footswitches that read as jacks
+        off = abs(have - target)
+        key = (off > max(1, int(0.1 * target)), int((own & ~read).sum()), off, rnd)
+        if best is None or key < best[0]:
+            best = (key, cur, have)
+        if rnd == FSW_ROUNDS:
+            break
+        changed = False
+        # a footswitch that is read as something else is a jack: take it out
+        for j in np.nonzero(own & ~read & ~block)[0]:
+            block[j] = True
+            changed = True
+            bonus[j] = 0.0
+        if have > target + max(1, int(0.15 * target)):
+            # too many: give up the ones the model itself did not ask for first
+            extra = [int(j) for j in np.nonzero(read)[0]]
+            extra.sort(key=lambda j: (bonus[j] > 0, noise[j]))
+            for j in extra[:have - target]:
+                block[j] = True
+                changed = True
+                bonus[j] = 0.0
+        elif have < target:
+            taken = read | (bonus > 0)
+            near = np.zeros(n + 2 * FSW_SPACING + 1, bool)
+            for j in np.nonzero(taken)[0]:
+                near[j:j + 2 * FSW_SPACING + 1] = True
+            # where the path stands now, which notes could be a D/U footswitch
+            able = g["fsw_du"][states].any(axis=1)
+            cand = [int(j) for j in np.nonzero(can & able & ~block & ~taken)[0]]
+            score = {j: float(np.max(np.where(g["fsw_du"][states[j]], un[j], NEG))) + noise[j]
+                     for j in cand}
+            cand.sort(key=lambda j: -score[j])
+            want = int(math.ceil((target - have) * FSW_OVERSHOOT))
+            for j in cand:
+                if want <= 0:
+                    break
+                if near[j + FSW_SPACING]:
+                    continue
+                near[j:j + 2 * FSW_SPACING + 1] = True
+                bonus[j] = FSW_BONUS
+                want -= 1
+                changed = True
+        if not changed:
+            break
+        un = unaries()
+        cur = attempt(un=un, fsw_bonus=bonus, fsw_block=block)
+        extra_rounds += cur[4]
+    _, cur, have = best
+    info = {"asked": round(asked, 4), "read": have, "read_share": round(have / n_single, 4),
+            "placed": int((bonus > 0).sum()), "blocked": int(block.sum())}
+    return (cur[0], cur[1], cur[2], cur[3], extra_rounds, cur[5]), info
 
 
 def _encoded_from(plan: RhythmPlan, tokens: np.ndarray, f_init: int,
@@ -1966,8 +2424,20 @@ class StepManiaNeuralEngine:
         if progress:
             progress("rhythm")
 
+        cb = self.model.callbacks()
+        cr = self.model.critic() if tau > 0 else None
+        links, novelty, cr_links = [], None, []
+        if cb is not None or cr is not None:
+            st = ST.analyze_structure(x, tau_sim=cb["tau_sim"] if cb else cr["tau_sim"])
+            novelty, cr_links = st.novelty, st.motif_links
+            if cb is not None:
+                links = st.motif_links
+
         def rhythm(cond_vec):
             logits = self.model.rhythm(x, cond_vec)
+            if links and cb["rhythm_weight"] > 0:
+                logits = dict(logits, onset=echo_onset_logits(
+                    logits["onset"], links, cb["tau_sim"], cb["rhythm_weight"]))
 
             def decode(o):
                 return decode_rhythm(logits, tick_times, difficulty,
@@ -2021,13 +2491,23 @@ class StepManiaNeuralEngine:
         dt = np.concatenate([[1e9], np.diff(times_ms)])
         dt_s = dt / 1000.0
         slots, hold_kind = lock_schedule(plan.tick, plan.is_jump, plan.flavor, plan.dur)
-        def attempt(rules: TierRules):
+        last_key = [None]               # (referee objects, panels out of band) of the last solve
+
+        def attempt(rules: TierRules, un=None, fsw_bonus=None, fsw_block=None):
             """Solve the foot path under `rules`: re-solve until the caller's
-            referee has no objection, and nudge until the panels balance."""
-            args = dict(unary=unary, dtb=C.dt_bucket(dt), is_jump=plan.is_jump, slots=slots,
+            referee has no objection, and nudge until the panels balance.
+            `un`, `fsw_bonus` and `fsw_block` are the footswitch placement's
+            (`place_footswitches`): its own unaries, the notes it wants a
+            footswitch at, and the notes that may not have one."""
+            args = dict(unary=unary if un is None else un, dtb=C.dt_bucket(dt),
+                        is_jump=plan.is_jump, slots=slots,
                         hold_kind=hold_kind, rules=rules, f_init=f_init)
             extra, base_no_repeat = timing_penalties(rules, style, dt_s)
             args.update(extra)
+            if fsw_bonus is not None:
+                args["fsw_bonus"] = fsw_bonus
+            if fsw_block is not None and fsw_block.any():
+                args["fsw_pen"] = args.get("fsw_pen", np.zeros(n)) + FSW_BLOCK * fsw_block
             ban = np.zeros((n, C.N_TOKENS), bool)
             bias = np.zeros(4)
             rounds, best = 0, None
@@ -2062,10 +2542,59 @@ class StepManiaNeuralEngine:
                 out = (share < BALANCE_BAND[0]) | (share > BALANCE_BAND[1])
                 bias += BALANCE_STEP * np.where(out, (0.25 - share) / 0.25, 0.0)
                 args["f_init"] = res.f_init
-            _, res, enc, chart, bias = best
+            last_key[0], res, enc, chart, bias = best
             return res, enc, chart, bias, rounds, int(ban.sum())
 
+        cb_info = None
+        if links and cb["choreo_bonus"] > 0:
+            # answer a repeated passage with the figure it got the first time:
+            # a bonus toward the token the step network itself chose on the
+            # same tick of the earlier bar. It is part of the unaries from the
+            # first solve on, so it costs no extra pass and every re-solve
+            # (referee, panel balance, footswitch placement) keeps it.
+            extra, anchored = callback_bonus(plan.tick, plan.is_jump, sampled, links,
+                                             cb["choreo_bonus"])
+            if anchored:
+                unary = unary + extra
+            cb_info = {"links": len(links), "anchored": int(anchored)}
+        elif links:
+            cb_info = {"links": len(links), "anchored": 0}
         res, enc, chart, bias, rounds, vetoed = attempt(rules)
+        cr_info = None
+        if cr is not None and n >= CRITIC_MIN_NOTES:
+            # Best-of-K: further samples of the step network on the same notes,
+            # each solved like the first; the critic's favourite among those the
+            # referees and the panel balance treat no worse than the first wins.
+            k_more = cr["k"] - 1
+            scales = cr["tau_scale"][1:] or (1.0,)
+            if cr["source"] == "logits":
+                more_tok, more_logp = resample(logp, k_more, tau, scales, seed)
+            else:
+                more_tok, more_logp = unmask_many(
+                    self.model, ctx, scalars, cv, plan.is_jump, sampled, k_more, cr["steps"],
+                    tau, scales, cr["remask"], seed)
+            cands = [(sampled, unary, (res, enc, chart, bias, rounds, vetoed), last_key[0])]
+            for j in range(k_more):
+                un = committed_unary(more_logp[j], more_tok[j])
+                if links and cb["choreo_bonus"] > 0:
+                    scale = cr["bonus_scale"][(j + 1) % len(cr["bonus_scale"])]
+                    un = un + callback_bonus(plan.tick, plan.is_jump, more_tok[j], links,
+                                             cb["choreo_bonus"] * scale)[0]
+                solved = attempt(rules, un=un)
+                cands.append((more_tok[j], un, solved, last_key[0]))
+            prep = CR.prepare(x, plan.tick, times_ms, plan.is_jump, difficulty, cr_links,
+                              novelty, slots > 0)
+            scores = self.model.sess_c.score(np.stack(
+                [CR.chart_features(prep, c[2][0].token, c[2][0].f_init) for c in cands]))
+            ok = [c[3] <= cands[0][3] for c in cands]
+            pick = max((j for j in range(len(cands)) if ok[j]), key=lambda j: (scores[j], -j))
+            cr_info = {"k": len(cands), "picked": int(pick),
+                       "scores": [round(float(v), 3) for v in scores],
+                       "eligible": [bool(v) for v in ok]}
+            if pick != 0:
+                sampled, unary = cands[pick][0], cands[pick][1]
+                res, enc, chart, bias, _, vetoed = cands[pick][2]
+            rounds = sum(c[2][4] for c in cands)
         cross_scale = rules.cross_scale
         if opts.stream and not rules.no_cross:
             # A stream is one long run at one speed, and the sampler's taste for
@@ -2080,6 +2609,15 @@ class StepManiaNeuralEngine:
                 rounds += r2[4]
                 if _cross_share(r2[0].token) < _cross_share(res.token):
                     res, enc, chart, bias, vetoed = r2[0], r2[1], r2[2], r2[3], r2[5]
+        fsw_info = None
+        asked_fsw = float(style[cond.INDEX["footswitch_share"]])
+        if asked_fsw > FSW_PLACE_MIN_SHARE and not rules.no_footswitch and n >= 8:
+            placed = place_footswitches(
+                lambda **kw: attempt(dataclasses.replace(rules, cross_scale=cross_scale), **kw),
+                (res, enc, chart, bias, 0, vetoed), unary, plan, times_ms, slots, hold_kind,
+                asked_fsw, seed)
+            (res, enc, chart, bias, more, vetoed), fsw_info = placed
+            rounds += more
         enc.mines = place_mines(plan.mine_tick, enc, seed)
         stats["choreo"] = {"viterbi_score": round(res.score, 2), "relaxed": res.relaxed,
                            "changed_by_viterbi": int((res.token != sampled).sum()),
@@ -2088,6 +2626,12 @@ class StepManiaNeuralEngine:
                            "panel_bias": [round(float(v), 2) for v in bias]}
         if cross_scale != rules.cross_scale:
             stats["choreo"]["cross_scale"] = cross_scale
+        if fsw_info is not None:
+            stats["choreo"]["footswitches"] = fsw_info
+        if cb_info is not None:
+            stats["choreo"]["callbacks"] = cb_info
+        if cr_info is not None:
+            stats["choreo"]["critic"] = cr_info
         return NeuralChart(C.decode(enc), enc, stats)
 
     def inpaint_section(self, events: C.ChartEvents, x: np.ndarray,

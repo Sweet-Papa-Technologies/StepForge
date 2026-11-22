@@ -213,13 +213,14 @@ def build_training_set(args, log=print):
     if not args.corpus_root:
         train = StageADataset(load_corpus(args.corpus, "train", args.max_songs,
                                           args.reencode), args.crop, True, args.seed,
-                              args.p_drop_stems)
+                              args.p_drop_stems, spec_augment=args.spec_augment)
         val = load_corpus(args.corpus, "val", args.max_songs, args.reencode)
         return train, val, {"sources": {"real": len(train)}}
     src = load_sources(args.corpus_root, STAGE_A_SOURCES, args.max_songs, args.reencode, log)
 
     def ds(songs):
-        return StageADataset(songs, args.crop, True, args.seed, args.p_drop_stems)
+        return StageADataset(songs, args.crop, True, args.seed, args.p_drop_stems,
+                             spec_augment=args.spec_augment)
 
     parts = {name: ds(src[name]) for name in ("real", *STAGE_A_SOURCES) if name in src}
     if "aug_stem" in src:
@@ -271,6 +272,12 @@ def main(argv=None):
                          "off the grid (v1.5: 0.25)")
     ap.add_argument("--phase-shift-weight", type=float, default=0.5,
                     help="weight of the ordinary loss on those shifted crops")
+    ap.add_argument("--spec-augment", action="store_true",
+                    help="mask random spans of ticks and bands of channels in the acoustic "
+                         "input of every training item (never the metric-timing channels, "
+                         "never in validation)")
+    ap.add_argument("--save-every", type=int, default=0,
+                    help="also keep a checkpoint every N epochs (epoch_NNN.pt)")
     ap.add_argument("--select", choices=["auto", "r_prec", "val_score", "polish_score"],
                     default="auto",
                     help="checkpoint metric (auto: val_score with --corpus-root). "
@@ -420,6 +427,9 @@ def main(argv=None):
             run.save("best", **ckpt)
             run.sync("best")
         run.save("last", opt=opt.state_dict(), best=best, best_early=best_early, **ckpt)
+        if args.save_every and (epoch + 1) % args.save_every == 0:
+            run.save(f"epoch_{epoch + 1:03d}", **ckpt)
+            run.sync(f"epoch_{epoch + 1:03d}")
         if last_epoch or (mixed and epoch == args.phase1_epochs - 1):
             run.sync("best", "best_early", "last")       # end of a phase
         elif args.mirror_every and (epoch + 1) % args.mirror_every == 0:
