@@ -32,7 +32,17 @@ pub struct Chart {
     pub columns: usize,
     /// Seconds at which beat 0 occurs (StepMania `#OFFSET` is its negation).
     pub beat0_time: f64,
+    /// The first tempo. Most charts have only this one.
     pub bpm: f64,
+    /// Every tempo segment as (beat, bpm), and every stop as (beat, seconds):
+    /// a song whose tempo changes or that pauses mid-way carries more than one
+    /// entry here, and the player must time its beat lines through them.
+    pub bpms: Vec<(f64, f64)>,
+    pub stops: Vec<(f64, f64)>,
+    /// Seconds at which each whole beat is played, from beat 0 to a few bars
+    /// past the last note — the player's beat and bar lines, already timed
+    /// through `bpms` and `stops` exactly as the notes are.
+    pub beat_times: Vec<f64>,
     pub notes: Vec<Note>,
 }
 
@@ -63,6 +73,52 @@ fn parse_bpms(src: &str) -> Vec<(f64, f64)> {
         out.push((0.0, 120.0));
     }
     out
+}
+
+/// `#STOPS:64.000=0.412,128.500=0.250;` -> [(beat, seconds)]
+fn parse_stops(src: &str) -> Vec<(f64, f64)> {
+    let mut out = Vec::new();
+    if let Some(raw) = tag(src, "STOPS") {
+        for pair in raw.split(',') {
+            let mut it = pair.split('=');
+            if let (Some(b), Some(v)) = (it.next(), it.next()) {
+                if let (Ok(b), Ok(v)) = (b.trim().parse::<f64>(), v.trim().parse::<f64>()) {
+                    if v > 0.0 {
+                        out.push((b, v));
+                    }
+                }
+            }
+        }
+    }
+    out.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    out
+}
+
+/// The tempo map of a simfile: where beat 0 is, the BPM segments, the stops.
+/// This is the same arithmetic the engine's `timing.py` does — a note, a beat
+/// line and a bar line all get their time from here.
+#[derive(Debug, Clone)]
+pub struct Timing {
+    pub beat0: f64,
+    pub bpms: Vec<(f64, f64)>,
+    pub stops: Vec<(f64, f64)>,
+}
+
+impl Timing {
+    pub fn parse(src: &str) -> Timing {
+        Timing {
+            beat0: -tag(src, "OFFSET").and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0),
+            bpms: parse_bpms(src),
+            stops: parse_stops(src),
+        }
+    }
+
+    /// Seconds at which `beat` is played. A stop holds the music AFTER the
+    /// note on its beat, so it delays every later beat and not that one.
+    pub fn time_at(&self, beat: f64) -> f64 {
+        let held: f64 = self.stops.iter().filter(|s| s.0 < beat).map(|s| s.1).sum();
+        beat_to_time(beat, self.beat0, &self.bpms) + held
+    }
 }
 
 /// Seconds for a beat, walking BPM segments.
@@ -99,7 +155,7 @@ fn strip_comments(s: &str) -> String {
         .join("\n")
 }
 
-fn parse_notedata(raw: &str, beat0: f64, bpms: &[(f64, f64)]) -> (Vec<Note>, usize) {
+fn parse_notedata(raw: &str, timing: &Timing) -> (Vec<Note>, usize) {
     let cleaned = strip_comments(raw);
     let mut notes = Vec::new();
     let mut columns = 0usize;
@@ -118,7 +174,7 @@ fn parse_notedata(raw: &str, beat0: f64, bpms: &[(f64, f64)]) -> (Vec<Note>, usi
         let rows_n = rows.len() as f64;
         for (r_idx, row) in rows.iter().enumerate() {
             let beat = 4.0 * (m_idx as f64 + r_idx as f64 / rows_n);
-            let time = beat_to_time(beat, beat0, bpms);
+            let time = timing.time_at(beat);
             columns = columns.max(row.chars().count());
             for (c, ch) in row.chars().enumerate() {
                 match ch {
@@ -129,7 +185,7 @@ fn parse_notedata(raw: &str, beat0: f64, bpms: &[(f64, f64)]) -> (Vec<Note>, usi
                     '3' => {
                         if let Some((start_beat, kind)) = open.remove(&c) {
                             notes.push(Note {
-                                time: beat_to_time(start_beat, beat0, bpms),
+                                time: timing.time_at(start_beat),
                                 beat: start_beat,
                                 column: c,
                                 kind,
@@ -146,10 +202,17 @@ fn parse_notedata(raw: &str, beat0: f64, bpms: &[(f64, f64)]) -> (Vec<Note>, usi
     (notes, if columns == 0 { 4 } else { columns })
 }
 
+/// Whole-beat times from beat 0 to four bars past the last note.
+fn beat_times(timing: &Timing, notes: &[Note]) -> Vec<f64> {
+    let last = notes.iter().map(|n| n.beat).fold(0.0_f64, f64::max);
+    let n = last.ceil() as usize + 16;
+    (0..=n).map(|b| timing.time_at(b as f64)).collect()
+}
+
 /// Parse one difficulty out of a simfile. `difficulty` matches case-insensitively.
 pub fn parse_chart(src: &str, difficulty: &str) -> Option<Chart> {
-    let beat0 = -tag(src, "OFFSET").and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0);
-    let bpms = parse_bpms(src);
+    let timing = Timing::parse(src);
+    let (beat0, bpms) = (timing.beat0, timing.bpms.clone());
     let want = difficulty.to_lowercase();
 
     // .ssc: one `#NOTEDATA:` block per chart.
@@ -162,7 +225,7 @@ pub fn parse_chart(src: &str, difficulty: &str) -> Option<Chart> {
             let start = section.find("#NOTES:")? + "#NOTES:".len();
             let body = &section[start..];
             let end = body.find(';').unwrap_or(body.len());
-            let (notes, columns) = parse_notedata(&body[..end], beat0, &bpms);
+            let (notes, columns) = parse_notedata(&body[..end], &timing);
             return Some(Chart {
                 difficulty: diff,
                 meter: tag(section, "METER").and_then(|v| v.parse().ok()).unwrap_or(0),
@@ -170,6 +233,9 @@ pub fn parse_chart(src: &str, difficulty: &str) -> Option<Chart> {
                 columns,
                 beat0_time: beat0,
                 bpm: bpms[0].1,
+                beat_times: beat_times(&timing, &notes),
+                bpms,
+                stops: timing.stops.clone(),
                 notes,
             });
         }
@@ -188,7 +254,7 @@ pub fn parse_chart(src: &str, difficulty: &str) -> Option<Chart> {
         if diff.to_lowercase() != want {
             continue;
         }
-        let (notes, columns) = parse_notedata(parts[5], beat0, &bpms);
+        let (notes, columns) = parse_notedata(parts[5], &timing);
         return Some(Chart {
             difficulty: diff,
             meter: parts[3].trim().parse().unwrap_or(0),
@@ -196,6 +262,9 @@ pub fn parse_chart(src: &str, difficulty: &str) -> Option<Chart> {
             columns,
             beat0_time: beat0,
             bpm: bpms[0].1,
+            beat_times: beat_times(&timing, &notes),
+            bpms,
+            stops: timing.stops.clone(),
             notes,
         });
     }
@@ -252,6 +321,40 @@ mod tests {
         let hold = c.notes.iter().find(|n| n.kind == "hold").expect("hold");
         assert!((hold.beat - 4.0).abs() < 1e-9);
         assert!(hold.end_time.unwrap() > hold.time);
+    }
+
+    /// A tempo change and a stop: notes and beat lines are timed through both,
+    /// the way the game times them.
+    #[test]
+    fn times_notes_through_bpm_changes_and_stops() {
+        let ssc = SSC
+            .replace("#BPMS:0.000=120.000;", "#BPMS:0.000=120.000,6.000=240.000;\n#STOPS:4.000=0.500;")
+            .replace("0010\n0000\n;", "0010\n0001\n;");
+        let c = parse_chart(&ssc, "easy").expect("chart");
+        assert_eq!(c.bpms, vec![(0.0, 120.0), (6.0, 240.0)]);
+        assert_eq!(c.stops, vec![(4.0, 0.5)]);
+        // beat 4: two seconds of 120 BPM; the stop comes AFTER this note
+        assert!((c.notes[0].time - (0.423 + 2.0)).abs() < 1e-9);
+        // beat 6: one more second, plus the half-second stop
+        assert!((c.notes[1].time - (0.423 + 3.0 + 0.5)).abs() < 1e-9);
+        // beat 7: a beat of 240 BPM later
+        assert!((c.notes[2].beat - 7.0).abs() < 1e-9);
+        assert!((c.notes[2].time - (0.423 + 3.0 + 0.5 + 0.25)).abs() < 1e-9);
+        // the player's beat lines say the same
+        assert!((c.beat_times[4] - (0.423 + 2.0)).abs() < 1e-9);
+        assert!((c.beat_times[5] - (0.423 + 2.5 + 0.5)).abs() < 1e-9);
+        assert!((c.beat_times[8] - (0.423 + 3.0 + 0.5 + 0.5)).abs() < 1e-9);
+        assert!(c.beat_times.len() >= 7 + 16);
+    }
+
+    /// One tempo, no stops: beat lines are evenly spaced, as they always were.
+    #[test]
+    fn single_tempo_beat_lines_are_even() {
+        let c = parse_chart(SSC, "easy").expect("chart");
+        assert!(c.stops.is_empty() && c.bpms.len() == 1);
+        for (b, t) in c.beat_times.iter().enumerate() {
+            assert!((t - (0.423 + b as f64 * 0.5)).abs() < 1e-9);
+        }
     }
 
     #[test]

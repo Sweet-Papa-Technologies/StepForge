@@ -12,6 +12,7 @@ from simfile.ssc import SSCChart, SSCSimfile
 
 from .grammar import BUDGETS
 from .quantize import to_simfile_notes
+from .timing import has_tempo_map, timing_of
 
 
 
@@ -25,7 +26,24 @@ def _sample_start(analysis: dict) -> float:
                key=lambda s: s.get("energy_pct", 0), default=None)
     if not best:
         return 0.0
+    if has_tempo_map(analysis):
+        return round(float(timing_of(analysis).time_at(best["start_bar"] * 4.0)), 3)
     return round(offset + best["start_bar"] * 4 / bpm * 60, 3)
+
+
+def timing_tags(analysis: dict) -> tuple:
+    """(#BPMS value, #STOPS value or None) for an analysis.
+
+    One tempo — nearly every song — is the single entry this has always
+    written. A song with a tempo map (`analysis["tempo_map"]`, see timing.py)
+    gets every BPM segment and every stop, three decimals each, which is the
+    precision the map was built with."""
+    tm = analysis.get("tempo_map")
+    if not tm:
+        return f"0.000={analysis['bpm']:.3f}", None
+    bpms = ",".join(f"{b:.3f}={v:.3f}" for b, v in tm["bpms"])
+    stops = ",".join(f"{b:.3f}={s:.3f}" for b, s in tm.get("stops", []))
+    return bpms, (stops or None)
 
 
 def build_simfile(track_meta: dict, analysis: dict, charts_by_diff: dict,
@@ -42,7 +60,9 @@ def build_simfile(track_meta: dict, analysis: dict, charts_by_diff: dict,
     sf.artist = track_meta["artist"]
     sf.music = track_meta["music"]
     sf.offset = f"{-round(analysis['offset'], 3):.3f}"      # #OFFSET = -(beat0 time)
-    sf.bpms = f"0.000={analysis['bpm']:.3f}"
+    sf.bpms, stops = timing_tags(analysis)
+    if stops:
+        sf.stops = stops
     sf.samplestart = f"{_sample_start(analysis):.3f}"
     sf.samplelength = "12.000"
     sf.selectable = "YES"

@@ -68,6 +68,11 @@ the charts.
 - **On the music.** StepForge measures the song's tempo and beat grid, places steps
   on real 4th / 8th / 16th / triplet positions, and follows the song's energy:
   calm verses, busy choruses.
+- **Tempo changes and pauses.** When a song changes tempo, or the band stops and
+  comes back in, the chart follows it: the simfile gets the BPM changes and
+  stops it needs, and the built-in player reads them too. Songs that hold one
+  tempo (nearly all of them) are charted exactly as before.
+  [How it works, and what it does not catch yet](docs/tempo-maps.md).
 - **Your style.** Sliders and presets for density, streams, jumps, freezes,
   crossovers, jacks and mines, or leave them for the model to choose.
 - **Your rhythm.** Cap a chart at 4ths, 8ths or 16ths, or switch on Stream mode
@@ -131,7 +136,10 @@ Beginner and Easy. See the
 
 ## How it works
 
-1. **Listen.** Signal processing finds the song's tempo, beat grid and every onset.
+1. **Listen.** Signal processing finds the song's tempo, beat grid and every onset,
+   and checks that the one tempo holds from the first bar to the last. Where it
+   does not (a tempo change, a pause, a bar cut short), the grid is re-seated
+   there and the simfile carries the change.
 2. **Place.** *RhythmNet* (9.6M parameters) reads the music on a musical grid of
    48 ticks per bar and decides where steps, jumps, freezes and mines go.
 3. **Step.** *ChoreoNet* (15.2M parameters) chooses the arrows, thinking in terms of

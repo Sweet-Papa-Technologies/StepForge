@@ -74,83 +74,11 @@ _MAX_HALF_WINDOW_S = 0.25
 # --------------------------------------------------------------------------- #
 # Timing
 # --------------------------------------------------------------------------- #
-class TimingMap:
-    """Beat <-> seconds for a song: an offset, BPM segments and stops/delays."""
+# `TimingMap` (beat <-> seconds: an offset, BPM segments, stops) lives in
+# ..timing so the modules outside the neural engine time a chart the same way.
+from ..timing import TICKS_PER_BEAT as _T_TPB, TICKS_PER_MEASURE as _T_G, TimingMap  # noqa: E402,F401
 
-    def __init__(self, offset_s: float, bpms, stops=(), delays=()):
-        """`offset_s` is the time of beat 0 (i.e. -#OFFSET). `bpms` is
-        [(beat, bpm), ...]; `stops`/`delays` are [(beat, seconds), ...]."""
-        bpms = sorted((float(b), float(v)) for b, v in bpms)
-        if not bpms:
-            raise ValueError("TimingMap needs at least one BPM")
-        if bpms[0][0] > 0:
-            bpms.insert(0, (0.0, bpms[0][1]))
-        self.offset_s = float(offset_s)
-        self.bpm_beats = np.array([b for b, _ in bpms])
-        self.bpm_vals = np.array([v for _, v in bpms])
-        spb = 60.0 / self.bpm_vals
-        seg = np.diff(self.bpm_beats) * spb[:-1]
-        self._seg_t = np.concatenate([[0.0], np.cumsum(seg)])
-        # A stop pauses AFTER the note on its beat; a delay pauses BEFORE it.
-        self._stops = self._pauses(stops)
-        self._delays = self._pauses(delays)
-
-    @staticmethod
-    def _pauses(items):
-        items = sorted((float(b), float(s)) for b, s in items if float(s) != 0.0)
-        beats = np.array([b for b, _ in items])
-        cum = np.concatenate([[0.0], np.cumsum([s for _, s in items])])
-        return beats, cum
-
-    @classmethod
-    def constant(cls, bpm: float, offset_s: float) -> "TimingMap":
-        return cls(offset_s, [(0.0, bpm)])
-
-    def shifted(self, delta_s: float) -> "TimingMap":
-        out = TimingMap.__new__(TimingMap)
-        out.__dict__.update(self.__dict__)
-        out.offset_s = self.offset_s + float(delta_s)
-        return out
-
-    @property
-    def is_constant(self) -> bool:
-        return (len(self.bpm_vals) == 1 and len(self._stops[0]) == 0
-                and len(self._delays[0]) == 0)
-
-    def time_at(self, beats) -> np.ndarray:
-        b = np.asarray(beats, np.float64)
-        j = np.clip(np.searchsorted(self.bpm_beats, b, side="right") - 1,
-                    0, len(self.bpm_vals) - 1)
-        t = self._seg_t[j] + (b - self.bpm_beats[j]) * 60.0 / self.bpm_vals[j]
-        sb, sc = self._stops
-        if len(sb):
-            t = t + sc[np.searchsorted(sb, b, side="left")]
-        db, dc = self._delays
-        if len(db):
-            t = t + dc[np.searchsorted(db, b, side="right")]
-        return t + self.offset_s
-
-    def tick_times(self, n_ticks: int) -> np.ndarray:
-        return self.time_at(np.arange(n_ticks) / TICKS_PER_BEAT)
-
-    def bpm_at(self, beats) -> np.ndarray:
-        j = np.clip(np.searchsorted(self.bpm_beats, np.asarray(beats, np.float64),
-                                    side="right") - 1, 0, len(self.bpm_vals) - 1)
-        return self.bpm_vals[j]
-
-    def ticks_for_duration(self, duration_s: float) -> int:
-        """Ticks needed to cover the audio, rounded up to a whole measure."""
-        lo, hi = 0.0, 4.0
-        while self.time_at(hi) < duration_s and hi < 1e6:
-            hi *= 2
-        for _ in range(60):
-            mid = (lo + hi) / 2
-            if self.time_at(mid) < duration_s:
-                lo = mid
-            else:
-                hi = mid
-        n = int(np.ceil(hi * TICKS_PER_BEAT))
-        return max(G, int(np.ceil(n / G)) * G)
+assert (_T_TPB, _T_G) == (TICKS_PER_BEAT, G), "timing.py and codec.py disagree on the grid"
 
 
 # --------------------------------------------------------------------------- #
