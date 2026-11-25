@@ -71,18 +71,54 @@ const activeUrl = computed(() =>
 );
 
 /* ------------------------------ bar range -------------------------------- */
-/** Seconds per bar (the emitted simfile is 4/4 at one tempo), or 0 if unknown. */
+/** Seconds per bar at the chart's first tempo (the emitted simfile is 4/4), or
+ *  0 if unknown. A truthy value also says "this chart has a grid". */
 const barSeconds = computed(() => {
   const bpm = props.chart?.bpm ?? 0;
   return bpm > 0 ? 240 / bpm : 0;
 });
+/** When a beat is played. A song with a tempo change or a mid-song pause has
+ *  its beats timed by the simfile's #BPMS and #STOPS — `beatTimes`, one entry
+ *  per whole beat, worked out the same way the notes' times are. Between two
+ *  entries the beat is interpolated; past either end the nearest beat's
+ *  length carries on. Charts without the table (one tempo) use plain
+ *  arithmetic. */
+function beatTime(beat: number): number {
+  const bt = props.chart?.beatTimes;
+  if (!bt || bt.length < 2) {
+    const bpm = props.chart?.bpm ?? 0;
+    return (props.chart?.beat0Time ?? 0) + (bpm > 0 ? (beat * 60) / bpm : 0);
+  }
+  const last = bt.length - 1;
+  if (beat <= 0) return bt[0] + beat * (bt[1] - bt[0]);
+  if (beat >= last) return bt[last] + (beat - last) * (bt[last] - bt[last - 1]);
+  const i = Math.floor(beat);
+  return bt[i] + (beat - i) * (bt[i + 1] - bt[i]);
+}
+/** The beat being played at `t` seconds: the inverse of `beatTime`. */
+function beatAt(t: number): number {
+  const bt = props.chart?.beatTimes;
+  if (!bt || bt.length < 2) {
+    const bpm = props.chart?.bpm ?? 0;
+    return bpm > 0 ? ((t - (props.chart?.beat0Time ?? 0)) * bpm) / 60 : 0;
+  }
+  const last = bt.length - 1;
+  if (t <= bt[0]) return (t - bt[0]) / Math.max(1e-6, bt[1] - bt[0]);
+  if (t >= bt[last]) return last + (t - bt[last]) / Math.max(1e-6, bt[last] - bt[last - 1]);
+  let lo = 0, hi = last;
+  while (hi - lo > 1) {
+    const mid = (lo + hi) >> 1;
+    if (bt[mid] <= t) lo = mid;
+    else hi = mid;
+  }
+  return lo + (t - bt[lo]) / Math.max(1e-6, bt[lo + 1] - bt[lo]);
+}
 function barAt(t: number): number {
-  const s = barSeconds.value;
-  if (!s) return 0;
-  return Math.max(0, Math.floor((t - (props.chart?.beat0Time ?? 0)) / s + 1e-6));
+  if (!barSeconds.value) return 0;
+  return Math.max(0, Math.floor(beatAt(t) / 4 + 1e-6));
 }
 function barTime(bar: number): number {
-  return (props.chart?.beat0Time ?? 0) + bar * barSeconds.value;
+  return beatTime(bar * 4);
 }
 const currentBar = computed(() => barAt(current.value));
 /** The marked range as a band on the progress bar (percent of the song). */
@@ -259,29 +295,29 @@ function frame() {
   ctx.fillStyle = "rgba(255,255,255,0.02)";
   for (let i = 0; i < cols; i++) ctx.fillRect(x0 + i * laneW + 2, 0, laneW - 4, cssH);
 
-  // beat lines
+  // beat lines, timed the way the notes are (see beatTime)
   const bpm = props.chart?.bpm ?? 0;
-  const beat0 = props.chart?.beat0Time ?? 0;
   if (bpm > 0) {
-    const spb = 60 / bpm;
     // the marked bar range, as a tint behind the notes
     const rs = props.rangeStart, re = props.rangeEnd;
     if (rs != null && re != null && re > rs) {
-      const top = Math.max(RECEPTOR_Y, RECEPTOR_Y + (beat0 + rs * 4 * spb - t) * speed.value);
-      const bottom = Math.min(cssH, RECEPTOR_Y + (beat0 + re * 4 * spb - t) * speed.value);
+      const top = Math.max(RECEPTOR_Y, RECEPTOR_Y + (barTime(rs) - t) * speed.value);
+      const bottom = Math.min(cssH, RECEPTOR_Y + (barTime(re) - t) * speed.value);
       if (bottom > top) {
         ctx.fillStyle = "rgba(188,19,254,0.10)";
         ctx.fillRect(x0, top, fieldW, bottom - top);
       }
     }
-    const first = Math.floor((t - beat0) / spb);
-    const span = Math.ceil((cssH - RECEPTOR_Y) / (spb * speed.value)) + 2;
+    const first = Math.floor(beatAt(t));
+    // beats on screen: counted until one falls off the bottom (a tempo change
+    // makes them unevenly spaced), with a ceiling for a runaway table
     ctx.font = "10px 'JetBrains Mono Variable', monospace";
     ctx.textAlign = "right";
     ctx.textBaseline = "middle";
-    for (let b = first; b < first + span; b++) {
-      const y = RECEPTOR_Y + (beat0 + b * spb - t) * speed.value;
-      if (y < RECEPTOR_Y || y > cssH) continue;
+    for (let b = first; b < first + 400; b++) {
+      const y = RECEPTOR_Y + (beatTime(b) - t) * speed.value;
+      if (y > cssH) break;
+      if (y < RECEPTOR_Y) continue;
       ctx.fillStyle = b % 4 === 0 ? "rgba(255,255,255,0.13)" : "rgba(255,255,255,0.05)";
       ctx.fillRect(x0, y, fieldW, 1);
       // bar numbers, counted from 0 as the section editor counts them

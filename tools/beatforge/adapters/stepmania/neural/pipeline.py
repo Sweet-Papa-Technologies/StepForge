@@ -26,6 +26,8 @@ from . import codec as C
 from . import conditioning as cond
 from . import grid_features as GF
 from . import infer
+from . import tempo_map as TM
+from ..timing import TimingMap, beats_to_times, has_tempo_map, timing_of
 
 ENGINE_NAME = "neural"
 #: Serialization grid for the neural engine: one tick of the 48-grid, so the
@@ -109,7 +111,10 @@ def transient_ticks(analysis: dict, n_ticks: int, tol_s: float = 0.032) -> np.nd
     onsets = np.sort(np.array([o["time"] for o in analysis.get("onsets", [])], float))
     if len(onsets) == 0:
         return np.ones(n_ticks, bool)
-    t = analysis["offset"] + np.arange(n_ticks) * 60.0 / analysis["bpm"] / C.TICKS_PER_BEAT
+    if has_tempo_map(analysis):
+        t = timing_of(analysis).tick_times(n_ticks)
+    else:
+        t = analysis["offset"] + np.arange(n_ticks) * 60.0 / analysis["bpm"] / C.TICKS_PER_BEAT
     j = np.clip(np.searchsorted(onsets, t), 1, len(onsets) - 1)
     return np.minimum(np.abs(t - onsets[j - 1]), np.abs(onsets[j] - t)) <= tol_s
 
@@ -124,10 +129,14 @@ def render_previews(placements, analysis, audio_path, out_stem) -> dict:
     out = {}
     bpm, offset = analysis["bpm"], analysis["offset"]
     notes = [p for p in placements if p.kind != "mine"]
-    times = np.array([offset + p.beat / bpm * 60 for p in notes])
+    if has_tempo_map(analysis):
+        times = beats_to_times(analysis, [p.beat for p in notes])
+    else:
+        times = np.array([offset + p.beat / bpm * 60 for p in notes])
     png = Path(str(out_stem) + ".notefield.png")
     try:
-        _notefield_png(png, notes, times, bpm, offset, analysis.get("sections", []))
+        _notefield_png(png, notes, times, bpm, offset, analysis.get("sections", []),
+                       timing_of(analysis) if has_tempo_map(analysis) else None)
         out["png"] = str(png)
     except Exception:
         pass
@@ -155,14 +164,28 @@ def render_previews(placements, analysis, audio_path, out_stem) -> dict:
     return out
 
 
-def _notefield_png(path, notes, times, bpm, offset, sections) -> None:
+def _notefield_png(path, notes, times, bpm, offset, sections, timing=None) -> None:
     """A timeline of the chart: one row per panel, a dot per tap, a bar per
     hold, dashed lines at section starts. Drawn with Pillow (already a
-    dependency) rather than matplotlib, which the app no longer bundles."""
+    dependency) rather than matplotlib, which the app no longer bundles.
+    `timing` is the song's TimingMap when it has more than one tempo."""
     from PIL import Image, ImageDraw, ImageFont
     from ..grammar import PANELS
     W, H, L, R, T, B = 1760, 330, 56, 24, 18, 46
-    end = max([float(t) + (p.hold_beats or 0) / bpm * 60 for p, t in zip(notes, times)] or [1.0]) + 1.0
+
+    def span_s(p, t) -> float:                   # how long a hold lasts, in seconds
+        if not p.hold_beats:
+            return 0.0
+        if timing is None:
+            return p.hold_beats / bpm * 60
+        return float(timing.time_at(p.beat + p.hold_beats)) - float(t)
+
+    def bar_s(bar) -> float:                     # when a bar starts
+        if timing is None:
+            return offset + bar * 4 / bpm * 60
+        return float(timing.time_at(bar * 4.0))
+
+    end = max([float(t) + span_s(p, t) for p, t in zip(notes, times)] or [1.0]) + 1.0
     x = lambda s: L + (W - L - R) * max(0.0, s) / end
     row = lambda c: H - B - (H - T - B) * (c + 0.5) / 4
     im = Image.new("RGB", (W, H), "white")
@@ -170,13 +193,13 @@ def _notefield_png(path, notes, times, bpm, offset, sections) -> None:
     font = ImageFont.load_default()
     d.rectangle((L, T, W - R, H - B), outline="#444444")
     for sec in sections:
-        sx = x(offset + sec["start_bar"] * 4 / bpm * 60)
+        sx = x(bar_s(sec["start_bar"]))
         for y0 in range(T, H - B, 10):
             d.line((sx, y0, sx, min(y0 + 5, H - B)), fill="#b14cff", width=1)
     for p, t in zip(notes, times):
         for c in p.panels:
             if p.hold_beats:
-                d.line((x(t), row(c), x(t + p.hold_beats / bpm * 60), row(c)), fill="#ff2d95", width=4)
+                d.line((x(t), row(c), x(t + span_s(p, t)), row(c)), fill="#ff2d95", width=4)
             else:
                 d.ellipse((x(t) - 3, row(c) - 3, x(t) + 3, row(c) + 3), fill="#2de2e6")
     for c, name in enumerate(PANELS):
@@ -189,7 +212,8 @@ def _notefield_png(path, notes, times, bpm, offset, sections) -> None:
     im.save(path)
 
 
-def cheapest_reading(placements, difficulty: str, bpm: float | None = None) -> list:
+def cheapest_reading(placements, difficulty: str, bpm: float | None = None,
+                     timing: TimingMap | None = None) -> list:
     """footflow's cost of every step under the foot assignment that makes the
     whole chart cheapest for it -> [(index into `placements`, cost)].
 
@@ -210,7 +234,7 @@ def cheapest_reading(placements, difficulty: str, bpm: float | None = None) -> l
     for _, p in notes:
         ndp = {}
         dt_s = None if bpm is None or prev_beat is None \
-            else (p.beat - prev_beat) * 60.0 / bpm
+            else _gap_s(prev_beat, p.beat, bpm, timing)
         prev_beat = p.beat
         for st, (c0, _, _) in dp.items():
             if len(p.panels) == 2:
@@ -232,6 +256,14 @@ def cheapest_reading(placements, difficulty: str, bpm: float | None = None) -> l
         state = prev
     costs.reverse()
     return [(i, c) for (i, _), c in zip(notes, costs)]
+
+
+def _gap_s(beat_a: float, beat_b: float, bpm: float, timing: TimingMap | None) -> float:
+    """Seconds from one beat to a later one: at the song's single tempo, or
+    through its tempo map when it has one."""
+    if timing is None:
+        return (beat_b - beat_a) * 60.0 / bpm
+    return float(timing.time_at(beat_b) - timing.time_at(beat_a))
 
 
 def read_double_steps(events: C.ChartEvents, times_ms) -> list:
@@ -269,7 +301,8 @@ def read_double_steps(events: C.ChartEvents, times_ms) -> list:
 READ_DSTEP_MAX_BUCKET = 3
 
 
-def flow_veto(difficulty: str, bpm: float | None = None):
+def flow_veto(difficulty: str, bpm: float | None = None,
+              timing: TimingMap | None = None):
     """The project's flow-ceiling gate as a per-note referee for the engine.
 
     `qa.chart_metrics` fails a chart whose worst footflow transition reaches
@@ -280,7 +313,8 @@ def flow_veto(difficulty: str, bpm: float | None = None):
     the neural model considers comfortable can still trip it. Rather than copy
     those rules, replay the gate's own arithmetic and hand back the notes it
     objects to; the engine bans each and re-solves. `bpm` gives the gate the
-    time between steps, as `qa.chart_metrics` does, so slow repeats pass.
+    time between steps, as `qa.chart_metrics` does, so slow repeats pass
+    (`timing` does the same for a song with a tempo map).
 
     A chart whose own footing passes is then read the way someone without the
     engine's foot labels reads it (`cheapest_reading`), and a step that reaches
@@ -303,7 +337,7 @@ def flow_veto(difficulty: str, bpm: float | None = None):
         index = {int(t): i for i, t in enumerate(chart.events.tick)}
         bad = own(placements, index)
         if not bad:
-            for j, c in cheapest_reading(placements, difficulty, bpm):
+            for j, c in cheapest_reading(placements, difficulty, bpm, timing):
                 if c >= ceiling:
                     i = index.get(int(round(placements[j].beat * C.TICKS_PER_BEAT)))
                     if i is not None:
@@ -311,14 +345,18 @@ def flow_veto(difficulty: str, bpm: float | None = None):
         if not bad and bpm:
             # ...and the way the codec's annotator reads it may not hold an
             # unforced double-step either (`read_double_steps`)
-            bad = read_double_steps(chart.events, chart.events.tick * (5000.0 / bpm))
+            if timing is None:
+                times_ms = chart.events.tick * (5000.0 / bpm)
+            else:
+                times_ms = timing.time_at(chart.events.tick / C.TICKS_PER_BEAT) * 1000.0
+            bad = read_double_steps(chart.events, times_ms)
         return bad
 
     def own(placements, index) -> list:
         state, bad, prev_beat = ff.REST_STATE, [], None
         for p in placements:
             dt_s = None if bpm is None or prev_beat is None \
-                else (p.beat - prev_beat) * 60.0 / bpm
+                else _gap_s(prev_beat, p.beat, bpm, timing)
             prev_beat = p.beat
             if len(p.panels) > 1:
                 c, state = ff.jump_cost(state, p.panels[0], p.panels[1], budget)
@@ -641,22 +679,32 @@ def verify_tempo(envelope: np.ndarray, bpm: float, offset: float, duration_s: fl
     return out
 
 
-def _rebar(analysis: dict, bpm: float, offset: float) -> dict:
+def _rebar(analysis: dict, bpm: float, offset: float,
+           timing: TimingMap | None = None) -> dict:
     """Re-express the per-bar parts of a DSP analysis on a different grid (after
-    `verify_tempo` replaced the tempo or `verify_phase` moved the bar line):
-    energy per bar and section bounds, both by time. The density plan is
-    dropped — it was computed for bars that no longer exist."""
+    `verify_tempo` replaced the tempo, `verify_phase` moved the bar line, or
+    the song was given a tempo map): energy per bar and section bounds, both by
+    time. The density plan is dropped — it was computed for bars that no
+    longer exist. `timing`, for a song with a tempo map, is that map on the
+    clock `offset` is on."""
     old_bar = 240.0 / analysis["bpm"]
     new_bar = 240.0 / bpm
     energy = analysis.get("energy_curve") or []
-    n_new = int(max(0.0, analysis["duration_s"] - offset) / new_bar) + 1
     out = dict(analysis)
+    if timing is None:
+        n_new = int(max(0.0, analysis["duration_s"] - offset) / new_bar) + 1
+        mids = offset + (np.arange(n_new) + 0.5) * new_bar
+    else:
+        n_new = int(max(0.0, float(timing.beat_at(analysis["duration_s"]))) / 4.0) + 1
+        mids = timing.time_at((np.arange(n_new) + 0.5) * 4.0)
     if energy:
-        t = offset + (np.arange(n_new) + 0.5) * new_bar
+        t = mids
         idx = np.clip(((t - analysis["offset"]) / old_bar).astype(int), 0, len(energy) - 1)
         out["energy_curve"] = [float(energy[i]) for i in idx]
     def bar_at(old_index: float) -> int:                 # same instant, new bars
         t = analysis["offset"] + old_index * old_bar
+        if timing is not None:
+            return max(0, int(round(float(timing.beat_at(t)) / 4.0)))
         return max(0, int(round((t - offset) / new_bar)))
 
     out["sections"] = [dict(sec, start_bar=bar_at(sec["start_bar"]),
@@ -715,7 +763,8 @@ def phase_decision(rule: str, margin: float, onset: float, jump: float | None = 
 PERC_MID = GF.FLUX.start + 4
 
 
-def verify_phase(engine, core: np.ndarray, dt_ms: np.ndarray) -> dict:
+def verify_phase(engine, core: np.ndarray, dt_ms: np.ndarray,
+                 passes: dict | None = None) -> dict:
     """Is the beat grid seated on the beats, and does bar 1 start on a downbeat?
     Ask the rhythm model.
 
@@ -773,6 +822,10 @@ def verify_phase(engine, core: np.ndarray, dt_ms: np.ndarray) -> dict:
 
     Returns {'half_beat', 'gain' (nats), 'bar_shift_beats' (0-3, later),
     'bar_share', 'rule', 'votes' (None under the margin rule)}.
+
+    `passes`, if given, is filled with the Beginner onset probabilities of
+    every grid tried, keyed by how many ticks later it starts — `pause_seats`
+    reads the same passes instead of running the network again.
     """
     cv = engine.cond_for(cond.resolve_style("beginner"))
 
@@ -781,7 +834,10 @@ def verify_phase(engine, core: np.ndarray, dt_ms: np.ndarray) -> dict:
         return infer.sigmoid(engine.model.rhythm(x, cond_vec)[name].astype(np.float64))
 
     def onset_p(shift: int) -> np.ndarray:
-        return heads(shift, cv, "onset")
+        p = heads(shift, cv, "onset")
+        if passes is not None:
+            passes[shift] = p
+        return p
 
     def contrast(p: np.ndarray) -> float:
         k = np.arange(len(p)) % C.TICKS_PER_BEAT
@@ -821,6 +877,244 @@ def verify_phase(engine, core: np.ndarray, dt_ms: np.ndarray) -> dict:
     return out
 
 
+PAUSE_SEAT_MARGIN = 2.0         # nats; see pause_seats
+PAUSE_SEAT_SCREEN = 0.25        # share of the quarter notes' probability; see pause_seats
+PAUSE_SIDE_BARS = 8             # bars of song a pause needs on each side to be asked about
+
+
+def pause_seats(engine, core: np.ndarray, dt_ms: np.ndarray, tick_times: np.ndarray,
+                pauses: list, shift: int = 0, passes: dict | None = None) -> dict | None:
+    """Did the music come back in after a pause on another 16th-note line?
+
+    A band that stops and starts again need not start on the old grid. When it
+    comes back in BETWEEN the grid's lines the tempo-map check sees it, and the
+    song gets a map. When it comes back in on a line that is not a beat — a
+    pause of five 8th notes, say — every onset is still on the grid, nothing is
+    out of time, and nothing in the onsets shows it; but from there on the beat
+    is seated on what used to be an off-beat or a 16th, and an easy chart steps
+    between the notes of the music.
+
+    The rhythm model can tell, the way it tells `verify_phase` which half of
+    the beat a whole song's grid is on. For each pause with at least
+    PAUSE_SIDE_BARS of song on either side, the song before it and the song
+    after it are looked at separately, in two steps:
+
+    1. **A screen that costs nothing.** `verify_phase` has already run the
+       network on the song's grid. Asked for a Beginner chart it puts its
+       probability on the quarter notes — where the music's beats are under
+       them. If on either side some other 16th-note position holds more than
+       PAUSE_SEAT_SCREEN of what the quarters hold, that side may be seated
+       wrong; otherwise the pause is left alone and nothing more is run. At
+       the 29 natural pauses in the 180 benchmark songs the largest such share
+       is 0.20; on the spliced songs below that step 2 goes on to re-seat, the
+       smallest is 0.31.
+    2. **The question itself.** The network is run with the grid moved one,
+       two and three 16ths later, and each side is scored on every one of the
+       four grids: how much of the onset probability on the 16th-note grid
+       gathers on the quarter notes. If each side is sure of its best seat
+       (ahead of its second best by PAUSE_SEAT_MARGIN) and the two seats
+       differ, the song came back in on another line.
+
+    Both sides have to be sure because the commoner reason for two halves of a
+    song to disagree is that the model is unsure about one of them. Measured
+    through the whole engine on 60 copies of the tuning songs with a 0.75 s
+    pause spliced in half-way: 6 were re-seated, all 6 rightly (their beats are
+    on beat lines before the pause and after it), and none of the other 54 got
+    worse. At the benchmark songs' natural pauses step 1 never fired. Looser
+    rules, tried on the same scores, found up to twice as many seat changes
+    and got up to 4 of them wrong; and the caller only asks at all where the
+    song's one tempo is locked from end to end — without that, one more song
+    was re-seated rightly and one wrongly, on a grid that was already drifting.
+
+    `shift` is how many ticks later than `core`'s grid the song's grid finally
+    sits (what `verify_phase` decided); `passes` are that function's own
+    passes, reused where they are the ones needed. Returns None, or the pause
+    and the seats: {'pause', 'before_beats', 'after_beats', 'margin', 'before',
+    'after'} with the seats in beats later than the song's grid.
+    """
+    tpb, n = C.TICKS_PER_BEAT, len(core)
+    need = PAUSE_SIDE_BARS * C.G
+    spans = []
+    for s0, s1 in pauses:
+        k0 = int(np.searchsorted(tick_times, s0))
+        k1 = int(np.searchsorted(tick_times, s1))
+        if k0 - shift >= need and n - k1 >= need:
+            spans.append(((float(s0), float(s1)), k0, k1))
+    if not spans:
+        return None
+    cv = engine.cond_for(cond.resolve_style("beginner"))
+    passes = {} if passes is None else passes
+    quarter = tpb // 4
+    seats = (0, quarter, 2 * quarter, 3 * quarter)
+
+    def run(r: int) -> np.ndarray:               # the grid `r` ticks later than the song's
+        if shift + r not in passes:
+            x = GF.assemble(core[shift + r:], dt_ms[shift + r:])
+            passes[shift + r] = infer.sigmoid(
+                engine.model.rhythm(x, cv)["onset"].astype(np.float64))
+        return passes[shift + r]
+
+    def part(p: np.ndarray, r: int, lo: int, hi: int):
+        a = min(max(lo - shift - r, 0), len(p))
+        b = min(max(hi - shift - r, 0), len(p))
+        return p[a:b], np.arange(a, b) % tpb
+
+    def suspect(lo: int, hi: int) -> bool:
+        v, k = part(run(0), 0, lo, hi)
+        other = max(v[k == c].sum() for c in seats[1:])
+        return bool(other > PAUSE_SEAT_SCREEN * v[k == 0].sum())
+
+    spans = [sp for sp in spans if suspect(shift, sp[1]) or suspect(sp[2], n)]
+    if not spans:
+        return None
+
+    def side(lo: int, hi: int) -> dict:
+        out = {}
+        for r in seats:
+            v, k = part(run(r), r, lo, hi)
+            rest = v[(k == quarter) | (k == 2 * quarter) | (k == 3 * quarter)].sum()
+            out[r] = float(np.log((v[k == 0].sum() + 1e-9) / (rest + 1e-9)))
+        return out
+
+    best = None
+    for pause, k0, k1 in spans:
+        before, after = side(shift, k0), side(k1, n)
+        ra = sorted(before, key=before.get, reverse=True)
+        rb = sorted(after, key=after.get, reverse=True)
+        sure = min(before[ra[0]] - before[ra[1]], after[rb[0]] - after[rb[1]])
+        if ra[0] != rb[0] and sure >= PAUSE_SEAT_MARGIN and (
+                best is None or sure > best["margin"]):
+            best = {"pause": list(pause), "before_beats": ra[0] / tpb,
+                    "after_beats": rb[0] / tpb, "margin": round(sure, 2),
+                    "before": {str(r): round(v, 2) for r, v in before.items()},
+                    "after": {str(r): round(v, 2) for r, v in after.items()}}
+    return best
+
+
+SIXTEENTH_MARGIN = 3.0          # nats; see verify_phase_regions
+
+
+def verify_phase_regions(engine, core: np.ndarray, dt_ms: np.ndarray, spans: list) -> dict:
+    """`verify_phase` for a song with a tempo map.
+
+    Each region of the map was fitted to its own onsets, and onsets say where
+    the 16th-note lines are, not which of them is the beat. The tempo-map
+    builder gave every region a first answer (the seat that continues the
+    region before it, or that puts the loud notes where its neighbour has
+    them). Here the rhythm model is asked, region by region, over that
+    region's own ticks (`spans`, [(first tick, end tick)] in song order):
+
+    - **Half a beat**, exactly as `verify_phase` asks it of a whole song, with
+      the model's own rule and margin.
+    - **A 16th note.** After a pause a band can come back in anywhere, and a
+      grid a 16th off puts every quarter note of an easy chart between two
+      notes of the music. The statistic is the same idea one level down: of
+      the Beginner onset probability on the 16th-note grid, how much gathers
+      on the quarter notes, for the grid as given and moved by one, two and
+      three 16ths. On the 60 tuning songs, whose grids are right, the best
+      16th-off seat beat the best of (as given, half a beat) on 5 songs, by at
+      most 2.1 nats, while the median margin the other way was 7.2; a region
+      is moved a 16th only when that seat wins by SIXTEENTH_MARGIN.
+
+    A region shorter than four bars keeps the seat it was given. The bar line
+    is settled once, on the longest region: one origin for the whole song's
+    beat numbers.
+
+    Returns {'regions': [{'shift_beats', 'half_beat', 'gain', 'votes',
+    'sixteenth'}, ...], 'bar_shift_beats', 'bar_share', 'rule', 'bar_region'}.
+    """
+    cv = engine.cond_for(cond.resolve_style("beginner"))
+    tpb = C.TICKS_PER_BEAT
+    half, quarter = tpb // 2, tpb // 4
+    n = len(core)
+
+    def heads(shift: int, cond_vec, name: str) -> np.ndarray:
+        x = GF.assemble(core[shift:], dt_ms[shift:])
+        return infer.sigmoid(engine.model.rhythm(x, cond_vec)[name].astype(np.float64))
+
+    def part(p: np.ndarray, shift: int, lo: int, hi: int):
+        """(values, their index in the shifted array) for original ticks lo..hi."""
+        a = min(max(lo - shift, 0), len(p))
+        b = min(max(min(hi, n) - shift, 0), len(p))
+        return p[a:b], np.arange(a, b)
+
+    def contrast(p: np.ndarray, shift: int, lo: int, hi: int) -> float:
+        v, j = part(p, shift, lo, hi)
+        k = j % tpb
+        return float(np.log((v[k == 0].sum() + 1e-9) / (v[k == half].sum() + 1e-9)))
+
+    def on_quarters(p: np.ndarray, shift: int, lo: int, hi: int) -> float:
+        v, j = part(p, shift, lo, hi)
+        k = j % tpb
+        rest = v[(k == quarter) | (k == half) | (k == 3 * quarter)].sum()
+        return float(np.log((v[k == 0].sum() + 1e-9) / (rest + 1e-9)))
+
+    def on_beat_one(p: np.ndarray, shift: int, lo: int, hi: int) -> float:
+        v, j = part(p, shift, lo, hi)
+        return float(v[j % C.G == 0].sum() / (v[j % tpb == 0].sum() + 1e-9))
+
+    rule, margin = phase_rule(engine), phase_margin(engine)
+    out = {"regions": [], "bar_shift_beats": 0, "bar_share": None, "rule": rule,
+           "bar_region": None}
+    blank = {"shift_beats": 0.0, "half_beat": False, "gain": 0.0, "votes": None,
+             "sixteenth": None}
+    if n < 8 * C.G:
+        out["regions"] = [dict(blank) for _ in spans]
+        return out
+    onset = {s: heads(s, cv, "onset") for s in (0, quarter, half, 3 * quarter)}
+    jump = None
+    if rule != "margin":
+        cm = engine.cond_for(cond.resolve_style("medium"))
+        jump = {0: heads(0, cm, "jump"), half: heads(half, cm, "jump")}
+    perc = np.maximum(core[:, PERC_MID].astype(np.float64), 0.0)
+    for lo, hi in spans:
+        hi = min(hi, n)
+        gain = contrast(onset[half], half, lo, hi) - contrast(onset[0], 0, lo, hi)
+        row = dict(blank, gain=round(gain, 2))
+        if hi - lo >= 4 * C.G:
+            score = {s: on_quarters(onset[s], s, lo, hi) for s in onset}
+            row["sixteenth"] = {str(s): round(v, 2) for s, v in score.items()}
+            odd = max((quarter, 3 * quarter), key=lambda s: score[s])
+            if score[odd] - max(score[0], score[half]) >= SIXTEENTH_MARGIN:
+                row["shift_beats"] = odd / tpb
+            else:
+                if rule == "margin":
+                    row["half_beat"] = phase_decision(rule, margin, gain)
+                else:
+                    jg = contrast(jump[half], half, lo, hi) - contrast(jump[0], 0, lo, hi)
+                    k = np.arange(lo, hi) % tpb
+                    seg = perc[lo:hi]
+                    audio = float(np.log((seg[k == half].sum() + 1e-6)
+                                         / (seg[k == 0].sum() + 1e-6)))
+                    row["votes"] = {"onset": round(gain, 2), "jump": round(jg, 2),
+                                    "audio": round(audio, 2)}
+                    row["half_beat"] = phase_decision(rule, margin, gain, jg, audio)
+                row["shift_beats"] = 0.5 if row["half_beat"] else 0.0
+        out["regions"].append(row)
+    # the bar line: the longest region decides, on the seat it was just given
+    big = max(range(len(spans)), key=lambda i: min(spans[i][1], n) - spans[i][0])
+    lo, hi = spans[big][0], min(spans[big][1], n)
+    base = int(round(out["regions"][big]["shift_beats"] * tpb))
+    share = [on_beat_one(onset[base], base, lo, hi)]
+    for k in (1, 2, 3):
+        s = base + k * tpb
+        share.append(on_beat_one(heads(s, cv, "onset"), s, lo, hi))
+    best = int(np.argmax(share))
+    if share[best] - share[0] > BAR_MARGIN:
+        out["bar_shift_beats"] = best
+    out["bar_share"] = [round(v, 3) for v in share]
+    out["bar_region"] = big
+    return out
+
+
+def _region_spans(tmap, n_ticks: int) -> list:
+    """[(first tick, end tick)] of each region of a tempo map: a region runs
+    from its first beat to the next region's."""
+    firsts = [max(0, int(round(a * C.TICKS_PER_BEAT))) for a, _ in tmap.region_beats]
+    firsts[0] = 0
+    return [(a, b) for a, b in zip(firsts, firsts[1:] + [n_ticks])]
+
+
 def _features(audio_path: str, bpm: float, offset: float, duration_s: float,
               beat_backend: str = "local_dsp", engine=None):
     """Beat-warped features on the audio-aligned grid -> (GridFeatures, align).
@@ -852,7 +1146,14 @@ def _features(audio_path: str, bpm: float, offset: float, duration_s: float,
                  tempo_switched_by=check["by"],
                  tempo_fit=check["fit"], dsp_tempo_fit=check["dsp_fit"],
                  phase_shift_beats=0.0, phase_gain=None, bar_share=None,
-                 phase_rule=None, phase_votes=None)
+                 phase_rule=None, phase_votes=None, tempo_map=None, timing=None)
+    # Does that one tempo hold from the first bar to the last? Nearly always
+    # yes, and then nothing below this line is any different from before.
+    tmap = TM.analyze(ff.onset_envelope, align["bpm"], align["offset"], duration_s,
+                      TM.frame_rms(y, ff.n_frames))
+    align["tempo_check"] = tmap.to_report()
+    if not tmap.constant:
+        return _features_mapped(ff, tmap, align, duration_s, engine)
 
     def warp():
         timing = GF.TimingMap.constant(align["bpm"], align["offset"])
@@ -860,14 +1161,70 @@ def _features(audio_path: str, bpm: float, offset: float, duration_s: float,
 
     core, t, dt_ms = warp()
     if engine is not None:
-        phase = verify_phase(engine, core, dt_ms)
+        # a song with a mid-song pause is also asked whether it came back in
+        # on another 16th-note line (`pause_seats`); that first reads the
+        # passes verify_phase runs anyway, so they are kept for it
+        passes = {} if tmap.pauses and tmap.diag.get("locked") else None
+        phase = verify_phase(engine, core, dt_ms, passes)
         align["phase_gain"], align["bar_share"] = phase["gain"], phase["bar_share"]
         align["phase_rule"], align["phase_votes"] = phase["rule"], phase["votes"]
         shift = 0.5 * phase["half_beat"] + phase["bar_shift_beats"]
+        seat = None
+        if tmap.pauses and tmap.diag.get("locked"):
+            # only where the one tempo is locked to the song from end to end:
+            # on a grid that drifts, which line is the beat changes along the
+            # song for a reason no stop can mend
+            seat = pause_seats(engine, core, dt_ms, t, tmap.pauses,
+                               int(round(shift * C.TICKS_PER_BEAT)), passes)
         if shift:
             align["offset"] += shift * 60.0 / align["bpm"]
             align["phase_shift_beats"] = shift
-            core, t, dt_ms = warp()
+            if seat is None:
+                core, t, dt_ms = warp()
+        if seat is not None:
+            remap = TM.reseat_at_pause(align["bpm"], align["offset"], duration_s,
+                                       seat["pause"], seat["before_beats"],
+                                       seat["after_beats"], tmap.pauses, tmap.diag)
+            align["tempo_check"] = dict(remap.to_report(), pause_seat=seat)
+            return _features_mapped(ff, remap, align, duration_s, None, tempo_kept=True)
+    return GF.GridFeatures(GF.assemble(core, dt_ms), t, dt_ms, core, False), align
+
+
+def _features_mapped(ff, tmap, align: dict, duration_s: float, engine,
+                     tempo_kept: bool = False):
+    """`_features` for a song whose single tempo did not hold: warp on the
+    tempo map, ask the rhythm model for each region's beat seat and the bar
+    line, and warp again if it moved anything. With no `engine` the map is
+    used as it stands (its seats are already settled); `tempo_kept` says the
+    map still runs at the song's one tempo, so what was recorded about how
+    that tempo was found stays true."""
+    def warp():
+        timing = tmap.timing()
+        core, t, dt_ms = GF.warp_core(ff, timing, timing.ticks_for_duration(duration_s))
+        return timing, core, t, dt_ms
+
+    timing, core, t, dt_ms = warp()
+    if engine is not None:
+        phase = verify_phase_regions(engine, core, dt_ms, _region_spans(tmap, len(core)))
+        moved = 0.0
+        for i, row in enumerate(phase["regions"]):
+            if row["shift_beats"]:
+                tmap.shift_region(i, row["shift_beats"])
+                moved += row["shift_beats"] if i == 0 else 0.0
+        if phase["bar_shift_beats"]:
+            tmap.move_origin(phase["bar_shift_beats"])
+            moved += phase["bar_shift_beats"]
+        big = phase["bar_region"] or 0
+        align.update(phase_gain=phase["regions"][big]["gain"], bar_share=phase["bar_share"],
+                     phase_rule=phase["rule"], phase_votes=phase["regions"][big]["votes"],
+                     phase_shift_beats=moved)
+        if moved or any(r["shift_beats"] for r in phase["regions"]):
+            timing, core, t, dt_ms = warp()
+        align["tempo_check"] = dict(tmap.to_report(), region_phase=phase["regions"])
+    align.update(bpm=timing.dominant_bpm(duration_s), offset=timing.offset_s,
+                 tempo_map=timing.to_dict(), timing=timing)
+    if not tempo_kept:
+        align.update(bpm_snapped=False, bpm_refined=False)
     return GF.GridFeatures(GF.assemble(core, dt_ms), t, dt_ms, core, False), align
 
 
@@ -993,13 +1350,21 @@ def prepare_song(audio, analysis: dict, log=print, engine=None) -> SongContext:
             f"(off-beat evidence {align['phase_gain']:+.1f} nats; beat-1 share by "
             f"bar position {align['bar_share']})", flush=True)
     bpm = align["bpm"]
+    timing = align.get("timing")                 # set only when the song has a tempo map
+    if timing is not None:
+        for ev in align["tempo_check"].get("events", []):
+            what = {"pause": f"a pause (stop of {ev.get('stop_s', 0) * 1000:.0f} ms)",
+                    "phase": f"the beat moves {ev.get('shift_ms', 0):+.0f} ms",
+                    "tempo": f"tempo {ev['bpm_before']:.2f} -> {ev['bpm_after']:.2f}"}[ev["kind"]]
+            log(f"    [features] at {ev['time_s']:.1f} s: {what}", flush=True)
     # Two views of one chart, both on the refined tempo. What is written and
     # previewed plays against real audio: `synced`. QA compares notes with the
     # DSP's own onsets, whose clock runs `shift_s` early, so QA gets the same
     # grid expressed on that clock: `analysis`.
-    if align["tempo_ratio"] != 1.0 or align["phase_shift_beats"]:
+    if align["tempo_ratio"] != 1.0 or align["phase_shift_beats"] or timing is not None:
         # the DSP's tempo or bar line was replaced: its bars are not this chart's
-        analysis = _rebar(analysis, bpm, align["offset"] - align["shift_s"])
+        analysis = _rebar(analysis, bpm, align["offset"] - align["shift_s"],
+                          None if timing is None else timing.shifted(-align["shift_s"]))
     if align["tempo_ratio"] != 1.0:
         log(f"    [features] DSP tempo {dsp_bpm:.2f} fits the onsets badly "
             f"({align['dsp_tempo_fit']}); using {bpm:.2f} ({align['tempo_fit']})",
@@ -1007,6 +1372,9 @@ def prepare_song(audio, analysis: dict, log=print, engine=None) -> SongContext:
     synced = dict(analysis, bpm=round(bpm, 3),
                   offset=round(align["offset"] - HUMAN_SYNC_LEAD_S, 4))
     analysis = dict(analysis, bpm=bpm, offset=align["offset"] - align["shift_s"])
+    if timing is not None:
+        # the same map on both clocks: only the time of beat 0 differs
+        synced["tempo_map"] = analysis["tempo_map"] = align["tempo_map"]
     log(f"    [features] grid seated {align['shift_s'] * 1000:+.0f} ms from the DSP "
         f"offset (contrast {align['contrast']:.2f}); tempo {dsp_bpm:.3f} -> {bpm:.3f}",
         flush=True)
@@ -1049,7 +1417,9 @@ def chart_song(ctx: SongContext, difficulties, engine: infer.StepManiaNeuralEngi
             g.X, g.tick_times_sec, diff, style, analysis["duration_s"],
             seed=_default_seed(track_id, diff) if seed is None else seed,
             tau=tau, energy_per_bar=analysis.get("energy_curve"),
-            veto=flow_veto(diff, analysis["bpm"]), on_transient=ctx.on_transient,
+            veto=flow_veto(diff, analysis["bpm"],
+                           timing_of(analysis) if has_tempo_map(analysis) else None),
+            on_transient=ctx.on_transient,
             options=chart_options,
             progress=(lambda stage, d=diff: log(f"    [{d}] neural: {stage}…", flush=True))
             if log else None)
@@ -1087,9 +1457,12 @@ def chart_audio(audio, analysis: dict, out_dir, meta: dict,
         options=options)
 
     placements = {d: infer.to_placements(c) for d, c in charts.items()}
-    meters = _strict_meters({d: compute_meter(p, bpm, d)
+    meters = _strict_meters({d: compute_meter(p, bpm, d, align.get("timing"))
                              for d, p in placements.items()})
     report = {"track_id": track_id, "bpm": synced["bpm"], "offset": synced["offset"],
+              # BPM segments and stops, for a song with more than one tempo or a
+              # mid-song pause; None for the usual single tempo
+              "tempo_map": synced.get("tempo_map"),
               "mode": ENGINE_NAME, "chunk_mode": "never", "charts": {},
               "engine": {"name": ENGINE_NAME, "model_dir": str(engine.model.dir),
                          "dsp_offset": dsp_offset, "dsp_bpm": dsp_bpm,
@@ -1100,6 +1473,7 @@ def chart_audio(audio, analysis: dict, out_dir, meta: dict,
                          "tempo_switched_by": align["tempo_switched_by"],
                          "tempo_fit": align["tempo_fit"],
                          "dsp_tempo_fit": align["dsp_tempo_fit"],
+                         "tempo_check": align.get("tempo_check"),
                          "phase_shift_beats": align["phase_shift_beats"],
                          "phase_gain": align["phase_gain"],
                          "phase_rule": align.get("phase_rule"),
@@ -1187,7 +1561,8 @@ def _recorded_style(chart_row: dict) -> tuple:
 
 
 def _analysis_on_grid(cached: dict | None, engine_row: dict, bpm: float,
-                      offset_true: float, duration_s: float) -> dict:
+                      offset_true: float, duration_s: float,
+                      timing: TimingMap | None = None) -> dict:
     """The song's DSP analysis expressed on the grid a chart was written on,
     on the DSP's own clock — what `prepare_song` handed the QA gates when the
     chart was generated. `offset_true` is the simfile's beat 0 in audio time.
@@ -1195,14 +1570,21 @@ def _analysis_on_grid(cached: dict | None, engine_row: dict, bpm: float,
     The simfile's grid differs from the DSP's by the clock correction
     (`grid_shift_ms`), the sync lead, and possibly a replaced tempo or a moved
     bar line, so the per-bar energy and the sections are re-read by time."""
+    tempo_map = None if timing is None or timing.is_constant else timing.to_dict()
     if not cached:
-        return {"bpm": bpm, "offset": offset_true, "duration_s": duration_s,
-                "onsets": [], "sections": [], "energy_curve": [], "meter": 4}
+        out = {"bpm": bpm, "offset": offset_true, "duration_s": duration_s,
+               "onsets": [], "sections": [], "energy_curve": [], "meter": 4}
+        if tempo_map:
+            out["tempo_map"] = tempo_map
+        return out
     shift_s = float(engine_row.get("grid_shift_ms") or 0.0) / 1000.0
     lead_s = float(engine_row.get("sync_lead_ms") or 0.0) / 1000.0
     offset = offset_true + lead_s - shift_s
-    out = _rebar(cached, bpm, offset)
+    out = _rebar(cached, bpm, offset,
+                 timing.shifted(lead_s - shift_s) if tempo_map else None)
     out.update(bpm=bpm, offset=offset)
+    if tempo_map:
+        out["tempo_map"] = tempo_map
     return out
 
 
@@ -1280,9 +1662,12 @@ def inpaint_song(difficulty: str, bars: tuple, *, track_id: str | None = None,
         seed = int(np.random.SeedSequence().entropy % (2 ** 31))
     from ....analyze import load_cached
     cached = (load_cached(track_id) if track_id else None) or load_cached(base)
-    analysis = _analysis_on_grid(cached, report.get("engine") or {}, bpms[0][1],
-                                 -float(td.offset), duration)
-    veto = flow_veto(difficulty, bpms[0][1])
+    # the tempo the chart is mostly in; its whole map when it has more than one
+    main_bpm = float(timing.dominant_bpm(duration))
+    mapped = None if timing.is_constant else timing
+    analysis = _analysis_on_grid(cached, report.get("engine") or {}, main_bpm,
+                                 -float(td.offset), duration, mapped)
+    veto = flow_veto(difficulty, main_bpm, mapped)
     if regenerate:
         result = engine.regenerate_section(
             events, g.X, g.tick_times_sec, difficulty, style, start_bar, end_bar,
@@ -1314,7 +1699,7 @@ def inpaint_song(difficulty: str, bars: tuple, *, track_id: str | None = None,
 
     # refresh this chart's previews + report entry; other charts are untouched
     meter = int(old.get("meter") or float(chart.meter))
-    true_frame = dict(analysis, bpm=bpms[0][1], offset=-float(td.offset))
+    true_frame = dict(analysis, bpm=main_bpm, offset=-float(td.offset))
     # the chart as a whole is still the one that was generated: keep what its
     # report says it was made with, and log this edit beside it
     old_engine = old.get("engine") or {}

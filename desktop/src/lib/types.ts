@@ -38,7 +38,15 @@ export interface Chart {
   stepstype: string;
   columns: number;
   beat0Time: number;
+  /** The first tempo. Most charts have only this one. */
   bpm: number;
+  /** Every tempo segment as [beat, bpm] and every stop as [beat, seconds]: a
+   *  song whose tempo changes, or that pauses mid-way, has more than one. */
+  bpms?: [number, number][];
+  stops?: [number, number][];
+  /** Seconds at which each whole beat is played, timed through `bpms` and
+   *  `stops` as the notes are: the player's beat and bar lines. */
+  beatTimes?: number[];
   notes: ChartNote[];
 }
 

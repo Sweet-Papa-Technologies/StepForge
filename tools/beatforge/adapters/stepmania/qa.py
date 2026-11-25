@@ -5,6 +5,7 @@ from __future__ import annotations
 from . import footflow as ff
 from .grammar import BUDGETS, PANELS
 from .quantize import Placement
+from .timing import beats_to_times, has_tempo_map, timing_of
 
 
 def chart_metrics(placements: list[Placement], analysis: dict, difficulty: str,
@@ -28,9 +29,13 @@ def chart_metrics(placements: list[Placement], analysis: dict, difficulty: str,
     n = len(placements)
     onset_times = sorted(o["time"] for o in analysis.get("onsets", []))
 
+    # a song with a tempo map (BPM changes, stops) is timed through it; the
+    # usual single-tempo song by the expression this has always used
+    mapped = has_tempo_map(analysis)
+    times = beats_to_times(analysis, [p.beat for p in placements]) if mapped else None
     aligned = grid = 0
-    for p in placements:
-        t = offset + p.beat / bpm * 60
+    for i, p in enumerate(placements):
+        t = float(times[i]) if mapped else offset + p.beat / bpm * 60
         if _near(t, onset_times, 0.035):
             aligned += 1
         else:
@@ -49,7 +54,8 @@ def chart_metrics(placements: list[Placement], analysis: dict, difficulty: str,
     jumps = sum(1 for p in placements if len(p.panels) > 1)
 
     # foot-flow cost distribution (re-score the realized chart)
-    max_cost, mean_cost = _flow_costs(placements, b, analysis.get("bpm"))
+    max_cost, mean_cost = _flow_costs(placements, b, analysis.get("bpm"),
+                                      timing_of(analysis) if mapped else None)
 
     # density vs energy (per-bar) Spearman
     spearman = _density_energy(placements, analysis)
@@ -176,18 +182,23 @@ def _near(t, onset_times, tol):
     return False
 
 
-def _flow_costs(placements, b, bpm: float | None = None):
+def _flow_costs(placements, b, bpm: float | None = None, timing=None):
     """(worst, mean) footflow cost of a chart as its own foot labels play it.
     With `bpm`, each step is told how long ago the previous one was, so a slow
-    repeat of the same arrow is not scored as a jack (footflow.JACK_FREE_S)."""
+    repeat of the same arrow is not scored as a jack (footflow.JACK_FREE_S);
+    `timing` (a TimingMap) does that for a song with more than one tempo."""
     if len(placements) < 2:
         return 0.0, 0.0
     state = ff.REST_STATE
     costs = []
     prev_beat = None
     for p in placements:
-        dt_s = None if bpm is None or prev_beat is None \
-            else (p.beat - prev_beat) * 60.0 / bpm
+        if bpm is None or prev_beat is None:
+            dt_s = None
+        elif timing is not None:
+            dt_s = float(timing.time_at(p.beat) - timing.time_at(prev_beat))
+        else:
+            dt_s = (p.beat - prev_beat) * 60.0 / bpm
         if len(p.panels) > 1:
             c, state = ff.jump_cost(state, p.panels[0], p.panels[1], b)
         else:

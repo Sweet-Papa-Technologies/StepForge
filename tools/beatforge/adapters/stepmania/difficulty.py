@@ -7,13 +7,18 @@ from .grammar import BUDGETS
 from .quantize import Placement
 
 
-def compute_meter(placements: list[Placement], bpm: float, difficulty: str) -> int:
+def compute_meter(placements: list[Placement], bpm: float, difficulty: str,
+                  timing=None) -> int:
     """Meter from sustained NPS + jump/crossover/stream density, clamped to the
-    difficulty's range so tiers stay monotonic."""
+    difficulty's range so tiers stay monotonic. `timing` is the song's
+    TimingMap when it has more than one tempo; otherwise `bpm` is all there is."""
     lo, hi = BUDGETS[difficulty].meter_range
     if not placements:
         return lo
-    times = sorted(p.beat / bpm * 60 for p in placements)
+    if timing is None:
+        times = sorted(p.beat / bpm * 60 for p in placements)
+    else:
+        times = sorted(float(v) for v in timing.time_at([p.beat for p in placements]))
     peak = 0
     for i in range(len(times)):
         j = i
