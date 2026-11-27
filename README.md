@@ -1,6 +1,6 @@
 # StepForge downloads
 
-Updated 2026-11-26 (UTC) by the `download-stats` workflow from GitHub's release download counters. Raw data: [downloads.csv](downloads.csv).
+Updated 2026-11-27 (UTC) by the `download-stats` workflow from GitHub's release download counters. Raw data: [downloads.csv](downloads.csv).
 
 **100 downloads** of installers across 8 releases.
 
@@ -31,6 +31,7 @@ Each day's increase in the running total (all releases and platforms).
 
 | Date | New | Running total |
 |---|---:|---:|
+| 2026-11-27 | 0 | 100 |
 | 2026-11-26 | 1 | 100 |
 | 2026-11-25 | 0 | 99 |
 | 2026-11-24 | 0 | 99 |
